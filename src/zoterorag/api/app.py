@@ -6,7 +6,7 @@ from typing import Any
 from ..backup import create_backup
 from ..embeddings import index_normalized_document, search_vector_index
 from ..runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime, scan_zotero_shadow
-from ..search import metadata_search
+from ..search import fulltext_search, metadata_search
 from .security import AccessDenied, verify_api_access
 
 
@@ -101,6 +101,19 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
                 classification=payload.get("classification"),
                 limit=int(payload.get("limit", payload.get("top_k", 10))),
                 consumer=str(payload.get("consumer", "llm_text")),
+            )
+        }
+
+    @app.post("/search/fulltext", dependencies=[Depends(require_access)])
+    def search_fulltext(payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "results": fulltext_search(
+                ledger,
+                query=str(payload["query"]),
+                chunk_type=payload.get("chunk_type"),
+                limit=int(payload.get("limit", payload.get("top_k", 10))),
+                consumer=str(payload.get("consumer", "llm_text")),
+                image_return=str(payload.get("image_return", "none")),
             )
         }
 

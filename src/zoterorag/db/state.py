@@ -1135,6 +1135,39 @@ class StateLedger:
         rows = self.conn.execute(query, params).fetchall()
         return [decode_chunk_row(row) for row in rows]
 
+    def search_chunks_fulltext(
+        self,
+        query: str,
+        *,
+        chunk_type: str | None = None,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        terms = [term.casefold() for term in query.split() if term.strip()]
+        if not terms:
+            return []
+        where_parts = []
+        params: list[Any] = []
+        for term in terms:
+            where_parts.append("lower(text) LIKE ?")
+            params.append(f"%{term}%")
+        if chunk_type is not None:
+            where_parts.append("chunk_type = ?")
+            params.append(chunk_type)
+        sql = f"""
+            SELECT chunk_id, document_id, chunk_type, chunk_index, text,
+                   heading_path_json, prev_chunk_id, next_chunk_id,
+                   metadata_json, updated_at
+            FROM chunks
+            WHERE {' AND '.join(where_parts)}
+            ORDER BY document_id, chunk_index
+        """
+        rows = self.conn.execute(sql, params).fetchall()
+        results = [decode_chunk_row(row) for row in rows]
+        for item in results:
+            item["score"] = chunk_match_score(item, terms)
+        results.sort(key=lambda item: (item["score"], item["document_id"], -item["chunk_index"]), reverse=True)
+        return results[:limit]
+
     def mark_absent_attachments_deleted(self, present_attachment_keys: Iterable[str]) -> int:
         keys = sorted(set(present_attachment_keys))
         now = utc_now()
@@ -1246,6 +1279,19 @@ def metadata_match_score(item: dict[str, Any], terms: list[str]) -> float:
         for term in terms:
             if term in value:
                 score += weight
+    return score
+
+
+def chunk_match_score(item: dict[str, Any], terms: list[str]) -> float:
+    text = str(item.get("text") or "").casefold()
+    heading = " ".join(str(part) for part in item.get("heading_path", [])).casefold()
+    score = 0.0
+    for term in terms:
+        score += text.count(term)
+        if term in heading:
+            score += 2.0
+    if item.get("chunk_type") == "text":
+        score += 0.25
     return score
 
 

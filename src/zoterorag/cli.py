@@ -10,7 +10,7 @@ from .embeddings import index_normalized_document, search_vector_index
 from .extractors import ExtractionManager, ExtractionRequest, ExtractorKeyPool, StubExtractorProvider
 from .normalize import normalize_markdown_document
 from .runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime, scan_zotero_shadow
-from .search import metadata_search
+from .search import fulltext_search, metadata_search
 from .zotero import ZoteroShadow
 
 
@@ -62,6 +62,13 @@ def build_parser() -> argparse.ArgumentParser:
     search_metadata.add_argument("--classification", default=None)
     search_metadata.add_argument("--limit", type=int, default=10)
     search_metadata.add_argument("--consumer", default="llm_text", choices=("manual", "llm_text", "llm_multimodal"))
+
+    search_fulltext = sub.add_parser("search-fulltext", help="Search normalized fulltext chunks without embeddings.")
+    search_fulltext.add_argument("query")
+    search_fulltext.add_argument("--chunk-type", default=None, choices=("text", "image"))
+    search_fulltext.add_argument("--limit", type=int, default=10)
+    search_fulltext.add_argument("--consumer", default="llm_text", choices=("manual", "llm_text", "llm_multimodal"))
+    search_fulltext.add_argument("--image-return", default="none", choices=("file_ref", "base64", "none"))
 
     backup = sub.add_parser("backup", help="Create and inspect ZoteroRAG runtime backups.")
     backup_sub = backup.add_subparsers(dest="backup_command", required=True)
@@ -204,6 +211,21 @@ def main(argv: list[str] | None = None) -> int:
                         classification=args.classification,
                         limit=args.limit,
                         consumer=args.consumer,
+                    )
+                }
+            )
+            return 0
+
+        if args.command == "search-fulltext":
+            emit(
+                {
+                    "results": fulltext_search(
+                        ledger,
+                        query=args.query,
+                        chunk_type=args.chunk_type,
+                        limit=args.limit,
+                        consumer=args.consumer,
+                        image_return=args.image_return,
                     )
                 }
             )
