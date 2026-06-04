@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from ..runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime
+from ..runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime, scan_zotero_shadow
 from .security import AccessDenied, verify_api_access
 
 
@@ -42,10 +42,14 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
         return {"models": ledger.list_embedding_profiles()}
 
     @app.post("/scan", dependencies=[Depends(require_access)])
-    def scan_shadow() -> dict[str, Any]:
-        # First implementation checkpoint: verify safe shadow creation only.
-        # Full Zotero classification will build on the shadow DB.
-        return copy_zotero_shadow(config, ledger)
+    def scan_shadow(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = payload or {}
+        return scan_zotero_shadow(
+            config,
+            ledger,
+            refresh_shadow=bool(payload.get("refresh_shadow", True)),
+            limit=payload.get("limit"),
+        )
 
     @app.post("/review/include", dependencies=[Depends(require_access)])
     def include_attachment(payload: dict[str, Any]) -> dict[str, str]:
@@ -63,7 +67,13 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
 
     @app.get("/review", dependencies=[Depends(require_access)])
     def review_rules() -> dict[str, Any]:
-        return {"rules": ledger.list_review_rules()}
+        return {
+            "rules": ledger.list_review_rules(),
+            "candidates": ledger.list_attachments(classification="needs_review"),
+        }
+
+    @app.get("/attachments", dependencies=[Depends(require_access)])
+    def attachments(classification: str | None = None, limit: int | None = 100) -> dict[str, Any]:
+        return {"attachments": ledger.list_attachments(classification=classification, limit=limit)}
 
     return app
-

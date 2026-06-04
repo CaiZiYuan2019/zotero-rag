@@ -43,6 +43,9 @@ def sanitize_results_for_consumer(
         item = result.to_dict() if isinstance(result, SearchResult) else dict(result)
         images = list(item.get("images") or [])
         if consumer == "llm_text" or image_return == "none":
+            # Pure-text LLM consumers must never receive image bytes or file
+            # handles. They can see that images exist and read captions, but the
+            # payload remains text-only by construction.
             item.pop("images", None)
             item["has_images"] = bool(images)
             item["image_count"] = len(images)
@@ -84,4 +87,3 @@ def sanitize_results_for_consumer(
             raise ValueError(f"unknown consumer: {consumer}")
         sanitized.append(item)
     return sanitized
-

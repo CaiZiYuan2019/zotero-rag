@@ -5,11 +5,13 @@ import json
 from pathlib import Path
 import sys
 
-from .runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime
+from .runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime, scan_zotero_shadow
 from .zotero import ZoteroShadow
 
 
 def emit(data: object) -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     print(json.dumps(data, ensure_ascii=False, indent=2))
 
 
@@ -21,6 +23,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("init-state", help="Create runtime directories and initialize state.sqlite.")
     sub.add_parser("status", help="Show runtime and state status.")
     sub.add_parser("shadow-copy", help="Create a read-only Zotero shadow copy.")
+    scan = sub.add_parser("scan", help="Copy Zotero shadow and classify attachments into state.")
+    scan.add_argument("--no-refresh-shadow", action="store_true", help="Scan the existing shadow DB without recopying Zotero.")
+    scan.add_argument("--limit", type=int, default=None)
 
     models = sub.add_parser("models", help="List configured embedding profiles.")
     models_sub = models.add_subparsers(dest="models_command", required=True)
@@ -35,6 +40,10 @@ def build_parser() -> argparse.ArgumentParser:
     exclude = review_sub.add_parser("exclude")
     exclude.add_argument("--attachment-key", required=True)
     exclude.add_argument("--reason", default="manual exclude")
+
+    attachments = sub.add_parser("attachments", help="List persisted attachment scan results.")
+    attachments.add_argument("--classification", default=None)
+    attachments.add_argument("--limit", type=int, default=50)
 
     inspect = sub.add_parser("inspect-shadow", help="Read summary from an existing shadow DB.")
     inspect.add_argument("--limit", type=int, default=5)
@@ -58,13 +67,29 @@ def main(argv: list[str] | None = None) -> int:
             emit(copy_zotero_shadow(config, ledger))
             return 0
 
+        if args.command == "scan":
+            emit(
+                scan_zotero_shadow(
+                    config,
+                    ledger,
+                    refresh_shadow=not args.no_refresh_shadow,
+                    limit=args.limit,
+                )
+            )
+            return 0
+
         if args.command == "models" and args.models_command == "list":
             emit({"models": ledger.list_embedding_profiles()})
             return 0
 
         if args.command == "review":
             if args.review_command == "list":
-                emit({"rules": ledger.list_review_rules()})
+                emit(
+                    {
+                        "rules": ledger.list_review_rules(),
+                        "candidates": ledger.list_attachments(classification="needs_review"),
+                    }
+                )
                 return 0
             if args.review_command == "include":
                 ledger.upsert_review_rule(args.attachment_key, "include", args.reason)
@@ -74,6 +99,17 @@ def main(argv: list[str] | None = None) -> int:
                 ledger.upsert_review_rule(args.attachment_key, "exclude", args.reason)
                 emit({"attachment_key": args.attachment_key, "decision": "exclude"})
                 return 0
+
+        if args.command == "attachments":
+            emit(
+                {
+                    "attachments": ledger.list_attachments(
+                        classification=args.classification,
+                        limit=args.limit,
+                    )
+                }
+            )
+            return 0
 
         if args.command == "inspect-shadow":
             shadow_path = Path(config.paths.shadow_db)
@@ -98,4 +134,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

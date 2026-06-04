@@ -6,7 +6,7 @@ from typing import Any
 
 from .config import AppConfig, load_config
 from .db import StateLedger
-from .zotero import create_shadow_copy
+from .zotero import create_shadow_copy, scan_shadow_to_ledger
 
 
 def initialize_runtime(config_path: str | Path = "config/config.example.toml") -> tuple[AppConfig, StateLedger]:
@@ -37,6 +37,28 @@ def copy_zotero_shadow(config: AppConfig, ledger: StateLedger | None = None) -> 
     return result
 
 
+def scan_zotero_shadow(
+    config: AppConfig,
+    ledger: StateLedger,
+    *,
+    refresh_shadow: bool = True,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    if refresh_shadow:
+        copy_zotero_shadow(config, ledger)
+    report = scan_shadow_to_ledger(
+        shadow_db=config.paths.shadow_db,
+        storage_dir=config.paths.zotero_storage,
+        ledger=ledger,
+        limit=limit,
+    )
+    return {
+        "shadow_db": str(config.paths.shadow_db),
+        "scanned": report.scanned,
+        "summary": report.summary,
+    }
+
+
 def config_as_public_dict(config: AppConfig) -> dict[str, Any]:
     """Return config details safe for status output.
 
@@ -56,4 +78,3 @@ def config_as_public_dict(config: AppConfig) -> dict[str, Any]:
         "server": asdict(config.server),
         "embedding_profiles": [asdict(profile) for profile in config.embedding_profiles],
     }
-

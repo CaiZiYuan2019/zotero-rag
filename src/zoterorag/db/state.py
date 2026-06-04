@@ -46,6 +46,9 @@ class StateLedger:
         self.conn.close()
 
     def _configure(self) -> None:
+        # WAL lets readers inspect status while the single state writer records
+        # progress. It does not make SQLite multi-writer; pipeline workers should
+        # still funnel writes through one writer component.
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
@@ -142,6 +145,49 @@ class StateLedger:
                     chunk_count INTEGER NOT NULL DEFAULT 0,
                     active INTEGER NOT NULL DEFAULT 1,
                     updated_at TEXT NOT NULL
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS attachments (
+                    attachment_key TEXT PRIMARY KEY,
+                    parent_key TEXT,
+                    content_type TEXT,
+                    relative_path TEXT,
+                    title TEXT,
+                    abstract TEXT,
+                    date_value TEXT,
+                    url TEXT,
+                    classification TEXT NOT NULL,
+                    source_quality TEXT NOT NULL DEFAULT 'unknown',
+                    reasons_json TEXT NOT NULL DEFAULT '[]',
+                    file_path TEXT,
+                    file_exists INTEGER NOT NULL DEFAULT 0,
+                    file_size INTEGER,
+                    file_mtime REAL,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            # This is the durable review queue produced from the Zotero shadow.
+            # It stores classification decisions and file facts only; no PDF
+            # content, embedding vectors, or expensive extraction payloads live
+            # in the state DB.
+            self.conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_attachments_classification
+                ON attachments(classification)
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS scan_reports (
+                    report_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id TEXT,
+                    summary_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
                 )
                 """
             )
@@ -245,6 +291,9 @@ class StateLedger:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def review_rule_map(self) -> dict[str, dict[str, Any]]:
+        return {row["attachment_key"]: row for row in self.list_review_rules()}
+
     def upsert_embedding_profiles(self, profiles: Iterable[Any]) -> None:
         with self.conn:
             for profile in profiles:
@@ -332,6 +381,136 @@ class StateLedger:
                 ),
             )
 
+    def upsert_attachments(self, attachments: Iterable[dict[str, Any]]) -> int:
+        count = 0
+        with self.conn:
+            for item in attachments:
+                self.conn.execute(
+                    """
+                    INSERT INTO attachments(
+                        attachment_key, parent_key, content_type, relative_path,
+                        title, abstract, date_value, url, classification,
+                        source_quality, reasons_json, file_path, file_exists,
+                        file_size, file_mtime, metadata_json, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(attachment_key) DO UPDATE SET
+                        parent_key = excluded.parent_key,
+                        content_type = excluded.content_type,
+                        relative_path = excluded.relative_path,
+                        title = excluded.title,
+                        abstract = excluded.abstract,
+                        date_value = excluded.date_value,
+                        url = excluded.url,
+                        classification = excluded.classification,
+                        source_quality = excluded.source_quality,
+                        reasons_json = excluded.reasons_json,
+                        file_path = excluded.file_path,
+                        file_exists = excluded.file_exists,
+                        file_size = excluded.file_size,
+                        file_mtime = excluded.file_mtime,
+                        metadata_json = excluded.metadata_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        item["attachment_key"],
+                        item.get("parent_key"),
+                        item.get("content_type"),
+                        item.get("relative_path"),
+                        item.get("title"),
+                        item.get("abstract"),
+                        item.get("date"),
+                        item.get("url"),
+                        item["classification"],
+                        item.get("source_quality", "unknown"),
+                        json.dumps(item.get("reasons", []), ensure_ascii=False, sort_keys=True),
+                        item.get("file_path"),
+                        int(bool(item.get("file_exists", False))),
+                        item.get("file_size"),
+                        item.get("file_mtime"),
+                        json.dumps(item.get("metadata", {}), ensure_ascii=False, sort_keys=True, default=str),
+                        utc_now(),
+                    ),
+                )
+                count += 1
+        return count
+
+    def list_attachments(
+        self,
+        classification: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        query = """
+            SELECT attachment_key, parent_key, content_type, relative_path,
+                   title, abstract, date_value, url, classification,
+                   source_quality, reasons_json, file_path, file_exists,
+                   file_size, file_mtime, metadata_json, updated_at
+            FROM attachments
+        """
+        params: list[Any] = []
+        if classification is not None:
+            query += " WHERE classification = ?"
+            params.append(classification)
+        query += " ORDER BY attachment_key"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        rows = self.conn.execute(query, params).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            reasons_json = item.pop("reasons_json")
+            metadata_json = item.pop("metadata_json")
+            item["file_exists"] = bool(row["file_exists"])
+            item["reasons"] = json.loads(reasons_json)
+            item["metadata"] = json.loads(metadata_json)
+            results.append(item)
+        return results
+
+    def add_scan_report(self, summary: dict[str, Any], job_id: str | None = None) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO scan_reports(job_id, summary_json, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (job_id, json.dumps(summary, ensure_ascii=False, sort_keys=True), utc_now()),
+            )
+
+    def mark_absent_attachments_deleted(self, present_attachment_keys: Iterable[str]) -> int:
+        keys = sorted(set(present_attachment_keys))
+        now = utc_now()
+        if not keys:
+            with self.conn:
+                cursor = self.conn.execute(
+                    """
+                    UPDATE attachments
+                    SET classification = 'deleted',
+                        source_quality = 'deleted_from_zotero_shadow',
+                        reasons_json = ?,
+                        updated_at = ?
+                    WHERE classification != 'deleted'
+                    """,
+                    (json.dumps(["absent_from_full_shadow_scan"]), now),
+                )
+            return int(cursor.rowcount)
+
+        placeholders = ",".join("?" for _ in keys)
+        with self.conn:
+            cursor = self.conn.execute(
+                f"""
+                UPDATE attachments
+                SET classification = 'deleted',
+                    source_quality = 'deleted_from_zotero_shadow',
+                    reasons_json = ?,
+                    updated_at = ?
+                WHERE attachment_key NOT IN ({placeholders})
+                  AND classification != 'deleted'
+                """,
+                [json.dumps(["absent_from_full_shadow_scan"]), now, *keys],
+            )
+        return int(cursor.rowcount)
+
     def status_summary(self) -> dict[str, Any]:
         jobs = self.conn.execute(
             "SELECT status, count(*) AS n FROM pipeline_jobs GROUP BY status"
@@ -339,11 +518,12 @@ class StateLedger:
         checkpoints = self.conn.execute("SELECT count(*) AS n FROM checkpoints").fetchone()
         profiles = self.conn.execute("SELECT count(*) AS n FROM embedding_profiles").fetchone()
         indexes = self.conn.execute("SELECT count(*) AS n FROM vector_indexes").fetchone()
+        attachments = self.conn.execute("SELECT classification, count(*) AS n FROM attachments GROUP BY classification").fetchall()
         return {
             "schema_version": SCHEMA_VERSION,
             "jobs": {row["status"]: row["n"] for row in jobs},
             "checkpoints": checkpoints["n"],
             "embedding_profiles": profiles["n"],
             "vector_indexes": indexes["n"],
+            "attachments": {row["classification"]: row["n"] for row in attachments},
         }
-

@@ -30,6 +30,8 @@ def verify_api_access(
     token = expected_api_token()
     if require_api_token:
         if not token:
+            # Fresh local installs should be usable from the same machine, but
+            # must not expose control endpoints to the LAN before a token is set.
             if client_host in LOCAL_HOSTS:
                 return
             raise AccessDenied("ZOTERORAG_API_TOKEN is required for non-loopback access")
@@ -41,4 +43,3 @@ def verify_api_access(
         if supplied_token and hmac.compare_digest(supplied_token, token):
             return
         raise AccessDenied("non-loopback access requires API token")
-
