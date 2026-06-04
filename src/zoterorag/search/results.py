@@ -45,6 +45,7 @@ def sanitize_results_for_consumer(
         images = list(item.get("images") or [])
         if consumer == "llm_text" or image_return == "none":
             item["text"] = strip_image_references_from_text(str(item.get("text", "")))
+            item["metadata"] = strip_image_payload_metadata(dict(item.get("metadata") or {}))
             # Pure-text LLM consumers must never receive image bytes or file
             # handles. They can see that images exist and read captions, but the
             # payload remains text-only by construction.
@@ -102,3 +103,17 @@ def strip_image_references_from_text(text: str) -> str:
 
     text = MARKDOWN_IMAGE_RE.sub(replace_markdown, text)
     return HTML_IMAGE_RE.sub("[Image]", text)
+
+
+def strip_image_payload_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Remove image handle fields from metadata sent to text-only consumers."""
+
+    blocked_keys = {
+        "image_path",
+        "image_return",
+        "file_ref",
+        "thumbnail_ref",
+        "base64",
+        "mime_type",
+    }
+    return {key: value for key, value in metadata.items() if key not in blocked_keys}

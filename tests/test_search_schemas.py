@@ -51,7 +51,11 @@ class SearchSchemaTests(OptionalModuleTestCase):
                 "title": "Figure chunk",
                 "score": 0.8,
                 "text": "figure caption",
-                "metadata": {"content_type": "image/png"},
+                "metadata": {
+                    "content_type": "image/png",
+                    "image_path": "images/img002.png",
+                    "image_return": "file_ref",
+                },
                 "images": [
                     {
                         "image_id": "img-b",
@@ -84,4 +88,6 @@ class SearchSchemaTests(OptionalModuleTestCase):
             self.assertNotIn("base64", repr(payload))
             self.assertNotIn("file_ref", repr(payload))
             self.assertNotIn("thumbnail_ref", repr(payload))
+            self.assertNotIn("image_path", repr(payload))
+            self.assertNotIn("images/img002.png", repr(payload))
             self.assertNotIn("images/img001.png", llm_text)
