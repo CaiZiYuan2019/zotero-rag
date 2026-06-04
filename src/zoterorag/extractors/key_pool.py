@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import re
+import time
+from typing import Any, Callable
 
 
 ENV_KEY_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$")
@@ -17,6 +19,13 @@ class ApiKeyRef:
         return {"alias": self.alias, "redacted": redact_secret(self.secret)}
 
 
+@dataclass
+class ApiKeyRuntimeState:
+    alias: str
+    in_flight: int = 0
+    cooldown_until: float = 0.0
+
+
 class ExtractorKeyPool:
     """Round-robin API key selector that exposes aliases to the state ledger.
 
@@ -24,9 +33,20 @@ class ExtractorKeyPool:
     but progress rows, logs, and backups should only store `alias`.
     """
 
-    def __init__(self, keys: list[ApiKeyRef] | None = None) -> None:
+    def __init__(
+        self,
+        keys: list[ApiKeyRef] | None = None,
+        *,
+        per_key_submit_concurrency: int = 1,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
+        if per_key_submit_concurrency < 1:
+            raise ValueError("per_key_submit_concurrency must be >= 1")
         self._keys = list(keys or [])
         self._next_index = 0
+        self.per_key_submit_concurrency = per_key_submit_concurrency
+        self._clock = clock or time.monotonic
+        self._states = {key.alias: ApiKeyRuntimeState(alias=key.alias) for key in self._keys}
 
     @classmethod
     def from_env_file(
@@ -53,8 +73,15 @@ class ExtractorKeyPool:
     def has_keys(self) -> bool:
         return bool(self._keys)
 
-    def list_public_keys(self) -> list[dict[str, str]]:
-        return [key.public_dict() for key in self._keys]
+    def list_public_keys(self) -> list[dict[str, Any]]:
+        return [
+            {
+                **key.public_dict(),
+                "in_flight": self._states[key.alias].in_flight,
+                "cooldown_remaining_seconds": round(self.cooldown_remaining(key.alias), 3),
+            }
+            for key in self._keys
+        ]
 
     def next_key(self) -> ApiKeyRef | None:
         if not self._keys:
@@ -62,6 +89,51 @@ class ExtractorKeyPool:
         key = self._keys[self._next_index % len(self._keys)]
         self._next_index += 1
         return key
+
+    def acquire_key(self) -> ApiKeyRef | None:
+        """Reserve a key for a submit/upload worker.
+
+        Selection is round-robin but skips keys at their per-key concurrency
+        limit or in cooldown. Only aliases should be persisted outside memory.
+        """
+
+        if not self._keys:
+            return None
+        now = self._clock()
+        for offset in range(len(self._keys)):
+            index = (self._next_index + offset) % len(self._keys)
+            key = self._keys[index]
+            state = self._states[key.alias]
+            if state.cooldown_until > now:
+                continue
+            if state.in_flight >= self.per_key_submit_concurrency:
+                continue
+            state.in_flight += 1
+            self._next_index = index + 1
+            return key
+        return None
+
+    def release_key(self, alias: str, *, cooldown_seconds: float = 0.0) -> None:
+        state = self._require_state(alias)
+        state.in_flight = max(0, state.in_flight - 1)
+        if cooldown_seconds > 0:
+            state.cooldown_until = max(state.cooldown_until, self._clock() + cooldown_seconds)
+
+    def mark_key_cooldown(self, alias: str, *, cooldown_seconds: float) -> None:
+        if cooldown_seconds <= 0:
+            return
+        state = self._require_state(alias)
+        state.cooldown_until = max(state.cooldown_until, self._clock() + cooldown_seconds)
+
+    def cooldown_remaining(self, alias: str) -> float:
+        state = self._require_state(alias)
+        return max(0.0, state.cooldown_until - self._clock())
+
+    def _require_state(self, alias: str) -> ApiKeyRuntimeState:
+        try:
+            return self._states[alias]
+        except KeyError as exc:
+            raise KeyError(f"unknown extractor key alias: {alias}") from exc
 
 
 def load_dotenv_values(env_path: str | Path) -> dict[str, str]:

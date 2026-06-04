@@ -52,11 +52,13 @@ class ExtractionManager:
         cache_dir: str | Path,
         provider: ExtractorProvider | None = None,
         key_pool: ExtractorKeyPool | None = None,
+        failure_cooldown_seconds: float = 60.0,
     ) -> None:
         self.ledger = ledger
         self.cache_dir = Path(cache_dir)
         self.provider = provider or StubExtractorProvider()
         self.key_pool = key_pool or ExtractorKeyPool()
+        self.failure_cooldown_seconds = failure_cooldown_seconds
 
     def ensure_extraction(self, request: ExtractionRequest) -> ExtractionResult:
         input_file = Path(request.input_file)
@@ -78,7 +80,9 @@ class ExtractionManager:
         if existing is not None and existing["state"] in REUSABLE_EXTRACT_STATES:
             return ExtractionResult(job=existing, cache_hit=True)
 
-        api_key = self.key_pool.next_key()
+        api_key = self.key_pool.acquire_key()
+        if api_key is None and self.key_pool.has_keys():
+            raise RuntimeError("no extractor API key is currently available; all keys are busy or cooling down")
         api_key_alias = api_key.alias if api_key is not None else f"{self.provider.name}_stub"
         job_id = existing["job_id"] if existing is not None else str(uuid.uuid4())
         now = utc_now()
@@ -145,6 +149,11 @@ class ExtractionManager:
             final_job = self.ledger.get_extract_job(job_id=job["job_id"]) or job
             return ExtractionResult(job=final_job, cache_hit=False)
         except Exception as exc:
+            if api_key is not None:
+                self.key_pool.mark_key_cooldown(
+                    api_key.alias,
+                    cooldown_seconds=self.failure_cooldown_seconds,
+                )
             self.ledger.set_extract_job_state(
                 job["job_id"],
                 state="failed_retryable",
@@ -153,3 +162,6 @@ class ExtractionManager:
                 error_message=str(exc),
             )
             raise
+        finally:
+            if api_key is not None:
+                self.key_pool.release_key(api_key.alias)
