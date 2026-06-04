@@ -5,6 +5,7 @@ from typing import Any
 
 from ..backup import create_backup
 from ..embeddings import index_normalized_document, search_vector_index
+from ..index import verify_vector_index
 from ..runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime, scan_zotero_shadow
 from ..search import fulltext_search, metadata_search
 from .security import AccessDenied, verify_api_access
@@ -56,6 +57,10 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
     @app.get("/vectors", dependencies=[Depends(require_access)])
     def list_vector_indexes() -> dict[str, Any]:
         return {"indexes": ledger.list_vector_indexes()}
+
+    @app.get("/vectors/{profile_name}/verify", dependencies=[Depends(require_access)])
+    def verify_vectors(profile_name: str) -> dict[str, Any]:
+        return verify_vector_index(ledger, profile_name).to_dict()
 
     @app.get("/jobs", dependencies=[Depends(require_access)])
     def list_jobs(kind: str | None = None, status: str | None = None, limit: int | None = 50) -> dict[str, Any]:

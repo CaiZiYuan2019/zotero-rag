@@ -8,6 +8,7 @@ import sys
 from .backup import create_backup, verify_manifest_files
 from .embeddings import index_normalized_document, search_vector_index
 from .extractors import ExtractionManager, ExtractionRequest, ExtractorKeyPool, StubExtractorProvider
+from .index import verify_vector_index
 from .normalize import normalize_markdown_document
 from .runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime, scan_zotero_shadow
 from .search import fulltext_search, metadata_search
@@ -42,6 +43,8 @@ def build_parser() -> argparse.ArgumentParser:
     vectors = sub.add_parser("vectors", help="Inspect local vector index registrations.")
     vectors_sub = vectors.add_subparsers(dest="vectors_command", required=True)
     vectors_sub.add_parser("list")
+    vectors_verify = vectors_sub.add_parser("verify")
+    vectors_verify.add_argument("--profile", required=True)
 
     jobs = sub.add_parser("jobs", help="Inspect pipeline jobs and progress events.")
     jobs_sub = jobs.add_subparsers(dest="jobs_command", required=True)
@@ -181,6 +184,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "vectors" and args.vectors_command == "list":
             emit({"indexes": ledger.list_vector_indexes()})
             return 0
+        if args.command == "vectors" and args.vectors_command == "verify":
+            result = verify_vector_index(ledger, args.profile)
+            emit(result.to_dict())
+            return 0 if result.ok else 1
 
         if args.command == "jobs":
             if args.jobs_command == "list":
