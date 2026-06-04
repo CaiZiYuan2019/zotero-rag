@@ -1,0 +1,48 @@
+# Local environments
+.conda/
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*api_key*
+*apikey*
+*secret*
+*token*
+config/local.*
+config/secrets.*
+
+# Runtime data and generated artifacts
+data/
+logs/
+backups/
+ragserver/sql_shadow/
+ragserver/lib/
+lib/
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+
+# MinerU and RAG outputs
+*_mineru_*/
+*_mineru_*.zip
+mineru_output/
+extract_cache/
+normalized/
+vector_store/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
