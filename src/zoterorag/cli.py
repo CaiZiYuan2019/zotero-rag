@@ -34,6 +34,10 @@ def build_parser() -> argparse.ArgumentParser:
     models_sub = models.add_subparsers(dest="models_command", required=True)
     models_sub.add_parser("list")
 
+    vectors = sub.add_parser("vectors", help="Inspect local vector index registrations.")
+    vectors_sub = vectors.add_subparsers(dest="vectors_command", required=True)
+    vectors_sub.add_parser("list")
+
     review = sub.add_parser("review", help="Manage manual include/exclude rules.")
     review_sub = review.add_subparsers(dest="review_command", required=True)
     review_sub.add_parser("list")
@@ -121,6 +125,10 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "models" and args.models_command == "list":
             emit({"models": ledger.list_embedding_profiles()})
+            return 0
+
+        if args.command == "vectors" and args.vectors_command == "list":
+            emit({"indexes": ledger.list_vector_indexes()})
             return 0
 
         if args.command == "review":

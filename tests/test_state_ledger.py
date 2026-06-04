@@ -85,3 +85,26 @@ class StateLedgerTests(unittest.TestCase):
                 self.assertEqual({"attempt": 2, "pages": 8}, second["payload"])
             finally:
                 ledger.close()
+
+    def test_vector_index_registration_is_listable_for_control_plane(self) -> None:
+        with workspace_tmpdir("state-ledger-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                ledger.register_vector_index(
+                    profile_name="qwen3vl_cloud_2560_text",
+                    backend="sqlite-local",
+                    path=tmpdir / "vectors.sqlite",
+                    document_count=2,
+                    chunk_count=5,
+                    active=True,
+                )
+                indexes = ledger.list_vector_indexes()
+
+                self.assertEqual(1, len(indexes))
+                self.assertEqual("qwen3vl_cloud_2560_text", indexes[0]["profile_name"])
+                self.assertEqual("sqlite-local", indexes[0]["backend"])
+                self.assertEqual(2, indexes[0]["document_count"])
+                self.assertEqual(5, indexes[0]["chunk_count"])
+                self.assertTrue(indexes[0]["active"])
+            finally:
+                ledger.close()

@@ -43,6 +43,10 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
     def list_embedding_models() -> dict[str, Any]:
         return {"models": ledger.list_embedding_profiles()}
 
+    @app.get("/vectors", dependencies=[Depends(require_access)])
+    def list_vector_indexes() -> dict[str, Any]:
+        return {"indexes": ledger.list_vector_indexes()}
+
     @app.post("/scan", dependencies=[Depends(require_access)])
     def scan_shadow(payload: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = payload or {}

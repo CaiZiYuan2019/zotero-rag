@@ -38,7 +38,7 @@ class StateLedger:
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.db_path, isolation_level=None)
+        self.conn = sqlite3.connect(self.db_path, isolation_level=None, timeout=30)
         self.conn.row_factory = sqlite3.Row
         self._configure()
         self.migrate()
@@ -47,13 +47,17 @@ class StateLedger:
         self.conn.close()
 
     def _configure(self) -> None:
+        # Set the busy timeout before switching WAL mode. Startup code may have
+        # multiple short-lived CLI/API processes opening the state DB at once;
+        # waiting here avoids false "database is locked" failures during status
+        # reads while still keeping SQLite as a single-writer ledger.
+        self.conn.execute("PRAGMA busy_timeout=30000")
         # WAL lets readers inspect status while the single state writer records
         # progress. It does not make SQLite multi-writer; pipeline workers should
         # still funnel writes through one writer component.
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
-        self.conn.execute("PRAGMA busy_timeout=5000")
 
     def migrate(self) -> None:
         with self.conn:
@@ -458,6 +462,22 @@ class StateLedger:
                     utc_now(),
                 ),
             )
+
+    def list_vector_indexes(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT profile_name, backend, path, document_count, chunk_count, active, updated_at
+            FROM vector_indexes
+            ORDER BY profile_name
+            """
+        ).fetchall()
+        return [
+            {
+                **dict(row),
+                "active": bool(row["active"]),
+            }
+            for row in rows
+        ]
 
     def upsert_attachments(self, attachments: Iterable[dict[str, Any]]) -> int:
         count = 0
