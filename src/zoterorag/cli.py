@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 
 from .backup import create_backup, verify_manifest_files
+from .documents import get_document, list_documents
 from .embeddings import index_normalized_document, search_vector_index
 from .extractors import ExtractionManager, ExtractionRequest, ExtractorKeyPool, StubExtractorProvider
 from .index import verify_vector_index
@@ -68,6 +69,18 @@ def build_parser() -> argparse.ArgumentParser:
     attachments = sub.add_parser("attachments", help="List persisted attachment scan results.")
     attachments.add_argument("--classification", default=None)
     attachments.add_argument("--limit", type=int, default=50)
+
+    documents = sub.add_parser("documents", help="Inspect document-level control records.")
+    documents_sub = documents.add_subparsers(dest="documents_command", required=True)
+    documents_list = documents_sub.add_parser("list")
+    documents_list.add_argument("--limit", type=int, default=50)
+    documents_list.add_argument("--normalized-only", action="store_true")
+    documents_show = documents_sub.add_parser("show")
+    documents_show.add_argument("document_id")
+    documents_show.add_argument("--chunks", action="store_true")
+    documents_show.add_argument("--chunk-type", default=None, choices=("text", "image"))
+    documents_show.add_argument("--limit", type=int, default=20)
+    documents_show.add_argument("--consumer", default="manual", choices=("manual", "llm_text", "llm_multimodal"))
 
     search_metadata = sub.add_parser("search-metadata", help="Search scanned Zotero metadata without embeddings.")
     search_metadata.add_argument("query")
@@ -226,6 +239,30 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
             return 0
+
+        if args.command == "documents":
+            if args.documents_command == "list":
+                emit(
+                    {
+                        "documents": list_documents(
+                            ledger,
+                            limit=args.limit,
+                            include_metadata_only=not args.normalized_only,
+                        )
+                    }
+                )
+                return 0
+            if args.documents_command == "show":
+                document = get_document(
+                    ledger,
+                    args.document_id,
+                    include_chunks=args.chunks,
+                    chunk_type=args.chunk_type,
+                    limit=args.limit,
+                    consumer=args.consumer,
+                )
+                emit({"document": document})
+                return 0 if document is not None else 1
 
         if args.command == "search-metadata":
             emit(

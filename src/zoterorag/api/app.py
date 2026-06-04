@@ -4,6 +4,8 @@ from pathlib import Path
 from typing import Any
 
 from ..backup import create_backup
+from ..documents import get_document as get_document_record
+from ..documents import list_documents as list_document_records
 from ..embeddings import index_normalized_document, search_vector_index
 from ..index import verify_vector_index
 from ..runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime, scan_zotero_shadow
@@ -107,6 +109,39 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
     @app.get("/attachments", dependencies=[Depends(require_access)])
     def attachments(classification: str | None = None, limit: int | None = 100) -> dict[str, Any]:
         return {"attachments": ledger.list_attachments(classification=classification, limit=limit)}
+
+    @app.get("/documents", dependencies=[Depends(require_access)])
+    def documents(limit: int | None = 50, include_metadata_only: bool = True) -> dict[str, Any]:
+        return {
+            "documents": list_document_records(
+                ledger,
+                limit=limit,
+                include_metadata_only=include_metadata_only,
+            )
+        }
+
+    @app.get("/documents/{document_id}", dependencies=[Depends(require_access)])
+    def document(
+        document_id: str,
+        include_chunks: bool = False,
+        chunk_type: str | None = None,
+        limit: int | None = 20,
+        consumer: str = "llm_text",
+    ) -> dict[str, Any]:
+        try:
+            record = get_document_record(
+                ledger,
+                document_id,
+                include_chunks=include_chunks,
+                chunk_type=chunk_type,
+                limit=limit,
+                consumer=consumer,  # type: ignore[arg-type]
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"document not found: {document_id}")
+        return {"document": record}
 
     @app.post("/search/metadata", dependencies=[Depends(require_access)])
     def search_metadata(payload: dict[str, Any]) -> dict[str, Any]:

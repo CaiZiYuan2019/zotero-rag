@@ -744,16 +744,22 @@ class StateLedger:
             query += " LIMIT ?"
             params.append(limit)
         rows = self.conn.execute(query, params).fetchall()
-        results: list[dict[str, Any]] = []
-        for row in rows:
-            item = dict(row)
-            reasons_json = item.pop("reasons_json")
-            metadata_json = item.pop("metadata_json")
-            item["file_exists"] = bool(row["file_exists"])
-            item["reasons"] = json.loads(reasons_json)
-            item["metadata"] = json.loads(metadata_json)
-            results.append(item)
-        return results
+        return [decode_attachment_row(row) for row in rows]
+
+    def get_attachment(self, attachment_key: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT attachment_key, parent_key, content_type, relative_path,
+                   title, abstract, date_value, url, classification,
+                   source_quality, reasons_json, file_path, file_exists,
+                   file_size, file_mtime, metadata_json, content_fingerprint,
+                   scan_status, first_seen_at, last_seen_at, updated_at
+            FROM attachments
+            WHERE attachment_key = ?
+            """,
+            (attachment_key,),
+        ).fetchone()
+        return decode_attachment_row(row) if row is not None else None
 
     def search_attachments_metadata(
         self,
@@ -1373,6 +1379,16 @@ def decode_job_event_row(row: sqlite3.Row) -> dict[str, Any]:
     item = dict(row)
     payload_json = item.pop("payload_json")
     item["payload"] = json.loads(payload_json)
+    return item
+
+
+def decode_attachment_row(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    reasons_json = item.pop("reasons_json")
+    metadata_json = item.pop("metadata_json")
+    item["file_exists"] = bool(row["file_exists"])
+    item["reasons"] = json.loads(reasons_json)
+    item["metadata"] = json.loads(metadata_json)
     return item
 
 
