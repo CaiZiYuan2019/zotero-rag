@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from ..backup import create_backup
+from ..backup import create_backup, plan_restore_backup, resolve_backup_manifest
 from ..documents import get_document as get_document_record
 from ..documents import list_documents as list_document_records
 from ..embeddings import index_normalized_document, search_vector_index
@@ -261,6 +261,14 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
     @app.get("/backup/list", dependencies=[Depends(require_access)])
     def backup_list() -> dict[str, Any]:
         return {"backups": ledger.list_backups()}
+
+    @app.post("/backup/restore-plan", dependencies=[Depends(require_access)])
+    def backup_restore_plan(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            manifest_path = resolve_backup_manifest(ledger, str(payload["backup"]))
+            return plan_restore_backup(config, manifest_path).to_dict()
+        except (FileNotFoundError, KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/extract/jobs", dependencies=[Depends(require_access)])
     def extract_jobs(state: str | None = None, limit: int | None = 50) -> dict[str, Any]:

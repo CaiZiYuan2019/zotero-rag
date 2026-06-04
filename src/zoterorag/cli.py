@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import sys
 
-from .backup import create_backup, verify_manifest_files
+from .backup import create_backup, plan_restore_backup, resolve_backup_manifest, restore_backup, verify_manifest_files
 from .documents import get_document, list_documents
 from .embeddings import index_normalized_document, search_vector_index
 from .extractors import ExtractionManager, ExtractionRequest, ExtractorKeyPool, StubExtractorProvider
@@ -125,6 +125,10 @@ def build_parser() -> argparse.ArgumentParser:
     backup_sub.add_parser("list")
     backup_verify = backup_sub.add_parser("verify")
     backup_verify.add_argument("manifest")
+    backup_restore = backup_sub.add_parser("restore")
+    backup_restore.add_argument("backup", help="Backup id or backup_manifest.json path.")
+    backup_restore.add_argument("--pre-restore-out", required=True)
+    backup_restore.add_argument("--confirm", action="store_true")
 
     extract = sub.add_parser("extract", help="Manage PDF extraction jobs and cache state.")
     extract_sub = extract.add_subparsers(dest="extract_command", required=True)
@@ -372,6 +376,23 @@ def main(argv: list[str] | None = None) -> int:
                 errors = verify_manifest_files(args.manifest)
                 emit({"ok": not errors, "errors": errors})
                 return 0 if not errors else 1
+            if args.backup_command == "restore":
+                manifest_path = resolve_backup_manifest(ledger, args.backup)
+                if not args.confirm:
+                    emit(plan_restore_backup(config, manifest_path).to_dict())
+                    return 0
+                emit(
+                    restore_backup(
+                        config,
+                        ledger,
+                        manifest_path=manifest_path,
+                        pre_restore_out_dir=args.pre_restore_out,
+                        config_path=args.config,
+                        confirm=True,
+                        close_ledger_before_apply=True,
+                    ).to_dict()
+                )
+                return 0
 
         if args.command == "extract":
             if args.extract_command == "dry-run":

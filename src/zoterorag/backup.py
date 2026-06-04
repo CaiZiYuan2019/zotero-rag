@@ -35,6 +35,26 @@ class BackupResult:
         }
 
 
+@dataclass(frozen=True)
+class RestoreResult:
+    manifest_path: Path
+    mode: str
+    applied: bool
+    files: list[dict[str, Any]]
+    errors: list[str]
+    pre_restore_backup: dict[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "manifest_path": str(self.manifest_path),
+            "mode": self.mode,
+            "applied": self.applied,
+            "files": self.files,
+            "errors": self.errors,
+            "pre_restore_backup": self.pre_restore_backup,
+        }
+
+
 def create_backup(
     config: AppConfig,
     ledger: StateLedger,
@@ -107,6 +127,90 @@ def create_backup(
     return result
 
 
+def plan_restore_backup(config: AppConfig, manifest_path: str | Path) -> RestoreResult:
+    """Validate a backup manifest and map restorable files to runtime targets.
+
+    This function is read-only. It never mutates the current runtime and never
+    restores config files or Zotero source data. Config files are included in
+    backups for auditability, but restoring them implicitly could repoint the
+    application at an unexpected Zotero library.
+    """
+
+    manifest_file = Path(manifest_path).expanduser().resolve()
+    manifest = read_manifest(manifest_file)
+    errors = verify_manifest_files(manifest_file)
+    files = build_restore_file_plan(config, manifest_file, manifest)
+    return RestoreResult(
+        manifest_path=manifest_file,
+        mode=str(manifest.get("mode", "unknown")),
+        applied=False,
+        files=files,
+        errors=errors,
+    )
+
+
+def restore_backup(
+    config: AppConfig,
+    ledger: StateLedger,
+    *,
+    manifest_path: str | Path,
+    pre_restore_out_dir: str | Path,
+    config_path: str | Path = "config/config.example.toml",
+    confirm: bool = False,
+    close_ledger_before_apply: bool = False,
+) -> RestoreResult:
+    """Restore runtime files from a verified backup.
+
+    Actual restore is intentionally opt-in through `confirm=True`. When applying
+    inside the CLI, pass `close_ledger_before_apply=True` so Windows can replace
+    the current state SQLite file after the pre-restore snapshot is created.
+    """
+
+    planned = plan_restore_backup(config, manifest_path)
+    if planned.errors or not confirm:
+        return planned
+
+    pre_restore = create_backup(
+        config,
+        ledger,
+        mode="snapshot",
+        out_dir=pre_restore_out_dir,
+        config_path=config_path,
+    )
+    if close_ledger_before_apply:
+        ledger.close()
+
+    applied_files: list[dict[str, Any]] = []
+    for item in planned.files:
+        if not item.get("restorable", False):
+            applied_files.append({**item, "applied": False})
+            continue
+        source = Path(item["source_path"])
+        target = Path(item["target_path"])
+        restore_file(source, target)
+        applied_files.append({**item, "applied": True})
+
+    return RestoreResult(
+        manifest_path=planned.manifest_path,
+        mode=planned.mode,
+        applied=True,
+        files=applied_files,
+        errors=[],
+        pre_restore_backup=pre_restore.to_dict(),
+    )
+
+
+def resolve_backup_manifest(ledger: StateLedger, backup_ref: str | Path) -> Path:
+    ref_path = Path(backup_ref)
+    if ref_path.is_file():
+        return ref_path
+    for backup in ledger.list_backups():
+        if backup["backup_id"] == str(backup_ref):
+            manifest_path = Path(backup["manifest"].get("manifest_path") or Path(backup["path"]) / BACKUP_MANIFEST)
+            return manifest_path
+    raise KeyError(f"backup not found: {backup_ref}")
+
+
 def copy_sqlite_database(source: str | Path, target: str | Path) -> None:
     source_path = Path(source)
     target_path = Path(target)
@@ -149,6 +253,85 @@ def copy_runtime_tree(source: Path, target: Path, backup_root: Path) -> list[dic
         copy_file(path, target_path)
         entries.append(file_manifest_entry(target_path, str(target_path.relative_to(backup_root))))
     return entries
+
+
+def read_manifest(manifest_path: str | Path) -> dict[str, Any]:
+    manifest_file = Path(manifest_path)
+    if not manifest_file.is_file():
+        raise FileNotFoundError(f"backup manifest not found: {manifest_file}")
+    return json.loads(manifest_file.read_text(encoding="utf-8"))
+
+
+def build_restore_file_plan(
+    config: AppConfig,
+    manifest_path: Path,
+    manifest: dict[str, Any],
+) -> list[dict[str, Any]]:
+    root = manifest_path.parent
+    planned: list[dict[str, Any]] = []
+    for item in manifest.get("files", []):
+        relative_path = str(item["path"]).replace("\\", "/")
+        source = (root / relative_path).resolve()
+        target = restore_target_for_relative_path(config, relative_path)
+        if target is None:
+            planned.append(
+                {
+                    "path": relative_path,
+                    "source_path": str(source),
+                    "target_path": None,
+                    "restorable": False,
+                    "reason": "not_runtime_restore_target",
+                }
+            )
+            continue
+        planned.append(
+            {
+                "path": relative_path,
+                "source_path": str(source),
+                "target_path": str(target),
+                "restorable": True,
+            }
+        )
+    return planned
+
+
+def restore_target_for_relative_path(config: AppConfig, relative_path: str) -> Path | None:
+    if relative_path == "state/state.sqlite":
+        return config.paths.state_db
+    if relative_path == "shadow/zotero.sqlite":
+        return config.paths.shadow_db
+    runtime_prefixes = {
+        "vector_store/": config.paths.vector_store_dir,
+        "extract_cache/": config.paths.extract_cache_dir,
+        "normalized/": config.paths.normalized_dir,
+        "embedding_cache/": config.paths.embedding_cache_dir,
+    }
+    for prefix, target_root in runtime_prefixes.items():
+        if relative_path.startswith(prefix):
+            suffix = relative_path.removeprefix(prefix)
+            target = target_root / Path(suffix)
+            ensure_restore_target_allowed(config, target)
+            return target
+    return None
+
+
+def ensure_restore_target_allowed(config: AppConfig, target: Path) -> None:
+    resolved = target.resolve()
+    data_dir = config.paths.data_dir.resolve()
+    if resolved == data_dir or data_dir in resolved.parents:
+        return
+    raise ValueError(f"restore target escapes runtime data directory: {target}")
+
+
+def restore_file(source: str | Path, target: str | Path) -> None:
+    source_path = Path(source)
+    target_path = Path(target)
+    if not source_path.is_file():
+        raise FileNotFoundError(f"backup file missing during restore: {source_path}")
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_target = target_path.with_name(f"{target_path.name}.restore_tmp")
+    shutil.copy2(source_path, temporary_target)
+    temporary_target.replace(target_path)
 
 
 def file_manifest_entry(path: str | Path, relative_path: str) -> dict[str, Any]:
