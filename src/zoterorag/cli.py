@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 
 from .backup import create_backup, verify_manifest_files
+from .extractors import ExtractionManager, ExtractionRequest, ExtractorKeyPool, StubExtractorProvider
 from .runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime, scan_zotero_shadow
 from .search import metadata_search
 from .zotero import ZoteroShadow
@@ -61,6 +62,29 @@ def build_parser() -> argparse.ArgumentParser:
     backup_sub.add_parser("list")
     backup_verify = backup_sub.add_parser("verify")
     backup_verify.add_argument("manifest")
+
+    extract = sub.add_parser("extract", help="Manage PDF extraction jobs and cache state.")
+    extract_sub = extract.add_subparsers(dest="extract_command", required=True)
+    extract_dry = extract_sub.add_parser("dry-run", help="Create or reuse a non-network stub extraction job.")
+    extract_dry.add_argument("--pdf", required=True, help="PDF path or any local file for stub-only tests.")
+    extract_dry.add_argument("--attachment-key", default=None)
+    extract_dry.add_argument("--sha256", default=None, help="Known PDF sha256. If omitted, the file is hashed.")
+    extract_dry.add_argument("--pages", default="", help="Canonical selected page range used in the cache key.")
+    extract_dry.add_argument(
+        "--selected-page-count",
+        type=int,
+        default=1,
+        help="Selected page count for timeout estimate; MinerU timeout defaults to pages*6+30.",
+    )
+    extract_dry.add_argument("--options-json", default="{}", help="Additional extractor options as JSON.")
+    extract_dry.add_argument(
+        "--env",
+        default=".env",
+        help="Optional env file for MinerU key aliases. Values are never printed or stored.",
+    )
+    extract_jobs = extract_sub.add_parser("jobs", help="List persisted extraction jobs.")
+    extract_jobs.add_argument("--state", default=None)
+    extract_jobs.add_argument("--limit", type=int, default=50)
 
     inspect = sub.add_parser("inspect-shadow", help="Read summary from an existing shadow DB.")
     inspect.add_argument("--limit", type=int, default=5)
@@ -161,6 +185,38 @@ def main(argv: list[str] | None = None) -> int:
                 errors = verify_manifest_files(args.manifest)
                 emit({"ok": not errors, "errors": errors})
                 return 0 if not errors else 1
+
+        if args.command == "extract":
+            if args.extract_command == "dry-run":
+                options = json.loads(args.options_json)
+                key_pool = ExtractorKeyPool.from_env_file(args.env)
+                manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=config.paths.extract_cache_dir,
+                    provider=StubExtractorProvider(),
+                    key_pool=key_pool,
+                )
+                result = manager.ensure_extraction(
+                    ExtractionRequest(
+                        input_file=Path(args.pdf),
+                        attachment_key=args.attachment_key,
+                        pdf_sha256=args.sha256,
+                        selected_pages=args.pages,
+                        selected_page_count=args.selected_page_count,
+                        options=options,
+                    )
+                )
+                emit(
+                    {
+                        "cache_hit": result.cache_hit,
+                        "job": result.job,
+                        "available_key_aliases": key_pool.list_public_keys(),
+                    }
+                )
+                return 0
+            if args.extract_command == "jobs":
+                emit({"jobs": ledger.list_extract_jobs(state=args.state, limit=args.limit)})
+                return 0
 
         if args.command == "inspect-shadow":
             shadow_path = Path(config.paths.shadow_db)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import Protocol
 
@@ -54,6 +55,18 @@ class StubExtractorProvider:
     def download(self, external_job_id: str, output_dir: Path) -> ExtractArtifact:
         output_dir.mkdir(parents=True, exist_ok=True)
         manifest = output_dir / "manifest.json"
-        manifest.write_text('{"provider":"stub","state":"completed"}\n', encoding="utf-8")
+        manifest.write_text(
+            json.dumps(
+                {
+                    "provider": self.name,
+                    "provider_version": self.version,
+                    "external_job_id": external_job_id,
+                    "state": "completed",
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         return ExtractArtifact(source_pdf=Path(external_job_id), artifact_dir=output_dir, manifest_path=manifest)
-

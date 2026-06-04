@@ -104,4 +104,8 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
     def backup_list() -> dict[str, Any]:
         return {"backups": ledger.list_backups()}
 
+    @app.get("/extract/jobs", dependencies=[Depends(require_access)])
+    def extract_jobs(state: str | None = None, limit: int | None = 50) -> dict[str, Any]:
+        return {"jobs": ledger.list_extract_jobs(state=state, limit=limit)}
+
     return app

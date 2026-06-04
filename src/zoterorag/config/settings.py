@@ -23,6 +23,18 @@ class PathsConfig:
     def vector_store_dir(self) -> Path:
         return self.data_dir / "vector_store"
 
+    @property
+    def extract_cache_dir(self) -> Path:
+        return self.data_dir / "extract_cache"
+
+    @property
+    def normalized_dir(self) -> Path:
+        return self.data_dir / "normalized"
+
+    @property
+    def embedding_cache_dir(self) -> Path:
+        return self.data_dir / "embedding_cache"
+
 
 @dataclass(frozen=True)
 class ServerConfig:
@@ -57,6 +69,9 @@ class AppConfig:
             self.paths.state_db.parent,
             self.paths.shadow_db.parent,
             self.paths.vector_store_dir,
+            self.paths.extract_cache_dir,
+            self.paths.normalized_dir,
+            self.paths.embedding_cache_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)
 
@@ -80,4 +95,3 @@ def load_config(path: str | Path = "config/config.example.toml") -> AppConfig:
     )
     profiles = tuple(EmbeddingProfile(**profile) for profile in profiles_data)
     return AppConfig(paths=paths, server=server, embedding_profiles=profiles)
-

@@ -216,6 +216,50 @@ class StateLedger:
                 )
                 """
             )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS extract_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    attachment_key TEXT,
+                    pdf_sha256 TEXT NOT NULL,
+                    selected_pages TEXT NOT NULL DEFAULT '',
+                    cache_key TEXT NOT NULL UNIQUE,
+                    provider TEXT NOT NULL,
+                    provider_version TEXT NOT NULL,
+                    options_hash TEXT NOT NULL,
+                    api_key_alias TEXT NOT NULL DEFAULT '',
+                    external_job_id TEXT,
+                    state TEXT NOT NULL,
+                    local_stage TEXT NOT NULL,
+                    zip_path TEXT,
+                    extract_dir TEXT,
+                    artifact_dir TEXT,
+                    manifest_path TEXT,
+                    error_code TEXT,
+                    error_message TEXT,
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    submitted_at TEXT,
+                    last_poll_at TEXT,
+                    updated_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}'
+                )
+                """
+            )
+            # MinerU and later extractor workers may run for hours. These
+            # indexes keep resume/status lookups cheap without storing large API
+            # payloads in SQLite.
+            self.conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_extract_jobs_state
+                ON extract_jobs(state, local_stage)
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_extract_jobs_attachment
+                ON extract_jobs(attachment_key)
+                """
+            )
 
     def _ensure_columns(self, table_name: str, columns: dict[str, str]) -> None:
         existing = {
@@ -645,6 +689,194 @@ class StateLedger:
             for row in rows
         ]
 
+    def upsert_extract_job(self, job: dict[str, Any]) -> dict[str, Any]:
+        """Persist one extractor job without leaking API secrets.
+
+        Callers may store an `api_key_alias` such as `mineru_1`, but never pass
+        the raw API key here. This keeps exported state, progress JSON, and full
+        backups safe to inspect or share.
+        """
+
+        now = utc_now()
+        job_id = job.get("job_id") or str(uuid.uuid4())
+        payload_json = json.dumps(job.get("payload", {}), ensure_ascii=False, sort_keys=True, default=str)
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO extract_jobs(
+                    job_id, attachment_key, pdf_sha256, selected_pages, cache_key,
+                    provider, provider_version, options_hash, api_key_alias,
+                    external_job_id, state, local_stage, zip_path, extract_dir,
+                    artifact_dir, manifest_path, error_code, error_message,
+                    retry_count, submitted_at, last_poll_at, updated_at, payload_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    attachment_key = excluded.attachment_key,
+                    pdf_sha256 = excluded.pdf_sha256,
+                    selected_pages = excluded.selected_pages,
+                    provider = excluded.provider,
+                    provider_version = excluded.provider_version,
+                    options_hash = excluded.options_hash,
+                    api_key_alias = excluded.api_key_alias,
+                    external_job_id = excluded.external_job_id,
+                    state = excluded.state,
+                    local_stage = excluded.local_stage,
+                    zip_path = excluded.zip_path,
+                    extract_dir = excluded.extract_dir,
+                    artifact_dir = excluded.artifact_dir,
+                    manifest_path = excluded.manifest_path,
+                    error_code = excluded.error_code,
+                    error_message = excluded.error_message,
+                    retry_count = excluded.retry_count,
+                    submitted_at = COALESCE(extract_jobs.submitted_at, excluded.submitted_at),
+                    last_poll_at = excluded.last_poll_at,
+                    updated_at = excluded.updated_at,
+                    payload_json = excluded.payload_json
+                """,
+                (
+                    job_id,
+                    job.get("attachment_key"),
+                    job["pdf_sha256"],
+                    job.get("selected_pages", ""),
+                    job["cache_key"],
+                    job["provider"],
+                    job["provider_version"],
+                    job["options_hash"],
+                    job.get("api_key_alias", ""),
+                    job.get("external_job_id"),
+                    job["state"],
+                    job["local_stage"],
+                    job.get("zip_path"),
+                    job.get("extract_dir"),
+                    job.get("artifact_dir"),
+                    job.get("manifest_path"),
+                    job.get("error_code"),
+                    job.get("error_message"),
+                    int(job.get("retry_count", 0)),
+                    job.get("submitted_at"),
+                    job.get("last_poll_at"),
+                    now,
+                    payload_json,
+                ),
+            )
+        return self.get_extract_job(job_id=job_id) or self.get_extract_job_by_cache_key(job["cache_key"])  # type: ignore[return-value]
+
+    def get_extract_job(self, *, job_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT job_id, attachment_key, pdf_sha256, selected_pages, cache_key,
+                   provider, provider_version, options_hash, api_key_alias,
+                   external_job_id, state, local_stage, zip_path, extract_dir,
+                   artifact_dir, manifest_path, error_code, error_message,
+                   retry_count, submitted_at, last_poll_at, updated_at, payload_json
+            FROM extract_jobs
+            WHERE job_id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+        return decode_extract_job_row(row)
+
+    def get_extract_job_by_cache_key(self, cache_key: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT job_id, attachment_key, pdf_sha256, selected_pages, cache_key,
+                   provider, provider_version, options_hash, api_key_alias,
+                   external_job_id, state, local_stage, zip_path, extract_dir,
+                   artifact_dir, manifest_path, error_code, error_message,
+                   retry_count, submitted_at, last_poll_at, updated_at, payload_json
+            FROM extract_jobs
+            WHERE cache_key = ?
+            """,
+            (cache_key,),
+        ).fetchone()
+        return decode_extract_job_row(row)
+
+    def list_extract_jobs(
+        self,
+        *,
+        state: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        query = """
+            SELECT job_id, attachment_key, pdf_sha256, selected_pages, cache_key,
+                   provider, provider_version, options_hash, api_key_alias,
+                   external_job_id, state, local_stage, zip_path, extract_dir,
+                   artifact_dir, manifest_path, error_code, error_message,
+                   retry_count, submitted_at, last_poll_at, updated_at, payload_json
+            FROM extract_jobs
+        """
+        params: list[Any] = []
+        if state is not None:
+            query += " WHERE state = ?"
+            params.append(state)
+        query += " ORDER BY updated_at DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        rows = self.conn.execute(query, params).fetchall()
+        return [job for row in rows if (job := decode_extract_job_row(row)) is not None]
+
+    def set_extract_job_state(
+        self,
+        job_id: str,
+        *,
+        state: str,
+        local_stage: str,
+        external_job_id: str | None = None,
+        zip_path: str | Path | None = None,
+        extract_dir: str | Path | None = None,
+        artifact_dir: str | Path | None = None,
+        manifest_path: str | Path | None = None,
+        error_code: str | None = None,
+        error_message: str | None = None,
+        last_poll_at: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        existing = self.get_extract_job(job_id=job_id)
+        if existing is None:
+            raise KeyError(f"extract job not found: {job_id}")
+        payload_json = json.dumps(
+            payload if payload is not None else existing.get("payload", {}),
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE extract_jobs
+                SET state = ?,
+                    local_stage = ?,
+                    external_job_id = COALESCE(?, external_job_id),
+                    zip_path = COALESCE(?, zip_path),
+                    extract_dir = COALESCE(?, extract_dir),
+                    artifact_dir = COALESCE(?, artifact_dir),
+                    manifest_path = COALESCE(?, manifest_path),
+                    error_code = ?,
+                    error_message = ?,
+                    last_poll_at = COALESCE(?, last_poll_at),
+                    updated_at = ?,
+                    payload_json = ?
+                WHERE job_id = ?
+                """,
+                (
+                    state,
+                    local_stage,
+                    external_job_id,
+                    str(zip_path) if zip_path is not None else None,
+                    str(extract_dir) if extract_dir is not None else None,
+                    str(artifact_dir) if artifact_dir is not None else None,
+                    str(manifest_path) if manifest_path is not None else None,
+                    error_code,
+                    error_message,
+                    last_poll_at,
+                    utc_now(),
+                    payload_json,
+                    job_id,
+                ),
+            )
+
     def mark_absent_attachments_deleted(self, present_attachment_keys: Iterable[str]) -> int:
         keys = sorted(set(present_attachment_keys))
         now = utc_now()
@@ -693,6 +925,7 @@ class StateLedger:
         attachments = self.conn.execute("SELECT classification, count(*) AS n FROM attachments GROUP BY classification").fetchall()
         scan_statuses = self.conn.execute("SELECT scan_status, count(*) AS n FROM attachments GROUP BY scan_status").fetchall()
         backups = self.conn.execute("SELECT count(*) AS n FROM backups").fetchone()
+        extract_jobs = self.conn.execute("SELECT state, count(*) AS n FROM extract_jobs GROUP BY state").fetchall()
         return {
             "schema_version": SCHEMA_VERSION,
             "jobs": {row["status"]: row["n"] for row in jobs},
@@ -702,6 +935,7 @@ class StateLedger:
             "attachments": {row["classification"]: row["n"] for row in attachments},
             "scan_statuses": {row["scan_status"]: row["n"] for row in scan_statuses},
             "backups": backups["n"],
+            "extract_jobs": {row["state"]: row["n"] for row in extract_jobs},
         }
 
 
@@ -751,3 +985,12 @@ def metadata_match_score(item: dict[str, Any], terms: list[str]) -> float:
             if term in value:
                 score += weight
     return score
+
+
+def decode_extract_job_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    item = dict(row)
+    payload_json = item.pop("payload_json")
+    item["payload"] = json.loads(payload_json)
+    return item
