@@ -45,4 +45,4 @@ vector_store/
 Thumbs.db
 .idea/
 .vscode/
-
+.tmp/

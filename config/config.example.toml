@@ -1,0 +1,30 @@
+[paths]
+zotero_db = "E:/ZoteroLib/lib/zotero.sqlite"
+zotero_storage = "E:/ZoteroLib/lib/storage"
+data_dir = "data"
+
+[server]
+host = "127.0.0.1"
+port = 8765
+require_api_token = true
+
+[[embedding_profiles]]
+name = "qwen3vl_cloud_2560_text"
+provider = "dashscope"
+model = "qwen3-vl-embedding"
+dimension = 2560
+modality = "text"
+enabled = true
+default_for_text = true
+default_for_multimodal = false
+
+[[embedding_profiles]]
+name = "qwen3vl_cloud_2560_multimodal"
+provider = "dashscope"
+model = "qwen3-vl-embedding"
+dimension = 2560
+modality = "multimodal"
+enabled = true
+default_for_text = false
+default_for_multimodal = true
+

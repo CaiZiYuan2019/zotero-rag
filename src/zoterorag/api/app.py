@@ -1,0 +1,69 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from ..runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime
+from .security import AccessDenied, verify_api_access
+
+
+def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
+    try:
+        from fastapi import Depends, FastAPI, Header, HTTPException, Request
+    except ImportError as exc:  # pragma: no cover - depends on optional package
+        raise RuntimeError("FastAPI is not installed. Install zotero-rag[api].") from exc
+
+    config, ledger = initialize_runtime(config_path)
+    app = FastAPI(title="ZoteroRAG", version="0.1.0")
+
+    def require_access(
+        request: Request,
+        x_api_token: str | None = Header(default=None, alias="X-API-Token"),
+    ) -> None:
+        try:
+            verify_api_access(
+                supplied_token=x_api_token,
+                client_host=request.client.host if request.client else None,
+                require_api_token=config.server.require_api_token,
+            )
+        except AccessDenied as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    @app.get("/health")
+    def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.get("/status", dependencies=[Depends(require_access)])
+    def status() -> dict[str, Any]:
+        return {"runtime": config_as_public_dict(config), "state": ledger.status_summary()}
+
+    @app.get("/models/embedding", dependencies=[Depends(require_access)])
+    def list_embedding_models() -> dict[str, Any]:
+        return {"models": ledger.list_embedding_profiles()}
+
+    @app.post("/scan", dependencies=[Depends(require_access)])
+    def scan_shadow() -> dict[str, Any]:
+        # First implementation checkpoint: verify safe shadow creation only.
+        # Full Zotero classification will build on the shadow DB.
+        return copy_zotero_shadow(config, ledger)
+
+    @app.post("/review/include", dependencies=[Depends(require_access)])
+    def include_attachment(payload: dict[str, Any]) -> dict[str, str]:
+        key = str(payload["attachment_key"])
+        reason = str(payload.get("reason", "manual include"))
+        ledger.upsert_review_rule(key, "include", reason)
+        return {"attachment_key": key, "decision": "include"}
+
+    @app.post("/review/exclude", dependencies=[Depends(require_access)])
+    def exclude_attachment(payload: dict[str, Any]) -> dict[str, str]:
+        key = str(payload["attachment_key"])
+        reason = str(payload.get("reason", "manual exclude"))
+        ledger.upsert_review_rule(key, "exclude", reason)
+        return {"attachment_key": key, "decision": "exclude"}
+
+    @app.get("/review", dependencies=[Depends(require_access)])
+    def review_rules() -> dict[str, Any]:
+        return {"rules": ledger.list_review_rules()}
+
+    return app
+
