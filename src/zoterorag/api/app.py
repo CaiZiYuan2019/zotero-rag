@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from ..backup import create_backup
 from ..runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime, scan_zotero_shadow
 from ..search import metadata_search
 from .security import AccessDenied, verify_api_access
@@ -88,5 +89,19 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
                 consumer=str(payload.get("consumer", "llm_text")),
             )
         }
+
+    @app.post("/backup/create", dependencies=[Depends(require_access)])
+    def backup_create(payload: dict[str, Any]) -> dict[str, Any]:
+        return create_backup(
+            config,
+            ledger,
+            mode=str(payload.get("mode", "snapshot")),
+            out_dir=payload["out"],
+            config_path=config_path,
+        ).to_dict()
+
+    @app.get("/backup/list", dependencies=[Depends(require_access)])
+    def backup_list() -> dict[str, Any]:
+        return {"backups": ledger.list_backups()}
 
     return app

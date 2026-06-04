@@ -205,6 +205,17 @@ class StateLedger:
                 )
                 """
             )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS backups (
+                    backup_id TEXT PRIMARY KEY,
+                    mode TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    manifest_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
 
     def _ensure_columns(self, table_name: str, columns: dict[str, str]) -> None:
         existing = {
@@ -594,6 +605,46 @@ class StateLedger:
                 (job_id, json.dumps(summary, ensure_ascii=False, sort_keys=True), utc_now()),
             )
 
+    def add_backup_record(self, backup_id: str, mode: str, path: str | Path, manifest: dict[str, Any]) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO backups(backup_id, mode, path, manifest_json, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(backup_id) DO UPDATE SET
+                    mode = excluded.mode,
+                    path = excluded.path,
+                    manifest_json = excluded.manifest_json,
+                    created_at = excluded.created_at
+                """,
+                (
+                    backup_id,
+                    mode,
+                    str(path),
+                    json.dumps(manifest, ensure_ascii=False, sort_keys=True, default=str),
+                    utc_now(),
+                ),
+            )
+
+    def list_backups(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT backup_id, mode, path, manifest_json, created_at
+            FROM backups
+            ORDER BY created_at DESC
+            """
+        ).fetchall()
+        return [
+            {
+                "backup_id": row["backup_id"],
+                "mode": row["mode"],
+                "path": row["path"],
+                "manifest": json.loads(row["manifest_json"]),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
     def mark_absent_attachments_deleted(self, present_attachment_keys: Iterable[str]) -> int:
         keys = sorted(set(present_attachment_keys))
         now = utc_now()
@@ -641,6 +692,7 @@ class StateLedger:
         indexes = self.conn.execute("SELECT count(*) AS n FROM vector_indexes").fetchone()
         attachments = self.conn.execute("SELECT classification, count(*) AS n FROM attachments GROUP BY classification").fetchall()
         scan_statuses = self.conn.execute("SELECT scan_status, count(*) AS n FROM attachments GROUP BY scan_status").fetchall()
+        backups = self.conn.execute("SELECT count(*) AS n FROM backups").fetchone()
         return {
             "schema_version": SCHEMA_VERSION,
             "jobs": {row["status"]: row["n"] for row in jobs},
@@ -649,6 +701,7 @@ class StateLedger:
             "vector_indexes": indexes["n"],
             "attachments": {row["classification"]: row["n"] for row in attachments},
             "scan_statuses": {row["scan_status"]: row["n"] for row in scan_statuses},
+            "backups": backups["n"],
         }
 
 

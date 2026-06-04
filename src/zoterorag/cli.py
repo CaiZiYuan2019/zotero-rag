@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import sys
 
+from .backup import create_backup, verify_manifest_files
 from .runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime, scan_zotero_shadow
 from .search import metadata_search
 from .zotero import ZoteroShadow
@@ -51,6 +52,15 @@ def build_parser() -> argparse.ArgumentParser:
     search_metadata.add_argument("--classification", default=None)
     search_metadata.add_argument("--limit", type=int, default=10)
     search_metadata.add_argument("--consumer", default="llm_text", choices=("manual", "llm_text", "llm_multimodal"))
+
+    backup = sub.add_parser("backup", help="Create and inspect ZoteroRAG runtime backups.")
+    backup_sub = backup.add_subparsers(dest="backup_command", required=True)
+    backup_create = backup_sub.add_parser("create")
+    backup_create.add_argument("--mode", choices=("snapshot", "full"), default="snapshot")
+    backup_create.add_argument("--out", required=True)
+    backup_sub.add_parser("list")
+    backup_verify = backup_sub.add_parser("verify")
+    backup_verify.add_argument("manifest")
 
     inspect = sub.add_parser("inspect-shadow", help="Read summary from an existing shadow DB.")
     inspect.add_argument("--limit", type=int, default=5)
@@ -131,6 +141,26 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
             return 0
+
+        if args.command == "backup":
+            if args.backup_command == "create":
+                emit(
+                    create_backup(
+                        config,
+                        ledger,
+                        mode=args.mode,
+                        out_dir=args.out,
+                        config_path=args.config,
+                    ).to_dict()
+                )
+                return 0
+            if args.backup_command == "list":
+                emit({"backups": ledger.list_backups()})
+                return 0
+            if args.backup_command == "verify":
+                errors = verify_manifest_files(args.manifest)
+                emit({"ok": not errors, "errors": errors})
+                return 0 if not errors else 1
 
         if args.command == "inspect-shadow":
             shadow_path = Path(config.paths.shadow_db)
