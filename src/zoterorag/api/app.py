@@ -8,6 +8,7 @@ from ..documents import get_document as get_document_record
 from ..documents import list_documents as list_document_records
 from ..embeddings import index_normalized_document, search_vector_index
 from ..index import verify_vector_index
+from ..pipeline import cancel_ingest_job, pause_ingest_job, resume_ingest_job, start_ingest_job
 from ..runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime, scan_zotero_shadow
 from ..search import fulltext_search, metadata_search
 from .security import AccessDenied, verify_api_access
@@ -84,6 +85,55 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
             refresh_shadow=bool(payload.get("refresh_shadow", True)),
             limit=payload.get("limit"),
         )
+
+    @app.post("/ingest/start", dependencies=[Depends(require_access)])
+    def ingest_start(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = payload or {}
+        try:
+            return start_ingest_job(
+                ledger,
+                mode=str(payload.get("mode", "incremental")),  # type: ignore[arg-type]
+                zotero_key=payload.get("zotero_key"),
+                include_multimodal=bool(payload.get("include_multimodal", True)),
+                execute=bool(payload.get("execute", False)),
+            )
+        except NotImplementedError as exc:
+            raise HTTPException(status_code=501, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/ingest/pause", dependencies=[Depends(require_access)])
+    def ingest_pause(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return pause_ingest_job(
+                ledger,
+                str(payload["job_id"]),
+                reason=str(payload.get("reason", "manual pause")),
+            )
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/ingest/resume", dependencies=[Depends(require_access)])
+    def ingest_resume(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return resume_ingest_job(
+                ledger,
+                str(payload["job_id"]),
+                reason=str(payload.get("reason", "manual resume")),
+            )
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/ingest/cancel", dependencies=[Depends(require_access)])
+    def ingest_cancel(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return cancel_ingest_job(
+                ledger,
+                str(payload["job_id"]),
+                reason=str(payload.get("reason", "manual cancel")),
+            )
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/review/include", dependencies=[Depends(require_access)])
     def include_attachment(payload: dict[str, Any]) -> dict[str, str]:

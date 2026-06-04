@@ -11,6 +11,7 @@ from .embeddings import index_normalized_document, search_vector_index
 from .extractors import ExtractionManager, ExtractionRequest, ExtractorKeyPool, StubExtractorProvider
 from .index import verify_vector_index
 from .normalize import normalize_markdown_document
+from .pipeline import cancel_ingest_job, pause_ingest_job, resume_ingest_job, start_ingest_job
 from .runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime, scan_zotero_shadow
 from .search import fulltext_search, metadata_search
 from .zotero import ZoteroShadow
@@ -55,6 +56,27 @@ def build_parser() -> argparse.ArgumentParser:
     jobs_list.add_argument("--limit", type=int, default=50)
     jobs_show = jobs_sub.add_parser("show")
     jobs_show.add_argument("job_id")
+
+    ingest = sub.add_parser("ingest", help="Plan and control long-running ingest jobs.")
+    ingest_sub = ingest.add_subparsers(dest="ingest_command", required=True)
+    ingest_start = ingest_sub.add_parser("start", help="Create a non-executing ingest plan in the state ledger.")
+    ingest_start.add_argument("--mode", choices=("incremental", "full"), default="incremental")
+    ingest_start.add_argument("--zotero-key", default=None)
+    ingest_start.add_argument("--text-only", action="store_true")
+    ingest_start.add_argument(
+        "--execute",
+        action="store_true",
+        help="Reserved for future workers. Currently rejected to avoid external API calls.",
+    )
+    ingest_pause = ingest_sub.add_parser("pause")
+    ingest_pause.add_argument("job_id")
+    ingest_pause.add_argument("--reason", default="manual pause")
+    ingest_resume = ingest_sub.add_parser("resume")
+    ingest_resume.add_argument("job_id")
+    ingest_resume.add_argument("--reason", default="manual resume")
+    ingest_cancel = ingest_sub.add_parser("cancel")
+    ingest_cancel.add_argument("job_id")
+    ingest_cancel.add_argument("--reason", default="manual cancel")
 
     review = sub.add_parser("review", help="Manage manual include/exclude rules.")
     review_sub = review.add_subparsers(dest="review_command", required=True)
@@ -210,6 +232,44 @@ def main(argv: list[str] | None = None) -> int:
                 job = ledger.get_job(args.job_id, include_events=True)
                 emit({"job": job})
                 return 0 if job is not None else 1
+
+        if args.command == "ingest":
+            if args.ingest_command == "start":
+                try:
+                    emit(
+                        start_ingest_job(
+                            ledger,
+                            mode=args.mode,
+                            zotero_key=args.zotero_key,
+                            include_multimodal=not args.text_only,
+                            execute=args.execute,
+                        )
+                    )
+                    return 0
+                except NotImplementedError as exc:
+                    emit({"ok": False, "error": str(exc)})
+                    return 1
+            if args.ingest_command == "pause":
+                try:
+                    emit(pause_ingest_job(ledger, args.job_id, reason=args.reason))
+                    return 0
+                except (KeyError, ValueError) as exc:
+                    emit({"ok": False, "error": str(exc)})
+                    return 1
+            if args.ingest_command == "resume":
+                try:
+                    emit(resume_ingest_job(ledger, args.job_id, reason=args.reason))
+                    return 0
+                except (KeyError, ValueError) as exc:
+                    emit({"ok": False, "error": str(exc)})
+                    return 1
+            if args.ingest_command == "cancel":
+                try:
+                    emit(cancel_ingest_job(ledger, args.job_id, reason=args.reason))
+                    return 0
+                except (KeyError, ValueError) as exc:
+                    emit({"ok": False, "error": str(exc)})
+                    return 1
 
         if args.command == "review":
             if args.review_command == "list":
