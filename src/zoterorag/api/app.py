@@ -112,4 +112,16 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
     def extract_jobs(state: str | None = None, limit: int | None = 50) -> dict[str, Any]:
         return {"jobs": ledger.list_extract_jobs(state=state, limit=limit)}
 
+    @app.get("/normalize/artifacts", dependencies=[Depends(require_access)])
+    def normalized_artifacts(limit: int | None = 50) -> dict[str, Any]:
+        return {"artifacts": ledger.list_normalized_artifacts(limit=limit)}
+
+    @app.get("/normalize/chunks/{document_id}", dependencies=[Depends(require_access)])
+    def normalized_chunks(
+        document_id: str,
+        chunk_type: str | None = None,
+        limit: int | None = 20,
+    ) -> dict[str, Any]:
+        return {"chunks": ledger.list_chunks(document_id, chunk_type=chunk_type, limit=limit)}
+
     return app

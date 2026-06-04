@@ -7,6 +7,7 @@ import sys
 
 from .backup import create_backup, verify_manifest_files
 from .extractors import ExtractionManager, ExtractionRequest, ExtractorKeyPool, StubExtractorProvider
+from .normalize import normalize_markdown_document
 from .runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime, scan_zotero_shadow
 from .search import metadata_search
 from .zotero import ZoteroShadow
@@ -89,6 +90,19 @@ def build_parser() -> argparse.ArgumentParser:
     extract_jobs = extract_sub.add_parser("jobs", help="List persisted extraction jobs.")
     extract_jobs.add_argument("--state", default=None)
     extract_jobs.add_argument("--limit", type=int, default=50)
+
+    normalize = sub.add_parser("normalize", help="Normalize local Markdown extraction artifacts.")
+    normalize_sub = normalize.add_subparsers(dest="normalize_command", required=True)
+    normalize_markdown = normalize_sub.add_parser("markdown", help="Normalize a local MinerU-style full.md.")
+    normalize_markdown.add_argument("--markdown", required=True)
+    normalize_markdown.add_argument("--document-id", required=True)
+    normalize_markdown.add_argument("--attachment-key", default=None)
+    normalize_markdown.add_argument("--extract-job-id", default=None)
+    normalize_sub.add_parser("list")
+    normalize_chunks = normalize_sub.add_parser("chunks")
+    normalize_chunks.add_argument("--document-id", required=True)
+    normalize_chunks.add_argument("--chunk-type", default=None, choices=("text", "image"))
+    normalize_chunks.add_argument("--limit", type=int, default=20)
 
     inspect = sub.add_parser("inspect-shadow", help="Read summary from an existing shadow DB.")
     inspect.add_argument("--limit", type=int, default=5)
@@ -224,6 +238,41 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             if args.extract_command == "jobs":
                 emit({"jobs": ledger.list_extract_jobs(state=args.state, limit=args.limit)})
+                return 0
+
+        if args.command == "normalize":
+            if args.normalize_command == "markdown":
+                result = normalize_markdown_document(
+                    source_markdown=args.markdown,
+                    output_root=config.paths.normalized_dir,
+                    document_id=args.document_id,
+                    attachment_key=args.attachment_key,
+                    extract_job_id=args.extract_job_id,
+                )
+                artifact = result.ledger_artifact()
+                ledger.upsert_normalized_artifact(artifact)
+                ledger.replace_document_chunks(result.document_id, result.chunks)
+                emit(
+                    {
+                        "artifact": ledger.get_normalized_artifact(result.document_id),
+                        "chunk_count": len(result.chunks),
+                        "image_count": len(result.images),
+                    }
+                )
+                return 0
+            if args.normalize_command == "list":
+                emit({"artifacts": ledger.list_normalized_artifacts()})
+                return 0
+            if args.normalize_command == "chunks":
+                emit(
+                    {
+                        "chunks": ledger.list_chunks(
+                            args.document_id,
+                            chunk_type=args.chunk_type,
+                            limit=args.limit,
+                        )
+                    }
+                )
                 return 0
 
         if args.command == "inspect-shadow":

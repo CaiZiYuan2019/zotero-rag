@@ -264,6 +264,49 @@ class StateLedger:
                 ON extract_jobs(attachment_key)
                 """
             )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS normalized_artifacts (
+                    document_id TEXT PRIMARY KEY,
+                    attachment_key TEXT,
+                    extract_job_id TEXT,
+                    artifact_dir TEXT NOT NULL,
+                    document_md TEXT NOT NULL,
+                    image_manifest TEXT NOT NULL,
+                    chunks_path TEXT NOT NULL,
+                    manifest_path TEXT NOT NULL,
+                    source_markdown TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    document_hash TEXT NOT NULL,
+                    chunk_count INTEGER NOT NULL DEFAULT 0,
+                    image_count INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}'
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chunks (
+                    chunk_id TEXT PRIMARY KEY,
+                    document_id TEXT NOT NULL,
+                    chunk_type TEXT NOT NULL,
+                    chunk_index INTEGER NOT NULL,
+                    text TEXT NOT NULL,
+                    heading_path_json TEXT NOT NULL DEFAULT '[]',
+                    prev_chunk_id TEXT,
+                    next_chunk_id TEXT,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_chunks_document_type
+                ON chunks(document_id, chunk_type, chunk_index)
+                """
+            )
 
     def _ensure_columns(self, table_name: str, columns: dict[str, str]) -> None:
         existing = {
@@ -897,6 +940,141 @@ class StateLedger:
                 ),
             )
 
+    def upsert_normalized_artifact(self, artifact: dict[str, Any]) -> dict[str, Any]:
+        now = utc_now()
+        payload_json = json.dumps(artifact.get("payload", {}), ensure_ascii=False, sort_keys=True, default=str)
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO normalized_artifacts(
+                    document_id, attachment_key, extract_job_id, artifact_dir,
+                    document_md, image_manifest, chunks_path, manifest_path,
+                    source_markdown, status, document_hash, chunk_count,
+                    image_count, updated_at, payload_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(document_id) DO UPDATE SET
+                    attachment_key = excluded.attachment_key,
+                    extract_job_id = excluded.extract_job_id,
+                    artifact_dir = excluded.artifact_dir,
+                    document_md = excluded.document_md,
+                    image_manifest = excluded.image_manifest,
+                    chunks_path = excluded.chunks_path,
+                    manifest_path = excluded.manifest_path,
+                    source_markdown = excluded.source_markdown,
+                    status = excluded.status,
+                    document_hash = excluded.document_hash,
+                    chunk_count = excluded.chunk_count,
+                    image_count = excluded.image_count,
+                    updated_at = excluded.updated_at,
+                    payload_json = excluded.payload_json
+                """,
+                (
+                    artifact["document_id"],
+                    artifact.get("attachment_key"),
+                    artifact.get("extract_job_id"),
+                    str(artifact["artifact_dir"]),
+                    str(artifact["document_md"]),
+                    str(artifact["image_manifest"]),
+                    str(artifact["chunks_path"]),
+                    str(artifact["manifest_path"]),
+                    str(artifact["source_markdown"]),
+                    artifact["status"],
+                    artifact["document_hash"],
+                    int(artifact.get("chunk_count", 0)),
+                    int(artifact.get("image_count", 0)),
+                    now,
+                    payload_json,
+                ),
+            )
+        return self.get_normalized_artifact(artifact["document_id"])  # type: ignore[return-value]
+
+    def get_normalized_artifact(self, document_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT document_id, attachment_key, extract_job_id, artifact_dir,
+                   document_md, image_manifest, chunks_path, manifest_path,
+                   source_markdown, status, document_hash, chunk_count,
+                   image_count, updated_at, payload_json
+            FROM normalized_artifacts
+            WHERE document_id = ?
+            """,
+            (document_id,),
+        ).fetchone()
+        return decode_normalized_artifact_row(row)
+
+    def list_normalized_artifacts(self, limit: int | None = None) -> list[dict[str, Any]]:
+        query = """
+            SELECT document_id, attachment_key, extract_job_id, artifact_dir,
+                   document_md, image_manifest, chunks_path, manifest_path,
+                   source_markdown, status, document_hash, chunk_count,
+                   image_count, updated_at, payload_json
+            FROM normalized_artifacts
+            ORDER BY updated_at DESC
+        """
+        params: list[Any] = []
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        rows = self.conn.execute(query, params).fetchall()
+        return [item for row in rows if (item := decode_normalized_artifact_row(row)) is not None]
+
+    def replace_document_chunks(self, document_id: str, chunks: Iterable[dict[str, Any]]) -> int:
+        now = utc_now()
+        count = 0
+        with self.conn:
+            self.conn.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
+            for chunk in chunks:
+                self.conn.execute(
+                    """
+                    INSERT INTO chunks(
+                        chunk_id, document_id, chunk_type, chunk_index, text,
+                        heading_path_json, prev_chunk_id, next_chunk_id,
+                        metadata_json, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        chunk["chunk_id"],
+                        document_id,
+                        chunk["chunk_type"],
+                        int(chunk["chunk_index"]),
+                        chunk.get("text", ""),
+                        json.dumps(chunk.get("heading_path", []), ensure_ascii=False, sort_keys=True),
+                        chunk.get("prev_chunk_id"),
+                        chunk.get("next_chunk_id"),
+                        json.dumps(chunk.get("metadata", {}), ensure_ascii=False, sort_keys=True, default=str),
+                        now,
+                    ),
+                )
+                count += 1
+        return count
+
+    def list_chunks(
+        self,
+        document_id: str,
+        *,
+        chunk_type: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        query = """
+            SELECT chunk_id, document_id, chunk_type, chunk_index, text,
+                   heading_path_json, prev_chunk_id, next_chunk_id,
+                   metadata_json, updated_at
+            FROM chunks
+            WHERE document_id = ?
+        """
+        params: list[Any] = [document_id]
+        if chunk_type is not None:
+            query += " AND chunk_type = ?"
+            params.append(chunk_type)
+        query += " ORDER BY chunk_index"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        rows = self.conn.execute(query, params).fetchall()
+        return [decode_chunk_row(row) for row in rows]
+
     def mark_absent_attachments_deleted(self, present_attachment_keys: Iterable[str]) -> int:
         keys = sorted(set(present_attachment_keys))
         now = utc_now()
@@ -946,6 +1124,8 @@ class StateLedger:
         scan_statuses = self.conn.execute("SELECT scan_status, count(*) AS n FROM attachments GROUP BY scan_status").fetchall()
         backups = self.conn.execute("SELECT count(*) AS n FROM backups").fetchone()
         extract_jobs = self.conn.execute("SELECT state, count(*) AS n FROM extract_jobs GROUP BY state").fetchall()
+        normalized = self.conn.execute("SELECT count(*) AS n FROM normalized_artifacts").fetchone()
+        chunks = self.conn.execute("SELECT chunk_type, count(*) AS n FROM chunks GROUP BY chunk_type").fetchall()
         return {
             "schema_version": SCHEMA_VERSION,
             "jobs": {row["status"]: row["n"] for row in jobs},
@@ -956,6 +1136,8 @@ class StateLedger:
             "scan_statuses": {row["scan_status"]: row["n"] for row in scan_statuses},
             "backups": backups["n"],
             "extract_jobs": {row["state"]: row["n"] for row in extract_jobs},
+            "normalized_artifacts": normalized["n"],
+            "chunks": {row["chunk_type"]: row["n"] for row in chunks},
         }
 
 
@@ -1013,4 +1195,20 @@ def decode_extract_job_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
     item = dict(row)
     payload_json = item.pop("payload_json")
     item["payload"] = json.loads(payload_json)
+    return item
+
+
+def decode_normalized_artifact_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    item = dict(row)
+    payload_json = item.pop("payload_json")
+    item["payload"] = json.loads(payload_json)
+    return item
+
+
+def decode_chunk_row(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    item["heading_path"] = json.loads(item.pop("heading_path_json"))
+    item["metadata"] = json.loads(item.pop("metadata_json"))
     return item
