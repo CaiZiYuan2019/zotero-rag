@@ -8,6 +8,7 @@ from ..documents import get_document as get_document_record
 from ..documents import list_documents as list_document_records
 from ..embeddings import index_normalized_document, search_vector_index
 from ..index import verify_vector_index
+from ..models import describe_embedding_profile, list_embedding_model_catalog
 from ..pipeline import cancel_ingest_job, pause_ingest_job, resume_ingest_job, start_ingest_job
 from ..runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime, scan_zotero_shadow
 from ..search import fulltext_search, metadata_search
@@ -46,16 +47,15 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
 
     @app.get("/models/embedding", dependencies=[Depends(require_access)])
     def list_embedding_models() -> dict[str, Any]:
-        return {"models": ledger.list_embedding_profiles()}
+        return list_embedding_model_catalog(ledger)
 
     @app.post("/models/embedding/activate", dependencies=[Depends(require_access)])
     def activate_embedding_model(payload: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "model": ledger.activate_embedding_profile(
-                profile_name=str(payload["profile_name"]),
-                mode=str(payload["mode"]),
-            )
-        }
+        activated = ledger.activate_embedding_profile(
+            profile_name=str(payload["profile_name"]),
+            mode=str(payload["mode"]),
+        )
+        return {"model": describe_embedding_profile(activated), **list_embedding_model_catalog(ledger)}
 
     @app.get("/vectors", dependencies=[Depends(require_access)])
     def list_vector_indexes() -> dict[str, Any]:

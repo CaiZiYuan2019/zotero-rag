@@ -10,6 +10,7 @@ from .documents import get_document, list_documents
 from .embeddings import index_normalized_document, search_vector_index
 from .extractors import ExtractionManager, ExtractionRequest, ExtractorKeyPool, StubExtractorProvider
 from .index import verify_vector_index
+from .models import describe_embedding_profile, list_embedding_model_catalog
 from .normalize import normalize_markdown_document
 from .pipeline import cancel_ingest_job, pause_ingest_job, resume_ingest_job, start_ingest_job
 from .runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime, scan_zotero_shadow
@@ -214,10 +215,11 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "models" and args.models_command == "list":
-            emit({"models": ledger.list_embedding_profiles()})
+            emit(list_embedding_model_catalog(ledger))
             return 0
         if args.command == "models" and args.models_command == "activate":
-            emit({"model": ledger.activate_embedding_profile(args.profile, args.mode)})
+            activated = ledger.activate_embedding_profile(args.profile, args.mode)
+            emit({"model": describe_embedding_profile(activated), **list_embedding_model_catalog(ledger)})
             return 0
 
         if args.command == "vectors" and args.vectors_command == "list":

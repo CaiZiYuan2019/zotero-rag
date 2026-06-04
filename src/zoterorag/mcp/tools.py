@@ -7,6 +7,7 @@ from ..config import AppConfig
 from ..db import StateLedger
 from ..documents import get_document
 from ..embeddings import search_vector_index
+from ..models import list_embedding_model_catalog
 from ..runtime import config_as_public_dict
 from ..search import fulltext_search, metadata_search
 
@@ -31,10 +32,7 @@ def zotero_rag_status(context: McpToolContext) -> dict[str, Any]:
 
 
 def zotero_rag_list_models(context: McpToolContext) -> dict[str, Any]:
-    return {
-        "models": context.ledger.list_embedding_profiles(),
-        "vector_indexes": context.ledger.list_vector_indexes(),
-    }
+    return list_embedding_model_catalog(context.ledger)
 
 
 def zotero_rag_metadata_search(
