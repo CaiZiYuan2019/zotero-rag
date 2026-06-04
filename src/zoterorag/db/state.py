@@ -423,6 +423,24 @@ class StateLedger:
         with self.conn:
             for profile in profiles:
                 data = profile.__dict__ if hasattr(profile, "__dict__") else dict(profile)
+                existing = self.conn.execute(
+                    """
+                    SELECT default_for_text, default_for_multimodal
+                    FROM embedding_profiles
+                    WHERE name = ?
+                    """,
+                    (data["name"],),
+                ).fetchone()
+                default_for_text = (
+                    bool(existing["default_for_text"])
+                    if existing is not None
+                    else bool(data.get("default_for_text", False))
+                )
+                default_for_multimodal = (
+                    bool(existing["default_for_multimodal"])
+                    if existing is not None
+                    else bool(data.get("default_for_multimodal", False))
+                )
                 self.conn.execute(
                     """
                     INSERT INTO embedding_profiles(
@@ -447,8 +465,8 @@ class StateLedger:
                         int(data["dimension"]),
                         data["modality"],
                         int(bool(data.get("enabled", True))),
-                        int(bool(data.get("default_for_text", False))),
-                        int(bool(data.get("default_for_multimodal", False))),
+                        int(default_for_text),
+                        int(default_for_multimodal),
                         json.dumps(data, ensure_ascii=False, sort_keys=True, default=str),
                     ),
                 )
@@ -462,16 +480,58 @@ class StateLedger:
             ORDER BY name
             """
         ).fetchall()
-        return [
-            {
-                **dict(row),
-                "enabled": bool(row["enabled"]),
-                "default_for_text": bool(row["default_for_text"]),
-                "default_for_multimodal": bool(row["default_for_multimodal"]),
-                "profile": json.loads(row["profile_json"]),
-            }
-            for row in rows
-        ]
+        profiles = []
+        for row in rows:
+            profile_json = json.loads(row["profile_json"])
+            profile_json["enabled"] = bool(row["enabled"])
+            profile_json["default_for_text"] = bool(row["default_for_text"])
+            profile_json["default_for_multimodal"] = bool(row["default_for_multimodal"])
+            profiles.append(
+                {
+                    **dict(row),
+                    "enabled": bool(row["enabled"]),
+                    "default_for_text": bool(row["default_for_text"]),
+                    "default_for_multimodal": bool(row["default_for_multimodal"]),
+                    "profile": profile_json,
+                }
+            )
+        return profiles
+
+    def activate_embedding_profile(self, profile_name: str, mode: str) -> dict[str, Any]:
+        if mode not in {"text", "multimodal"}:
+            raise ValueError("mode must be 'text' or 'multimodal'")
+        expected_modality = "text" if mode == "text" else "multimodal"
+        flag_column = "default_for_text" if mode == "text" else "default_for_multimodal"
+        row = self.conn.execute(
+            """
+            SELECT name, modality, enabled
+            FROM embedding_profiles
+            WHERE name = ?
+            """,
+            (profile_name,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"embedding profile not found: {profile_name}")
+        if row["modality"] != expected_modality:
+            raise ValueError(f"profile {profile_name} has modality {row['modality']}, expected {expected_modality}")
+        if not bool(row["enabled"]):
+            raise ValueError(f"profile {profile_name} is disabled")
+
+        with self.conn:
+            # Exactly one default profile per query mode keeps search scoring
+            # unambiguous. Cross-model score merging is intentionally avoided.
+            self.conn.execute(
+                f"UPDATE embedding_profiles SET {flag_column} = 0 WHERE modality = ?",
+                (expected_modality,),
+            )
+            self.conn.execute(
+                f"UPDATE embedding_profiles SET {flag_column} = 1 WHERE name = ?",
+                (profile_name,),
+            )
+        for profile in self.list_embedding_profiles():
+            if profile["name"] == profile_name:
+                return profile
+        raise KeyError(f"embedding profile not found after activation: {profile_name}")
 
     def register_vector_index(
         self,

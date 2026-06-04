@@ -44,6 +44,15 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
     def list_embedding_models() -> dict[str, Any]:
         return {"models": ledger.list_embedding_profiles()}
 
+    @app.post("/models/embedding/activate", dependencies=[Depends(require_access)])
+    def activate_embedding_model(payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "model": ledger.activate_embedding_profile(
+                profile_name=str(payload["profile_name"]),
+                mode=str(payload["mode"]),
+            )
+        }
+
     @app.get("/vectors", dependencies=[Depends(require_access)])
     def list_vector_indexes() -> dict[str, Any]:
         return {"indexes": ledger.list_vector_indexes()}

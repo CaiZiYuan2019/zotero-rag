@@ -35,6 +35,9 @@ def build_parser() -> argparse.ArgumentParser:
     models = sub.add_parser("models", help="List configured embedding profiles.")
     models_sub = models.add_subparsers(dest="models_command", required=True)
     models_sub.add_parser("list")
+    models_activate = models_sub.add_parser("activate", help="Set the default embedding profile for one search mode.")
+    models_activate.add_argument("--profile", required=True)
+    models_activate.add_argument("--mode", required=True, choices=("text", "multimodal"))
 
     vectors = sub.add_parser("vectors", help="Inspect local vector index registrations.")
     vectors_sub = vectors.add_subparsers(dest="vectors_command", required=True)
@@ -154,6 +157,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "models" and args.models_command == "list":
             emit({"models": ledger.list_embedding_profiles()})
+            return 0
+        if args.command == "models" and args.models_command == "activate":
+            emit({"model": ledger.activate_embedding_profile(args.profile, args.mode)})
             return 0
 
         if args.command == "vectors" and args.vectors_command == "list":

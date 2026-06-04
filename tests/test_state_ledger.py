@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from tests._support import workspace_tmpdir
+from zoterorag.config import EmbeddingProfile
 from zoterorag.db.state import JobEvent, SCHEMA_VERSION, StateLedger
 
 
@@ -106,5 +107,56 @@ class StateLedgerTests(unittest.TestCase):
                 self.assertEqual(2, indexes[0]["document_count"])
                 self.assertEqual(5, indexes[0]["chunk_count"])
                 self.assertTrue(indexes[0]["active"])
+            finally:
+                ledger.close()
+
+    def test_activate_embedding_profile_sets_one_default_and_survives_bootstrap(self) -> None:
+        with workspace_tmpdir("state-ledger-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                profiles = [
+                    EmbeddingProfile(
+                        name="text-a",
+                        provider="stub",
+                        model="stub-a",
+                        dimension=8,
+                        modality="text",
+                        enabled=True,
+                        default_for_text=True,
+                    ),
+                    EmbeddingProfile(
+                        name="text-b",
+                        provider="stub",
+                        model="stub-b",
+                        dimension=8,
+                        modality="text",
+                        enabled=True,
+                    ),
+                    EmbeddingProfile(
+                        name="mm-a",
+                        provider="stub",
+                        model="stub-mm",
+                        dimension=8,
+                        modality="multimodal",
+                        enabled=True,
+                        default_for_multimodal=True,
+                    ),
+                ]
+                ledger.upsert_embedding_profiles(profiles)
+                activated = ledger.activate_embedding_profile("text-b", "text")
+                self.assertTrue(activated["default_for_text"])
+
+                by_name = {item["name"]: item for item in ledger.list_embedding_profiles()}
+                self.assertFalse(by_name["text-a"]["default_for_text"])
+                self.assertTrue(by_name["text-b"]["default_for_text"])
+                self.assertTrue(by_name["mm-a"]["default_for_multimodal"])
+
+                ledger.upsert_embedding_profiles(profiles)
+                by_name = {item["name"]: item for item in ledger.list_embedding_profiles()}
+                self.assertFalse(by_name["text-a"]["default_for_text"])
+                self.assertTrue(by_name["text-b"]["default_for_text"])
+
+                with self.assertRaises(ValueError):
+                    ledger.activate_embedding_profile("mm-a", "text")
             finally:
                 ledger.close()
