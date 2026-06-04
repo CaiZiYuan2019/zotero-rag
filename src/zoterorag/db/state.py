@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import sqlite3
@@ -167,9 +168,22 @@ class StateLedger:
                     file_size INTEGER,
                     file_mtime REAL,
                     metadata_json TEXT NOT NULL DEFAULT '{}',
+                    content_fingerprint TEXT NOT NULL DEFAULT '',
+                    scan_status TEXT NOT NULL DEFAULT 'new',
+                    first_seen_at TEXT,
+                    last_seen_at TEXT,
                     updated_at TEXT NOT NULL
                 )
                 """
+            )
+            self._ensure_columns(
+                "attachments",
+                {
+                    "content_fingerprint": "TEXT NOT NULL DEFAULT ''",
+                    "scan_status": "TEXT NOT NULL DEFAULT 'new'",
+                    "first_seen_at": "TEXT",
+                    "last_seen_at": "TEXT",
+                },
             )
             # This is the durable review queue produced from the Zotero shadow.
             # It stores classification decisions and file facts only; no PDF
@@ -191,6 +205,15 @@ class StateLedger:
                 )
                 """
             )
+
+    def _ensure_columns(self, table_name: str, columns: dict[str, str]) -> None:
+        existing = {
+            row["name"]
+            for row in self.conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        }
+        for name, definition in columns.items():
+            if name not in existing:
+                self.conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {name} {definition}")
 
     def create_job(self, kind: str, payload: dict[str, Any] | None = None) -> str:
         job_id = str(uuid.uuid4())
@@ -385,15 +408,35 @@ class StateLedger:
         count = 0
         with self.conn:
             for item in attachments:
+                now = utc_now()
+                fingerprint = attachment_fingerprint(item)
+                existing = self.conn.execute(
+                    """
+                    SELECT content_fingerprint, first_seen_at, classification
+                    FROM attachments
+                    WHERE attachment_key = ?
+                    """,
+                    (item["attachment_key"],),
+                ).fetchone()
+                if existing is None or existing["classification"] == "deleted":
+                    scan_status = "new"
+                    first_seen_at = now
+                elif existing["content_fingerprint"] != fingerprint:
+                    scan_status = "changed"
+                    first_seen_at = existing["first_seen_at"] or now
+                else:
+                    scan_status = "unchanged"
+                    first_seen_at = existing["first_seen_at"] or now
                 self.conn.execute(
                     """
                     INSERT INTO attachments(
                         attachment_key, parent_key, content_type, relative_path,
                         title, abstract, date_value, url, classification,
                         source_quality, reasons_json, file_path, file_exists,
-                        file_size, file_mtime, metadata_json, updated_at
+                        file_size, file_mtime, metadata_json, content_fingerprint,
+                        scan_status, first_seen_at, last_seen_at, updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(attachment_key) DO UPDATE SET
                         parent_key = excluded.parent_key,
                         content_type = excluded.content_type,
@@ -410,6 +453,10 @@ class StateLedger:
                         file_size = excluded.file_size,
                         file_mtime = excluded.file_mtime,
                         metadata_json = excluded.metadata_json,
+                        content_fingerprint = excluded.content_fingerprint,
+                        scan_status = excluded.scan_status,
+                        first_seen_at = COALESCE(attachments.first_seen_at, excluded.first_seen_at),
+                        last_seen_at = excluded.last_seen_at,
                         updated_at = excluded.updated_at
                     """,
                     (
@@ -429,7 +476,11 @@ class StateLedger:
                         item.get("file_size"),
                         item.get("file_mtime"),
                         json.dumps(item.get("metadata", {}), ensure_ascii=False, sort_keys=True, default=str),
-                        utc_now(),
+                        fingerprint,
+                        scan_status,
+                        first_seen_at,
+                        now,
+                        now,
                     ),
                 )
                 count += 1
@@ -444,7 +495,8 @@ class StateLedger:
             SELECT attachment_key, parent_key, content_type, relative_path,
                    title, abstract, date_value, url, classification,
                    source_quality, reasons_json, file_path, file_exists,
-                   file_size, file_mtime, metadata_json, updated_at
+                   file_size, file_mtime, metadata_json, content_fingerprint,
+                   scan_status, first_seen_at, last_seen_at, updated_at
             FROM attachments
         """
         params: list[Any] = []
@@ -488,10 +540,12 @@ class StateLedger:
                     SET classification = 'deleted',
                         source_quality = 'deleted_from_zotero_shadow',
                         reasons_json = ?,
+                        scan_status = 'deleted',
+                        last_seen_at = ?,
                         updated_at = ?
                     WHERE classification != 'deleted'
                     """,
-                    (json.dumps(["absent_from_full_shadow_scan"]), now),
+                    (json.dumps(["absent_from_full_shadow_scan"]), now, now),
                 )
             return int(cursor.rowcount)
 
@@ -503,11 +557,13 @@ class StateLedger:
                 SET classification = 'deleted',
                     source_quality = 'deleted_from_zotero_shadow',
                     reasons_json = ?,
+                    scan_status = 'deleted',
+                    last_seen_at = ?,
                     updated_at = ?
                 WHERE attachment_key NOT IN ({placeholders})
                   AND classification != 'deleted'
                 """,
-                [json.dumps(["absent_from_full_shadow_scan"]), now, *keys],
+                [json.dumps(["absent_from_full_shadow_scan"]), now, now, *keys],
             )
         return int(cursor.rowcount)
 
@@ -519,6 +575,7 @@ class StateLedger:
         profiles = self.conn.execute("SELECT count(*) AS n FROM embedding_profiles").fetchone()
         indexes = self.conn.execute("SELECT count(*) AS n FROM vector_indexes").fetchone()
         attachments = self.conn.execute("SELECT classification, count(*) AS n FROM attachments GROUP BY classification").fetchall()
+        scan_statuses = self.conn.execute("SELECT scan_status, count(*) AS n FROM attachments GROUP BY scan_status").fetchall()
         return {
             "schema_version": SCHEMA_VERSION,
             "jobs": {row["status"]: row["n"] for row in jobs},
@@ -526,4 +583,34 @@ class StateLedger:
             "embedding_profiles": profiles["n"],
             "vector_indexes": indexes["n"],
             "attachments": {row["classification"]: row["n"] for row in attachments},
+            "scan_statuses": {row["scan_status"]: row["n"] for row in scan_statuses},
         }
+
+
+def attachment_fingerprint(item: dict[str, Any]) -> str:
+    """Stable hash for deciding whether a scanned attachment changed.
+
+    The hash excludes state timestamps and job bookkeeping. If this changes,
+    later pipeline stages know the attachment's metadata, file facts, or review
+    classification changed and can decide whether extraction/indexing is stale.
+    """
+
+    payload = {
+        "parent_key": item.get("parent_key"),
+        "content_type": item.get("content_type"),
+        "relative_path": item.get("relative_path"),
+        "title": item.get("title"),
+        "abstract": item.get("abstract"),
+        "date": item.get("date"),
+        "url": item.get("url"),
+        "classification": item.get("classification"),
+        "source_quality": item.get("source_quality"),
+        "reasons": item.get("reasons", []),
+        "file_path": item.get("file_path"),
+        "file_exists": bool(item.get("file_exists", False)),
+        "file_size": item.get("file_size"),
+        "file_mtime": item.get("file_mtime"),
+        "metadata": item.get("metadata", {}),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()

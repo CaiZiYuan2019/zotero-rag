@@ -247,6 +247,38 @@ class ZoteroScannerTests(unittest.TestCase):
             finally:
                 ledger.close()
 
+    def test_scan_status_tracks_new_unchanged_changed_and_deleted(self) -> None:
+        with workspace_tmpdir("zotero-scan-") as root:
+            shadow_db, storage_dir = self.build_fixture(root)
+            ledger = StateLedger(root / "state.sqlite")
+            try:
+                scan_shadow_to_ledger(shadow_db, storage_dir, ledger)
+                first = self.attachment_map(ledger)
+                self.assertEqual("new", first["ATTNORM"]["scan_status"])
+
+                scan_shadow_to_ledger(shadow_db, storage_dir, ledger)
+                second = self.attachment_map(ledger)
+                self.assertEqual("unchanged", second["ATTNORM"]["scan_status"])
+
+                write_storage_file(storage_dir, "ATTNORM", "paper.pdf", b"%PDF-1.4 changed\n")
+                scan_shadow_to_ledger(shadow_db, storage_dir, ledger)
+                third = self.attachment_map(ledger)
+                self.assertEqual("changed", third["ATTNORM"]["scan_status"])
+
+                conn = sqlite3.connect(shadow_db)
+                try:
+                    conn.execute("DELETE FROM itemAttachments WHERE itemID = 2")
+                    conn.commit()
+                finally:
+                    conn.close()
+
+                scan_shadow_to_ledger(shadow_db, storage_dir, ledger)
+                fourth = self.attachment_map(ledger)
+                self.assertEqual("deleted", fourth["ATTNORM"]["scan_status"])
+                self.assertEqual("deleted", fourth["ATTNORM"]["classification"])
+            finally:
+                ledger.close()
+
 
 if __name__ == "__main__":
     unittest.main()
