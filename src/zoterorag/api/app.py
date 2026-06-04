@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from ..backup import create_backup
+from ..embeddings import index_normalized_document, search_vector_index
 from ..runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime, scan_zotero_shadow
 from ..search import metadata_search
 from .security import AccessDenied, verify_api_access
@@ -94,6 +95,36 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
             )
         }
 
+    @app.post("/search/text", dependencies=[Depends(require_access)])
+    def search_text(payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "results": search_vector_index(
+                ledger=ledger,
+                vector_store_dir=config.paths.vector_store_dir,
+                profile_name=payload.get("profile_name"),
+                query=str(payload["query"]),
+                mode="text",
+                top_k=int(payload.get("top_k", 10)),
+                consumer=str(payload.get("consumer", "llm_text")),
+                image_return="none",
+            )
+        }
+
+    @app.post("/search/multimodal", dependencies=[Depends(require_access)])
+    def search_multimodal(payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "results": search_vector_index(
+                ledger=ledger,
+                vector_store_dir=config.paths.vector_store_dir,
+                profile_name=payload.get("profile_name"),
+                query=str(payload.get("query_text", payload.get("query", ""))),
+                mode="multimodal",
+                top_k=int(payload.get("top_k", 10)),
+                consumer=str(payload.get("consumer", "manual")),
+                image_return=str(payload.get("image_return", "file_ref")),
+            )
+        }
+
     @app.post("/backup/create", dependencies=[Depends(require_access)])
     def backup_create(payload: dict[str, Any]) -> dict[str, Any]:
         return create_backup(
@@ -123,5 +154,14 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
         limit: int | None = 20,
     ) -> dict[str, Any]:
         return {"chunks": ledger.list_chunks(document_id, chunk_type=chunk_type, limit=limit)}
+
+    @app.post("/embed/index-normalized", dependencies=[Depends(require_access)])
+    def embed_index_normalized(payload: dict[str, Any]) -> dict[str, Any]:
+        return index_normalized_document(
+            ledger=ledger,
+            vector_store_dir=config.paths.vector_store_dir,
+            profile_name=str(payload["profile_name"]),
+            document_id=str(payload["document_id"]),
+        ).to_dict()
 
     return app

@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 
 from .backup import create_backup, verify_manifest_files
+from .embeddings import index_normalized_document, search_vector_index
 from .extractors import ExtractionManager, ExtractionRequest, ExtractorKeyPool, StubExtractorProvider
 from .normalize import normalize_markdown_document
 from .runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime, scan_zotero_shadow
@@ -103,6 +104,20 @@ def build_parser() -> argparse.ArgumentParser:
     normalize_chunks.add_argument("--document-id", required=True)
     normalize_chunks.add_argument("--chunk-type", default=None, choices=("text", "image"))
     normalize_chunks.add_argument("--limit", type=int, default=20)
+
+    embed = sub.add_parser("embed", help="Offline embedding/index commands. Defaults to stub provider.")
+    embed_sub = embed.add_subparsers(dest="embed_command", required=True)
+    embed_index = embed_sub.add_parser("index-normalized", help="Index normalized chunks into a local vector store.")
+    embed_index.add_argument("--document-id", required=True)
+    embed_index.add_argument("--profile", required=True)
+
+    search_vector = sub.add_parser("search-vector", help="Search local vector indexes with the stub provider.")
+    search_vector.add_argument("query")
+    search_vector.add_argument("--mode", choices=("text", "multimodal"), default="text")
+    search_vector.add_argument("--profile", default=None)
+    search_vector.add_argument("--top-k", type=int, default=10)
+    search_vector.add_argument("--consumer", default="llm_text", choices=("manual", "llm_text", "llm_multimodal"))
+    search_vector.add_argument("--image-return", default="none", choices=("file_ref", "base64", "none"))
 
     inspect = sub.add_parser("inspect-shadow", help="Read summary from an existing shadow DB.")
     inspect.add_argument("--limit", type=int, default=5)
@@ -274,6 +289,34 @@ def main(argv: list[str] | None = None) -> int:
                     }
                 )
                 return 0
+
+        if args.command == "embed":
+            if args.embed_command == "index-normalized":
+                result = index_normalized_document(
+                    ledger=ledger,
+                    vector_store_dir=config.paths.vector_store_dir,
+                    profile_name=args.profile,
+                    document_id=args.document_id,
+                )
+                emit(result.to_dict())
+                return 0
+
+        if args.command == "search-vector":
+            emit(
+                {
+                    "results": search_vector_index(
+                        ledger=ledger,
+                        vector_store_dir=config.paths.vector_store_dir,
+                        profile_name=args.profile,
+                        query=args.query,
+                        mode=args.mode,
+                        top_k=args.top_k,
+                        consumer=args.consumer,
+                        image_return=args.image_return,
+                    )
+                }
+            )
+            return 0
 
         if args.command == "inspect-shadow":
             shadow_path = Path(config.paths.shadow_db)

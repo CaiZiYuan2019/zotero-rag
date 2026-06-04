@@ -14,14 +14,16 @@ def initialize_runtime(config_path: str | Path = "config/config.example.toml") -
     config.ensure_runtime_dirs()
     ledger = StateLedger(config.paths.state_db)
     ledger.upsert_embedding_profiles(config.embedding_profiles)
+    existing_indexes = {item["profile_name"]: item for item in ledger.list_vector_indexes()}
     for profile in config.embedding_profiles:
         vector_path = config.paths.vector_store_dir / profile.name / "vectors.sqlite"
+        existing = existing_indexes.get(profile.name)
         ledger.register_vector_index(
             profile_name=profile.name,
             backend="sqlite-local",
             path=vector_path,
-            document_count=0,
-            chunk_count=0,
+            document_count=int(existing["document_count"]) if existing else 0,
+            chunk_count=int(existing["chunk_count"]) if existing else 0,
             active=profile.enabled,
         )
     return config, ledger

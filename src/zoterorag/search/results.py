@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 from typing import Any, Literal
 
 
@@ -43,6 +44,7 @@ def sanitize_results_for_consumer(
         item = result.to_dict() if isinstance(result, SearchResult) else dict(result)
         images = list(item.get("images") or [])
         if consumer == "llm_text" or image_return == "none":
+            item["text"] = strip_image_references_from_text(str(item.get("text", "")))
             # Pure-text LLM consumers must never receive image bytes or file
             # handles. They can see that images exist and read captions, but the
             # payload remains text-only by construction.
@@ -87,3 +89,16 @@ def sanitize_results_for_consumer(
             raise ValueError(f"unknown consumer: {consumer}")
         sanitized.append(item)
     return sanitized
+
+
+MARKDOWN_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\([^)]+\)")
+HTML_IMAGE_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
+
+
+def strip_image_references_from_text(text: str) -> str:
+    def replace_markdown(match: re.Match[str]) -> str:
+        caption = match.group(1).strip()
+        return f"[Image: {caption}]" if caption else "[Image]"
+
+    text = MARKDOWN_IMAGE_RE.sub(replace_markdown, text)
+    return HTML_IMAGE_RE.sub("[Image]", text)

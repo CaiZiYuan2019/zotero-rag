@@ -239,7 +239,7 @@ def build_chunks(document_id: str, markdown_text: str, images: list[dict[str, An
 
     def flush_text() -> None:
         nonlocal chunk_index, current_text
-        text = "\n".join(line for line in current_text).strip()
+        text = strip_image_paths_for_text_chunk("\n".join(line for line in current_text)).strip()
         current_text = []
         if not text:
             return
@@ -303,6 +303,25 @@ def split_markdown_target(target: str) -> tuple[str, str, str]:
     if not match:
         return leading, rest, ""
     return leading, match.group(1), match.group(2)
+
+
+def strip_image_paths_for_text_chunk(text: str) -> str:
+    """Remove image file references from text chunks.
+
+    `document.md` keeps renderable image links for manual use, but text chunks
+    feed pure-text retrieval and LLM outputs. They may mention that an image
+    exists or keep the caption, but must not carry local file paths.
+    """
+
+    def replace_markdown(match: re.Match[str]) -> str:
+        alt_text = match.group(1).removeprefix("![").removesuffix("](").strip()
+        return f"[Image: {alt_text}]" if alt_text else "[Image]"
+
+    def replace_html(match: re.Match[str]) -> str:
+        return "[Image]"
+
+    text = MARKDOWN_IMAGE_RE.sub(replace_markdown, text)
+    return HTML_IMAGE_RE.sub(replace_html, text)
 
 
 def estimate_tokens(text: str) -> int:

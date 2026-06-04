@@ -53,6 +53,10 @@ class NormalizeMarkdownTests(unittest.TestCase):
                 self.assertTrue((result.artifact_dir / "images" / "img001.png").is_file())
                 self.assertTrue((result.artifact_dir / "chunks.jsonl").is_file())
                 self.assertGreaterEqual(len(chunks), 3)
+                text_chunks = [chunk for chunk in chunks if chunk["chunk_type"] == "text"]
+                self.assertNotIn("images/hash-b.png", text_chunks[0]["text"])
+                self.assertNotIn("images/img001.png", text_chunks[0]["text"])
+                self.assertIn("[Image: Figure A]", text_chunks[0]["text"])
                 self.assertEqual({"image": 2, "text": len(chunks) - 2}, ledger.status_summary()["chunks"])
             finally:
                 ledger.close()

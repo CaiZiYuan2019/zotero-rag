@@ -1,0 +1,110 @@
+from __future__ import annotations
+
+import unittest
+
+from tests._support import workspace_tmpdir
+from zoterorag.config import EmbeddingProfile
+from zoterorag.db import StateLedger
+from zoterorag.embeddings import index_normalized_document, search_vector_index
+from zoterorag.normalize import normalize_markdown_document
+
+
+class EmbeddingIndexerTests(unittest.TestCase):
+    def test_stub_indexer_indexes_text_and_multimodal_profiles_separately(self) -> None:
+        with workspace_tmpdir("embedding-indexer-") as tmpdir:
+            source_dir = tmpdir / "mineru"
+            images_dir = source_dir / "images"
+            images_dir.mkdir(parents=True)
+            (images_dir / "fig.png").write_bytes(b"fake-image")
+            markdown = source_dir / "full.md"
+            markdown.write_text(
+                "# Demo Paper\n\n"
+                "alpha beta gamma text evidence\n\n"
+                "![important figure](images/fig.png)\n",
+                encoding="utf-8",
+            )
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                ledger.upsert_embedding_profiles(
+                    [
+                        EmbeddingProfile(
+                            name="stub_text",
+                            provider="stub",
+                            model="stub",
+                            dimension=8,
+                            modality="text",
+                            enabled=True,
+                            default_for_text=True,
+                        ),
+                        EmbeddingProfile(
+                            name="stub_mm",
+                            provider="stub",
+                            model="stub",
+                            dimension=8,
+                            modality="multimodal",
+                            enabled=True,
+                            default_for_multimodal=True,
+                        ),
+                    ]
+                )
+                normalized = normalize_markdown_document(
+                    source_markdown=markdown,
+                    output_root=tmpdir / "normalized",
+                    document_id="DOC1",
+                    attachment_key="ATT1",
+                )
+                ledger.upsert_normalized_artifact(normalized.ledger_artifact())
+                ledger.replace_document_chunks(normalized.document_id, normalized.chunks)
+
+                text_result = index_normalized_document(
+                    ledger=ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="stub_text",
+                    document_id="DOC1",
+                )
+                mm_result = index_normalized_document(
+                    ledger=ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="stub_mm",
+                    document_id="DOC1",
+                )
+                text_hits = search_vector_index(
+                    ledger=ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="stub_text",
+                    query="alpha beta gamma",
+                    mode="text",
+                    consumer="llm_text",
+                )
+                mm_text_only_hits = search_vector_index(
+                    ledger=ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="stub_mm",
+                    query="important figure",
+                    mode="multimodal",
+                    consumer="llm_text",
+                    image_return="none",
+                )
+                mm_manual_hits = search_vector_index(
+                    ledger=ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="stub_mm",
+                    query="important figure",
+                    mode="multimodal",
+                    consumer="manual",
+                    image_return="file_ref",
+                )
+
+                self.assertEqual(1, text_result.indexed_chunks)
+                self.assertEqual(1, mm_result.indexed_chunks)
+                self.assertEqual("stub_text", text_hits[0]["metadata"]["profile_name"])
+                self.assertNotIn("images", mm_text_only_hits[0])
+                self.assertTrue(mm_text_only_hits[0]["has_images"])
+                self.assertIn("images", mm_manual_hits[0])
+                self.assertEqual("images/img001.png", mm_manual_hits[0]["images"][0]["file_ref"])
+            finally:
+                ledger.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

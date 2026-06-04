@@ -32,7 +32,7 @@ class SearchSchemaTests(OptionalModuleTestCase):
                 "chunk_id": "text-1",
                 "title": "Text chunk",
                 "score": 0.9,
-                "text": "plain text chunk",
+                "text": "plain text chunk ![chart](images/img001.png)",
                 "metadata": {"content_type": "text/plain"},
                 "images": [
                     {
@@ -84,3 +84,4 @@ class SearchSchemaTests(OptionalModuleTestCase):
             self.assertNotIn("base64", repr(payload))
             self.assertNotIn("file_ref", repr(payload))
             self.assertNotIn("thumbnail_ref", repr(payload))
+            self.assertNotIn("images/img001.png", llm_text)
