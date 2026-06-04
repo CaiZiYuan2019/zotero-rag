@@ -519,6 +519,71 @@ class StateLedger:
             results.append(item)
         return results
 
+    def search_attachments_metadata(
+        self,
+        query: str,
+        *,
+        classification: str | None = None,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Direct metadata search over scanned Zotero shadow results.
+
+        This deliberately searches only the local state ledger populated from
+        the shadow DB. It never reads Zotero's live database, and it never calls
+        embedding services. The implementation is parameterized LIKE search for
+        the bootstrap phase; the call shape is stable so an FTS5-backed version
+        can replace it later without changing API/CLI consumers.
+        """
+
+        terms = [term.casefold() for term in query.split() if term.strip()]
+        if not terms:
+            return []
+
+        where_parts = []
+        params: list[Any] = []
+        searchable_columns = (
+            "attachment_key",
+            "parent_key",
+            "relative_path",
+            "title",
+            "abstract",
+            "date_value",
+            "url",
+            "classification",
+            "source_quality",
+        )
+        for term in terms:
+            like = f"%{term}%"
+            per_term = " OR ".join(f"lower(coalesce({column}, '')) LIKE ?" for column in searchable_columns)
+            where_parts.append(f"({per_term})")
+            params.extend([like] * len(searchable_columns))
+        if classification is not None:
+            where_parts.append("classification = ?")
+            params.append(classification)
+
+        query_sql = f"""
+            SELECT attachment_key, parent_key, content_type, relative_path,
+                   title, abstract, date_value, url, classification,
+                   source_quality, reasons_json, file_path, file_exists,
+                   file_size, file_mtime, metadata_json, content_fingerprint,
+                   scan_status, first_seen_at, last_seen_at, updated_at
+            FROM attachments
+            WHERE {' AND '.join(where_parts)}
+        """
+        rows = self.conn.execute(query_sql, params).fetchall()
+        results = []
+        for row in rows:
+            item = dict(row)
+            reasons_json = item.pop("reasons_json")
+            metadata_json = item.pop("metadata_json")
+            item["file_exists"] = bool(row["file_exists"])
+            item["reasons"] = json.loads(reasons_json)
+            item["metadata"] = json.loads(metadata_json)
+            item["score"] = metadata_match_score(item, terms)
+            results.append(item)
+        results.sort(key=lambda item: (item["score"], item.get("title") or ""), reverse=True)
+        return results[:limit]
+
     def add_scan_report(self, summary: dict[str, Any], job_id: str | None = None) -> None:
         with self.conn:
             self.conn.execute(
@@ -614,3 +679,22 @@ def attachment_fingerprint(item: dict[str, Any]) -> str:
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def metadata_match_score(item: dict[str, Any], terms: list[str]) -> float:
+    weighted_fields = (
+        ("title", 5.0),
+        ("abstract", 2.0),
+        ("relative_path", 1.5),
+        ("url", 1.0),
+        ("date_value", 1.0),
+        ("attachment_key", 1.0),
+        ("parent_key", 1.0),
+    )
+    score = 0.0
+    for field, weight in weighted_fields:
+        value = str(item.get(field) or "").casefold()
+        for term in terms:
+            if term in value:
+                score += weight
+    return score

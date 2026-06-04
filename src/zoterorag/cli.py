@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 
 from .runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime, scan_zotero_shadow
+from .search import metadata_search
 from .zotero import ZoteroShadow
 
 
@@ -44,6 +45,12 @@ def build_parser() -> argparse.ArgumentParser:
     attachments = sub.add_parser("attachments", help="List persisted attachment scan results.")
     attachments.add_argument("--classification", default=None)
     attachments.add_argument("--limit", type=int, default=50)
+
+    search_metadata = sub.add_parser("search-metadata", help="Search scanned Zotero metadata without embeddings.")
+    search_metadata.add_argument("query")
+    search_metadata.add_argument("--classification", default=None)
+    search_metadata.add_argument("--limit", type=int, default=10)
+    search_metadata.add_argument("--consumer", default="llm_text", choices=("manual", "llm_text", "llm_multimodal"))
 
     inspect = sub.add_parser("inspect-shadow", help="Read summary from an existing shadow DB.")
     inspect.add_argument("--limit", type=int, default=5)
@@ -106,6 +113,20 @@ def main(argv: list[str] | None = None) -> int:
                     "attachments": ledger.list_attachments(
                         classification=args.classification,
                         limit=args.limit,
+                    )
+                }
+            )
+            return 0
+
+        if args.command == "search-metadata":
+            emit(
+                {
+                    "results": metadata_search(
+                        ledger,
+                        query=args.query,
+                        classification=args.classification,
+                        limit=args.limit,
+                        consumer=args.consumer,
                     )
                 }
             )

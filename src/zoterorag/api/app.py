@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from ..runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime, scan_zotero_shadow
+from ..search import metadata_search
 from .security import AccessDenied, verify_api_access
 
 
@@ -75,5 +76,17 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
     @app.get("/attachments", dependencies=[Depends(require_access)])
     def attachments(classification: str | None = None, limit: int | None = 100) -> dict[str, Any]:
         return {"attachments": ledger.list_attachments(classification=classification, limit=limit)}
+
+    @app.post("/search/metadata", dependencies=[Depends(require_access)])
+    def search_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "results": metadata_search(
+                ledger,
+                query=str(payload["query"]),
+                classification=payload.get("classification"),
+                limit=int(payload.get("limit", payload.get("top_k", 10))),
+                consumer=str(payload.get("consumer", "llm_text")),
+            )
+        }
 
     return app
