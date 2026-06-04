@@ -57,6 +57,17 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
     def list_vector_indexes() -> dict[str, Any]:
         return {"indexes": ledger.list_vector_indexes()}
 
+    @app.get("/jobs", dependencies=[Depends(require_access)])
+    def list_jobs(kind: str | None = None, status: str | None = None, limit: int | None = 50) -> dict[str, Any]:
+        return {"jobs": ledger.list_jobs(kind=kind, status=status, limit=limit)}
+
+    @app.get("/jobs/{job_id}", dependencies=[Depends(require_access)])
+    def get_job(job_id: str) -> dict[str, Any]:
+        job = ledger.get_job(job_id, include_events=True)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"job not found: {job_id}")
+        return {"job": job}
+
     @app.post("/scan", dependencies=[Depends(require_access)])
     def scan_shadow(payload: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = payload or {}

@@ -43,6 +43,15 @@ def build_parser() -> argparse.ArgumentParser:
     vectors_sub = vectors.add_subparsers(dest="vectors_command", required=True)
     vectors_sub.add_parser("list")
 
+    jobs = sub.add_parser("jobs", help="Inspect pipeline jobs and progress events.")
+    jobs_sub = jobs.add_subparsers(dest="jobs_command", required=True)
+    jobs_list = jobs_sub.add_parser("list")
+    jobs_list.add_argument("--kind", default=None)
+    jobs_list.add_argument("--status", default=None)
+    jobs_list.add_argument("--limit", type=int, default=50)
+    jobs_show = jobs_sub.add_parser("show")
+    jobs_show.add_argument("job_id")
+
     review = sub.add_parser("review", help="Manage manual include/exclude rules.")
     review_sub = review.add_subparsers(dest="review_command", required=True)
     review_sub.add_parser("list")
@@ -172,6 +181,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "vectors" and args.vectors_command == "list":
             emit({"indexes": ledger.list_vector_indexes()})
             return 0
+
+        if args.command == "jobs":
+            if args.jobs_command == "list":
+                emit({"jobs": ledger.list_jobs(kind=args.kind, status=args.status, limit=args.limit)})
+                return 0
+            if args.jobs_command == "show":
+                job = ledger.get_job(args.job_id, include_events=True)
+                emit({"job": job})
+                return 0 if job is not None else 1
 
         if args.command == "review":
             if args.review_command == "list":

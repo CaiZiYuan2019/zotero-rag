@@ -68,6 +68,17 @@ class StateLedgerTests(unittest.TestCase):
                 self.assertEqual("ok", event_row["status"])
                 self.assertEqual("copied", event_row["message"])
                 self.assertIn('"rows": 12', event_row["payload_json"])
+
+                job = reopened.get_job(job_id)
+                self.assertIsNotNone(job)
+                self.assertEqual("shadow-sync", job["kind"])
+                self.assertEqual({"source": "zotero"}, job["payload"])
+                self.assertEqual(1, len(job["events"]))
+                self.assertEqual({"rows": 12}, job["events"][0]["payload"])
+
+                jobs = reopened.list_jobs(kind="shadow-sync", status="running")
+                self.assertEqual(1, len(jobs))
+                self.assertEqual(job_id, jobs[0]["job_id"])
             finally:
                 reopened.close()
 

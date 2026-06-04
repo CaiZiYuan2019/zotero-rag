@@ -338,6 +338,50 @@ class StateLedger:
                 (status, utc_now(), job_id),
             )
 
+    def get_job(self, job_id: str, *, include_events: bool = True) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT job_id, kind, status, created_at, updated_at, payload_json
+            FROM pipeline_jobs
+            WHERE job_id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        job = decode_pipeline_job_row(row)
+        if include_events:
+            job["events"] = self.list_job_events(job_id)
+        return job
+
+    def list_jobs(
+        self,
+        *,
+        kind: str | None = None,
+        status: str | None = None,
+        limit: int | None = 50,
+    ) -> list[dict[str, Any]]:
+        query = """
+            SELECT job_id, kind, status, created_at, updated_at, payload_json
+            FROM pipeline_jobs
+        """
+        where = []
+        params: list[Any] = []
+        if kind is not None:
+            where.append("kind = ?")
+            params.append(kind)
+        if status is not None:
+            where.append("status = ?")
+            params.append(status)
+        if where:
+            query += " WHERE " + " AND ".join(where)
+        query += " ORDER BY updated_at DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        rows = self.conn.execute(query, params).fetchall()
+        return [decode_pipeline_job_row(row) for row in rows]
+
     def add_event(self, event: JobEvent) -> None:
         created_at = event.created_at or utc_now()
         payload_json = json.dumps(event.payload or {}, ensure_ascii=False, sort_keys=True)
@@ -353,6 +397,20 @@ class StateLedger:
                 "UPDATE pipeline_jobs SET updated_at = ? WHERE job_id = ?",
                 (created_at, event.job_id),
             )
+
+    def list_job_events(self, job_id: str, *, limit: int | None = None) -> list[dict[str, Any]]:
+        query = """
+            SELECT event_id, job_id, stage, status, message, payload_json, created_at
+            FROM job_events
+            WHERE job_id = ?
+            ORDER BY event_id
+        """
+        params: list[Any] = [job_id]
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        rows = self.conn.execute(query, params).fetchall()
+        return [decode_job_event_row(row) for row in rows]
 
     def checkpoint(
         self,
@@ -1298,6 +1356,20 @@ def chunk_match_score(item: dict[str, Any], terms: list[str]) -> float:
 def decode_extract_job_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
+    item = dict(row)
+    payload_json = item.pop("payload_json")
+    item["payload"] = json.loads(payload_json)
+    return item
+
+
+def decode_pipeline_job_row(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    payload_json = item.pop("payload_json")
+    item["payload"] = json.loads(payload_json)
+    return item
+
+
+def decode_job_event_row(row: sqlite3.Row) -> dict[str, Any]:
     item = dict(row)
     payload_json = item.pop("payload_json")
     item["payload"] = json.loads(payload_json)
