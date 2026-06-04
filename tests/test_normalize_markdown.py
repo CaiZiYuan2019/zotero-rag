@@ -61,6 +61,60 @@ class NormalizeMarkdownTests(unittest.TestCase):
             finally:
                 ledger.close()
 
+    def test_image_manifest_records_dimensions_and_consecutive_runs(self) -> None:
+        with workspace_tmpdir("normalize-md-") as tmpdir:
+            source_dir = tmpdir / "mineru"
+            images_dir = source_dir / "images"
+            images_dir.mkdir(parents=True)
+            (images_dir / "panel-a.png").write_bytes(png_header(width=2000, height=1000))
+            (images_dir / "panel-b.png").write_bytes(png_header(width=800, height=600))
+            (images_dir / "separate.png").write_bytes(png_header(width=40, height=40))
+            markdown = source_dir / "full.md"
+            markdown.write_text(
+                "# Figures\n\n"
+                "![Panel A](images/panel-a.png)\n"
+                "![Panel B](images/panel-b.png)\n\n"
+                "A paragraph separates this image from the panel run.\n\n"
+                "![Separate](images/separate.png)\n",
+                encoding="utf-8",
+            )
+
+            result = normalize_markdown_document(
+                source_markdown=markdown,
+                output_root=tmpdir / "normalized",
+                document_id="DOC_RUN",
+            )
+            image_manifest = json.loads(result.image_manifest.read_text(encoding="utf-8"))
+            image_chunks = [chunk for chunk in result.chunks if chunk["chunk_type"] == "image"]
+
+            self.assertEqual(3, len(image_manifest))
+            self.assertEqual(2000, image_manifest[0]["width"])
+            self.assertEqual(1000, image_manifest[0]["height"])
+            self.assertIn("exceeds_embedding_long_edge", image_manifest[0]["image_quality_flags"])
+            self.assertEqual("needs_resize", image_manifest[0]["embedding_policy"]["status"])
+            self.assertEqual("ready_original", image_manifest[1]["embedding_policy"]["status"])
+            self.assertIn("tiny_image", image_manifest[2]["image_quality_flags"])
+
+            self.assertEqual("run:00001", image_manifest[0]["image_run_id"])
+            self.assertEqual("run:00001", image_manifest[1]["image_run_id"])
+            self.assertEqual("run:00002", image_manifest[2]["image_run_id"])
+            self.assertEqual(2, image_manifest[0]["image_run_count"])
+            self.assertEqual(1, image_manifest[0]["image_run_position"])
+            self.assertEqual(2, image_manifest[1]["image_run_position"])
+            self.assertEqual("DOC_RUN:run:00001", image_chunks[0]["metadata"]["image_run_id"])
+            self.assertEqual(2, image_chunks[0]["metadata"]["image_run_count"])
+
+def png_header(*, width: int, height: int) -> bytes:
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + b"\x00\x00\x00\r"
+        + b"IHDR"
+        + width.to_bytes(4, "big")
+        + height.to_bytes(4, "big")
+        + b"\x08\x02\x00\x00\x00"
+        + b"\x00\x00\x00\x00"
+    )
+
 
 if __name__ == "__main__":
     unittest.main()

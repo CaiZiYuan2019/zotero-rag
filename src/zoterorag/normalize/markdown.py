@@ -6,6 +6,7 @@ import json
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import struct
 from typing import Any
 
 
@@ -80,6 +81,7 @@ def normalize_markdown_document(
     mapping = build_ordered_image_mapping(refs, images_dir, policy)
     normalized_text = rewrite_image_references(markdown_text, mapping)
     images = copy_images(mapping, images_dir, policy)
+    images = assign_image_runs(images, markdown_text)
     chunks = build_chunks(document_id=document_id, markdown_text=normalized_text, images=images)
 
     document_md = artifact_dir / "document.md"
@@ -125,9 +127,9 @@ def collect_image_references(markdown_text: str, markdown_parent: Path) -> list[
     for match in MARKDOWN_IMAGE_RE.finditer(markdown_text):
         alt_text = match.group(1).removeprefix("![").removesuffix("](")
         target = split_markdown_target(match.group(2))[1]
-        refs.append(build_image_reference(match.start(), alt_text, target, markdown_parent))
+        refs.append(build_image_reference(match.start(), match.end(), alt_text, target, markdown_parent))
     for match in HTML_IMAGE_RE.finditer(markdown_text):
-        refs.append(build_image_reference(match.start(), "", match.group(2), markdown_parent))
+        refs.append(build_image_reference(match.start(), match.end(), "", match.group(2), markdown_parent))
     refs.sort(key=lambda item: item["position"])
     seen: set[Path] = set()
     unique = []
@@ -140,10 +142,17 @@ def collect_image_references(markdown_text: str, markdown_parent: Path) -> list[
     return unique
 
 
-def build_image_reference(position: int, alt_text: str, target: str, markdown_parent: Path) -> dict[str, Any]:
+def build_image_reference(
+    position: int,
+    end_position: int,
+    alt_text: str,
+    target: str,
+    markdown_parent: Path,
+) -> dict[str, Any]:
     source_path = resolve_local_image(target, markdown_parent)
     return {
         "position": position,
+        "end_position": end_position,
         "alt_text": alt_text,
         "target": target,
         "source_path": source_path,
@@ -209,6 +218,8 @@ def copy_images(mapping: dict[Path, dict[str, Any]], images_dir: Path, policy: I
         target = images_dir / item["ordered_name"]
         shutil.copy2(source, target)
         stat = target.stat()
+        dimensions = read_image_dimensions(target)
+        quality_flags = image_quality_flags(dimensions, stat.st_size, policy)
         images.append(
             {
                 "image_index": item["image_index"],
@@ -218,15 +229,52 @@ def copy_images(mapping: dict[Path, dict[str, Any]], images_dir: Path, policy: I
                 "ordered_relative_path": item["ordered_relative_path"],
                 "sha256": sha256_file(target),
                 "size": stat.st_size,
+                "width": dimensions.get("width"),
+                "height": dimensions.get("height"),
+                "format": dimensions.get("format"),
+                "pixel_count": dimensions.get("pixel_count"),
+                "image_quality_flags": quality_flags,
                 "embedding_policy": {
                     "max_long_edge": policy.embedding_max_long_edge,
                     "max_bytes": policy.embedding_max_bytes,
-                    "status": "not_resized_yet",
+                    "status": "needs_resize"
+                    if "exceeds_embedding_limits" in quality_flags
+                    else "ready_original",
                 },
                 "alt_text": item["alt_text"],
                 "position": item["position"],
+                "end_position": item["end_position"],
             }
         )
+    return images
+
+
+def assign_image_runs(images: list[dict[str, Any]], markdown_text: str) -> list[dict[str, Any]]:
+    """Group consecutive image references into stable image runs.
+
+    MinerU can split one multi-panel figure into adjacent image files. We keep
+    per-image vectors because the current qwen3-vl cloud embedding API accepts a
+    single image per request, but shared run ids let retrieval merge or present
+    consecutive hits together.
+    """
+
+    sorted_images = sorted(images, key=lambda item: item["position"])
+    current_run = 0
+    previous: dict[str, Any] | None = None
+    run_members: dict[str, list[dict[str, Any]]] = {}
+    for image in sorted_images:
+        if previous is None or markdown_text[previous["end_position"] : image["position"]].strip():
+            current_run += 1
+        run_id = f"run:{current_run:05d}"
+        image["image_run_id"] = run_id
+        run_members.setdefault(run_id, []).append(image)
+        previous = image
+
+    for members in run_members.values():
+        run_count = len(members)
+        for index, image in enumerate(members, start=1):
+            image["image_run_position"] = index
+            image["image_run_count"] = run_count
     return images
 
 
@@ -283,7 +331,14 @@ def build_chunks(document_id: str, markdown_text: str, images: list[dict[str, An
                 "metadata": {
                     "image_index": image["image_index"],
                     "image_path": image["ordered_relative_path"],
-                    "image_run_id": f"{document_id}:run:{image['image_index']:05d}",
+                    "image_run_id": f"{document_id}:{image['image_run_id']}",
+                    "image_run_position": image["image_run_position"],
+                    "image_run_count": image["image_run_count"],
+                    "width": image.get("width"),
+                    "height": image.get("height"),
+                    "pixel_count": image.get("pixel_count"),
+                    "image_quality_flags": image.get("image_quality_flags", []),
+                    "embedding_policy": image.get("embedding_policy", {}),
                     "image_return": "file_ref",
                 },
             }
@@ -331,6 +386,76 @@ def estimate_tokens(text: str) -> int:
 def sanitize_id(text: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", text.strip())
     return cleaned[:128] if cleaned else "document"
+
+
+def read_image_dimensions(path: str | Path) -> dict[str, Any]:
+    file_path = Path(path)
+    header = file_path.read_bytes()[:64]
+    if len(header) >= 24 and header.startswith(b"\x89PNG\r\n\x1a\n") and header[12:16] == b"IHDR":
+        width, height = struct.unpack(">II", header[16:24])
+        return image_dimension_result("png", width, height)
+    if len(header) >= 10 and header.startswith((b"GIF87a", b"GIF89a")):
+        width, height = struct.unpack("<HH", header[6:10])
+        return image_dimension_result("gif", width, height)
+    if header.startswith(b"\xff\xd8"):
+        jpeg_dimensions = read_jpeg_dimensions(file_path)
+        if jpeg_dimensions:
+            return jpeg_dimensions
+    return {"format": file_path.suffix.lower().lstrip(".") or "unknown"}
+
+
+def read_jpeg_dimensions(path: Path) -> dict[str, Any] | None:
+    data = path.read_bytes()
+    offset = 2
+    while offset + 9 < len(data):
+        if data[offset] != 0xFF:
+            offset += 1
+            continue
+        marker = data[offset + 1]
+        offset += 2
+        if marker in {0xD8, 0xD9}:
+            continue
+        if offset + 2 > len(data):
+            return None
+        segment_length = int.from_bytes(data[offset : offset + 2], "big")
+        if segment_length < 2 or offset + segment_length > len(data):
+            return None
+        if marker in {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}:
+            if segment_length < 7:
+                return None
+            height = int.from_bytes(data[offset + 3 : offset + 5], "big")
+            width = int.from_bytes(data[offset + 5 : offset + 7], "big")
+            return image_dimension_result("jpeg", width, height)
+        offset += segment_length
+    return None
+
+
+def image_dimension_result(image_format: str, width: int, height: int) -> dict[str, Any]:
+    return {
+        "format": image_format,
+        "width": width,
+        "height": height,
+        "pixel_count": width * height,
+    }
+
+
+def image_quality_flags(dimensions: dict[str, Any], file_size: int, policy: ImagePolicy) -> list[str]:
+    flags: list[str] = []
+    width = dimensions.get("width")
+    height = dimensions.get("height")
+    if width is None or height is None:
+        flags.append("unknown_dimensions")
+    else:
+        if min(int(width), int(height)) < 64:
+            flags.append("tiny_image")
+        if max(int(width), int(height)) > policy.embedding_max_long_edge:
+            flags.append("exceeds_embedding_limits")
+            flags.append("exceeds_embedding_long_edge")
+    if file_size > policy.embedding_max_bytes:
+        if "exceeds_embedding_limits" not in flags:
+            flags.append("exceeds_embedding_limits")
+        flags.append("exceeds_embedding_bytes")
+    return flags
 
 
 def sha256_text(text: str) -> str:
