@@ -5,6 +5,7 @@ import unittest
 from tests._support import workspace_tmpdir
 from zoterorag.config import EmbeddingProfile
 from zoterorag.db import StateLedger
+from zoterorag.embeddings.profile import embedding_profile_hash
 from zoterorag.normalize import normalize_markdown_document
 from zoterorag.pipeline import (
     cancel_ingest_job,
@@ -27,13 +28,13 @@ class IngestPipelineTests(unittest.TestCase):
                     normalized.document_id,
                     "embed:text-profile",
                     "indexed",
-                    {"chunks": 1},
+                    {"chunks": 1, "profile_hash": profile_hash(ledger, "text-profile")},
                 )
                 ledger.checkpoint(
                     normalized.document_id,
                     "embed:mm-profile",
                     "indexed",
-                    {"chunks": 1},
+                    {"chunks": 1, "profile_hash": profile_hash(ledger, "mm-profile")},
                 )
 
                 plan = create_ingest_plan(ledger)
@@ -46,6 +47,32 @@ class IngestPipelineTests(unittest.TestCase):
                 self.assertEqual("extract:blocked", by_key["ATT_MISSING"]["next_stage"])
                 self.assertEqual("text-profile", plan["text_profile"])
                 self.assertEqual("mm-profile", plan["multimodal_profile"])
+            finally:
+                ledger.close()
+
+    def test_profile_hash_mismatch_marks_embedding_pending(self) -> None:
+        with workspace_tmpdir("ingest-profile-hash-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                seed_profiles(ledger)
+                ledger.upsert_attachments([build_attachment("ATT_DONE", title="Already Indexed")])
+                normalized = normalize_fixture(tmpdir, ledger)
+                ledger.checkpoint(
+                    normalized.document_id,
+                    "embed:text-profile",
+                    "indexed",
+                    {"chunks": 1, "profile_hash": "old-hash"},
+                )
+
+                plan = create_ingest_plan(ledger, include_multimodal=False)
+                document = plan["documents"][0]
+                embed_stage = next(stage for stage in document["stages"] if stage["stage"] == "embed:text-profile")
+
+                self.assertEqual("embed:text-profile:pending", document["next_stage"])
+                self.assertEqual("pending", embed_stage["status"])
+                self.assertEqual("profile_changed", embed_stage["reason"])
+                self.assertEqual("old-hash", embed_stage["checkpoint_profile_hash"])
+                self.assertEqual(profile_hash(ledger, "text-profile"), embed_stage["profile_hash"])
             finally:
                 ledger.close()
 
@@ -115,6 +142,11 @@ def seed_profiles(ledger: StateLedger) -> None:
             ),
         ]
     )
+
+
+def profile_hash(ledger: StateLedger, profile_name: str) -> str:
+    profile = next(profile for profile in ledger.list_embedding_profiles() if profile["name"] == profile_name)
+    return embedding_profile_hash(profile)
 
 
 def seed_attachments(ledger: StateLedger) -> None:

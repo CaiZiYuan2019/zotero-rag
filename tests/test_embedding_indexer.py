@@ -6,6 +6,7 @@ from tests._support import workspace_tmpdir
 from zoterorag.config import EmbeddingProfile
 from zoterorag.db import StateLedger
 from zoterorag.embeddings import index_normalized_document, search_vector_index
+from zoterorag.embeddings.profile import embedding_profile_hash
 from zoterorag.normalize import normalize_markdown_document
 
 
@@ -97,7 +98,16 @@ class EmbeddingIndexerTests(unittest.TestCase):
 
                 self.assertEqual(1, text_result.indexed_chunks)
                 self.assertEqual(1, mm_result.indexed_chunks)
+                self.assertEqual(
+                    embedding_profile_hash(
+                        next(profile for profile in ledger.list_embedding_profiles() if profile["name"] == "stub_text")
+                    ),
+                    text_result.profile_hash,
+                )
+                checkpoint = ledger.get_checkpoint("DOC1", "embed:stub_text")
+                self.assertEqual(text_result.profile_hash, checkpoint["payload"]["profile_hash"])
                 self.assertEqual("stub_text", text_hits[0]["metadata"]["profile_name"])
+                self.assertEqual(text_result.profile_hash, text_hits[0]["metadata"]["profile_hash"])
                 self.assertNotIn("images", mm_text_only_hits[0])
                 self.assertTrue(mm_text_only_hits[0]["has_images"])
                 self.assertIn("images", mm_manual_hits[0])

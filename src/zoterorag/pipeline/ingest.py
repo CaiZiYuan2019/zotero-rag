@@ -4,6 +4,7 @@ from collections import Counter
 from typing import Any, Literal
 
 from ..db import JobEvent, StateLedger
+from ..embeddings.profile import embedding_profile_hash
 
 
 IngestMode = Literal["incremental", "full"]
@@ -35,8 +36,8 @@ def create_ingest_plan(
         if artifact.get("attachment_key")
     }
     extract_jobs_by_attachment = group_extract_jobs_by_attachment(ledger)
-    text_profile = default_profile_name(ledger, mode="text")
-    multimodal_profile = default_profile_name(ledger, mode="multimodal") if include_multimodal else None
+    text_profile = default_profile(ledger, mode="text")
+    multimodal_profile = default_profile(ledger, mode="multimodal") if include_multimodal else None
 
     documents = [
         plan_attachment(
@@ -55,8 +56,8 @@ def create_ingest_plan(
         "mode": mode,
         "zotero_key": zotero_key,
         "include_multimodal": include_multimodal,
-        "text_profile": text_profile,
-        "multimodal_profile": multimodal_profile,
+        "text_profile": text_profile["name"] if text_profile else None,
+        "multimodal_profile": multimodal_profile["name"] if multimodal_profile else None,
         "summary": summary,
         "documents": documents,
     }
@@ -173,8 +174,8 @@ def plan_attachment(
     attachment: dict[str, Any],
     artifact: dict[str, Any] | None,
     extract_jobs: list[dict[str, Any]],
-    text_profile: str | None,
-    multimodal_profile: str | None,
+    text_profile: dict[str, Any] | None,
+    multimodal_profile: dict[str, Any] | None,
     mode: IngestMode,
 ) -> dict[str, Any]:
     document_id = artifact["document_id"] if artifact is not None else attachment["attachment_key"]
@@ -247,18 +248,42 @@ def stage_for_embedding(
     *,
     document_id: str,
     artifact: dict[str, Any] | None,
-    profile_name: str | None,
+    profile_name: dict[str, Any] | str | None,
     force: bool,
 ) -> dict[str, Any]:
     if profile_name is None:
         return {"stage": "embed", "status": "skipped", "reason": "no_default_profile"}
-    stage_name = f"embed:{profile_name}"
+    profile = profile_name if isinstance(profile_name, dict) else profile_by_name(ledger, profile_name)
+    if profile is None:
+        return {"stage": f"embed:{profile_name}", "status": "skipped", "reason": "profile_not_found"}
+    current_hash = embedding_profile_hash(profile)
+    stage_name = f"embed:{profile['name']}"
     if artifact is None:
-        return {"stage": stage_name, "status": "blocked", "reason": "not_normalized"}
+        return {"stage": stage_name, "status": "blocked", "reason": "not_normalized", "profile_hash": current_hash}
     checkpoint = ledger.get_checkpoint(document_id, stage_name)
     if checkpoint is not None and checkpoint["status"] == "indexed" and not force:
-        return {"stage": stage_name, "status": "done", "checkpoint": checkpoint}
-    return {"stage": stage_name, "status": "pending", "reason": "full_rebuild" if force and checkpoint else "not_indexed"}
+        checkpoint_hash = checkpoint.get("payload", {}).get("profile_hash")
+        if checkpoint_hash == current_hash:
+            return {
+                "stage": stage_name,
+                "status": "done",
+                "checkpoint": checkpoint,
+                "profile_hash": current_hash,
+            }
+        reason = "missing_profile_hash" if checkpoint_hash is None else "profile_changed"
+        return {
+            "stage": stage_name,
+            "status": "pending",
+            "reason": reason,
+            "profile_hash": current_hash,
+            "checkpoint_profile_hash": checkpoint_hash,
+        }
+    return {
+        "stage": stage_name,
+        "status": "pending",
+        "reason": "full_rebuild" if force and checkpoint else "not_indexed",
+        "profile_hash": current_hash,
+    }
 
 
 def summarize_plan(documents: list[dict[str, Any]]) -> dict[str, Any]:
@@ -292,11 +317,23 @@ def group_extract_jobs_by_attachment(ledger: StateLedger) -> dict[str, list[dict
 
 
 def default_profile_name(ledger: StateLedger, *, mode: Literal["text", "multimodal"]) -> str | None:
+    profile = default_profile(ledger, mode=mode)
+    return str(profile["name"]) if profile else None
+
+
+def default_profile(ledger: StateLedger, *, mode: Literal["text", "multimodal"]) -> dict[str, Any] | None:
     flag = "default_for_text" if mode == "text" else "default_for_multimodal"
     expected_modality = "text" if mode == "text" else "multimodal"
     for profile in ledger.list_embedding_profiles():
         if profile["enabled"] and profile["modality"] == expected_modality and profile[flag]:
-            return str(profile["name"])
+            return profile
+    return None
+
+
+def profile_by_name(ledger: StateLedger, profile_name: str) -> dict[str, Any] | None:
+    for profile in ledger.list_embedding_profiles():
+        if profile["name"] == profile_name:
+            return profile
     return None
 
 

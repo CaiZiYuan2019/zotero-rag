@@ -8,6 +8,7 @@ from ..db import StateLedger
 from ..index.local_vector import LocalVectorStore, VectorRecord
 from ..search.results import SearchResult, sanitize_results_for_consumer
 from .base import EmbeddingInput, EmbeddingProvider, StubEmbeddingProvider
+from .profile import embedding_profile_hash
 
 
 SearchMode = Literal["text", "multimodal"]
@@ -20,6 +21,7 @@ class IndexResult:
     indexed_chunks: int
     vector_path: Path
     modality: str
+    profile_hash: str
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -28,6 +30,7 @@ class IndexResult:
             "indexed_chunks": self.indexed_chunks,
             "vector_path": str(self.vector_path),
             "modality": self.modality,
+            "profile_hash": self.profile_hash,
         }
 
 
@@ -45,6 +48,7 @@ def index_normalized_document(
         raise KeyError(f"normalized artifact not found: {document_id}")
 
     profile_modality = str(profile["modality"])
+    profile_hash = embedding_profile_hash(profile)
     chunk_type = "text" if profile_modality == "text" else "image"
     chunks = ledger.list_chunks(document_id, chunk_type=chunk_type)
     embedding_provider = provider or StubEmbeddingProvider(dimension=int(profile["dimension"]))
@@ -68,6 +72,7 @@ def index_normalized_document(
                 **chunk.get("metadata", {}),
                 "heading_path": chunk.get("heading_path", []),
                 "profile_name": profile_name,
+                "profile_hash": profile_hash,
                 "consumer_safe": chunk_type == "text",
             },
         )
@@ -94,7 +99,12 @@ def index_normalized_document(
         document_id,
         f"embed:{profile_name}",
         "indexed",
-        {"chunks": indexed, "profile_modality": profile_modality, "chunk_type": chunk_type},
+        {
+            "chunks": indexed,
+            "profile_modality": profile_modality,
+            "chunk_type": chunk_type,
+            "profile_hash": profile_hash,
+        },
     )
     return IndexResult(
         profile_name=profile_name,
@@ -102,6 +112,7 @@ def index_normalized_document(
         indexed_chunks=indexed,
         vector_path=vector_path,
         modality=chunk_type,
+        profile_hash=profile_hash,
     )
 
 
