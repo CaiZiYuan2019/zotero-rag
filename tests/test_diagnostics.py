@@ -4,6 +4,9 @@ import unittest
 
 from tests._support import workspace_tmpdir
 from tests.test_zotero_shadow import build_minimal_zotero_db
+from zoterorag.config import EmbeddingProfile
+from zoterorag.config import load_config
+from zoterorag.db import StateLedger
 from zoterorag.diagnostics import run_runtime_diagnostics
 from zoterorag.runtime import initialize_runtime
 
@@ -98,6 +101,86 @@ default_for_multimodal = false
                 self.assertIn("missing_vector_store", deep["checks"]["vectors"]["indexes"][0]["verification"]["errors"][0])
             finally:
                 ledger.close()
+
+    def test_vector_provenance_reports_unattributed_and_tracked_indexes(self) -> None:
+        with workspace_tmpdir("diagnostics-provenance-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                ledger.upsert_embedding_profiles(
+                    [
+                        EmbeddingProfile(
+                            name="stub_text",
+                            provider="stub",
+                            model="stub",
+                            dimension=8,
+                            modality="text",
+                            enabled=True,
+                            default_for_text=True,
+                        )
+                    ]
+                )
+                ledger.register_vector_index(
+                    profile_name="stub_text",
+                    backend="sqlite-local",
+                    path=tmpdir / "vectors" / "stub_text" / "vectors.sqlite",
+                    document_count=1,
+                    chunk_count=3,
+                    active=True,
+                    active_version="batch-live",
+                )
+                config = make_config(tmpdir)
+                build_minimal_zotero_db(config.paths.shadow_db)
+
+                unattributed = run_runtime_diagnostics(config, ledger)["checks"]["vectors"]["indexes"][0]
+                self.assertEqual("unattributed", unattributed["provenance"]["status"])
+                self.assertFalse(unattributed["provenance"]["active_version_has_completed_batch"])
+
+                ledger.upsert_embedding_batch(
+                    batch_hash="batch-live",
+                    profile_name="stub_text",
+                    profile_hash="profile-hash",
+                    document_id="DOC1",
+                    chunk_type="text",
+                    chunk_count=3,
+                    status="completed",
+                    provider="stub",
+                    model="stub",
+                )
+                tracked = run_runtime_diagnostics(config, ledger)["checks"]["vectors"]["indexes"][0]
+                self.assertEqual("tracked_active_version", tracked["provenance"]["status"])
+                self.assertTrue(tracked["provenance"]["active_version_has_completed_batch"])
+            finally:
+                ledger.close()
+
+
+def make_config(tmpdir):
+    config_path = tmpdir / "config.toml"
+    source_db = tmpdir / "zotero.sqlite"
+    storage = tmpdir / "storage"
+    storage.mkdir(exist_ok=True)
+    source_db.write_bytes(b"source-placeholder")
+    config_path.write_text(
+        f"""
+[paths]
+zotero_db = "{source_db.as_posix()}"
+zotero_storage = "{storage.as_posix()}"
+data_dir = "{(tmpdir / 'data').as_posix()}"
+
+[[embedding_profiles]]
+name = "stub_text"
+provider = "stub"
+model = "stub"
+dimension = 8
+modality = "text"
+enabled = true
+default_for_text = true
+default_for_multimodal = false
+""",
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+    config.ensure_runtime_dirs()
+    return config
 
 
 if __name__ == "__main__":

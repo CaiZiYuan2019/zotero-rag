@@ -49,6 +49,7 @@ class EmbeddingModelCatalogTests(unittest.TestCase):
                     document_count=3,
                     chunk_count=11,
                     active=True,
+                    active_version="batch-live",
                 )
 
                 catalog = list_embedding_model_catalog(ledger)
@@ -59,6 +60,7 @@ class EmbeddingModelCatalogTests(unittest.TestCase):
                 self.assertEqual("ready", by_name["text-profile"]["index_status"])
                 self.assertEqual(["text"], by_name["text-profile"]["query_modes"])
                 self.assertEqual(11, by_name["text-profile"]["vector_index"]["chunk_count"])
+                self.assertEqual("batch-live", by_name["text-profile"]["vector_index"]["active_version"])
                 self.assertTrue(by_name["text-profile"]["vector_index"]["path_exists"])
                 self.assertEqual("not_indexed", by_name["mm-profile"]["index_status"])
                 self.assertEqual(["multimodal"], by_name["mm-profile"]["query_modes"])

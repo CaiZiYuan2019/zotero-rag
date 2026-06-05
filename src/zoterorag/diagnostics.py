@@ -105,6 +105,7 @@ def check_vector_indexes(
         item = {
             **index,
             "path_exists": path.is_file(),
+            "provenance": vector_index_provenance(ledger, index),
         }
         if verify_vectors:
             verification = verify_vector_index(ledger, index["profile_name"]).to_dict()
@@ -112,6 +113,32 @@ def check_vector_indexes(
             result["ok"] = result["ok"] and bool(verification["ok"])
         result["indexes"].append(item)
     return result
+
+
+def vector_index_provenance(ledger: StateLedger, index: dict[str, Any]) -> dict[str, Any]:
+    batches = ledger.list_embedding_batches(
+        profile_name=index["profile_name"],
+        status="completed",
+        limit=None,
+    )
+    active_version = str(index.get("active_version") or "")
+    matching_active_version = [
+        batch for batch in batches if active_version and batch["batch_hash"] == active_version
+    ]
+    if int(index.get("chunk_count") or 0) == 0:
+        status = "empty"
+    elif matching_active_version:
+        status = "tracked_active_version"
+    elif batches:
+        status = "tracked_profile"
+    else:
+        status = "unattributed"
+    return {
+        "status": status,
+        "completed_batch_count": len(batches),
+        "active_version": active_version,
+        "active_version_has_completed_batch": bool(matching_active_version),
+    }
 
 
 def check_api_access(config: AppConfig) -> dict[str, Any]:

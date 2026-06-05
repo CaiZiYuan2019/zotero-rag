@@ -74,6 +74,7 @@ def describe_vector_index(vector_index: dict[str, Any] | None) -> dict[str, Any]
         "document_count": int(vector_index["document_count"]),
         "chunk_count": int(vector_index["chunk_count"]),
         "active": bool(vector_index["active"]),
+        "active_version": str(vector_index.get("active_version") or ""),
         "updated_at": vector_index["updated_at"],
     }
 
