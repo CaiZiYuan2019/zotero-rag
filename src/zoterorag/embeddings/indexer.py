@@ -46,6 +46,7 @@ def index_normalized_document(
     profile_name: str,
     document_id: str,
     provider: EmbeddingProvider | None = None,
+    allow_stub_provider: bool = False,
 ) -> IndexResult:
     profile = require_embedding_profile(ledger, profile_name)
     artifact = ledger.get_normalized_artifact(document_id)
@@ -56,6 +57,12 @@ def index_normalized_document(
     profile_hash = embedding_profile_hash(profile)
     chunk_type = "text" if profile_modality == "text" else "image"
     chunks = ledger.list_chunks(document_id, chunk_type=chunk_type)
+    if provider is None and profile["provider"] != "stub" and not allow_stub_provider:
+        raise NotImplementedError(
+            f"embedding provider {profile['provider']} is not implemented for direct local indexing; "
+            "use a real provider implementation or set allow_stub_provider=true for control-plane tests"
+        )
+
     embedding_provider = provider or StubEmbeddingProvider(dimension=int(profile["dimension"]))
     if embedding_provider.dimension != int(profile["dimension"]):
         raise ValueError(

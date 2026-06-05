@@ -189,6 +189,11 @@ def build_parser() -> argparse.ArgumentParser:
     embed_index = embed_sub.add_parser("index-normalized", help="Index normalized chunks into a local vector store.")
     embed_index.add_argument("--document-id", required=True)
     embed_index.add_argument("--profile", required=True)
+    embed_index.add_argument(
+        "--allow-stub-provider",
+        action="store_true",
+        help="Allow local stub embeddings for non-stub profiles during control-plane tests.",
+    )
     embed_batches = embed_sub.add_parser("batches", help="List persisted embedding batch progress.")
     embed_batches.add_argument("--profile", default=None)
     embed_batches.add_argument("--document-id", default=None)
@@ -533,12 +538,17 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "embed":
             if args.embed_command == "index-normalized":
-                result = index_normalized_document(
-                    ledger=ledger,
-                    vector_store_dir=config.paths.vector_store_dir,
-                    profile_name=args.profile,
-                    document_id=args.document_id,
-                )
+                try:
+                    result = index_normalized_document(
+                        ledger=ledger,
+                        vector_store_dir=config.paths.vector_store_dir,
+                        profile_name=args.profile,
+                        document_id=args.document_id,
+                        allow_stub_provider=args.allow_stub_provider,
+                    )
+                except (KeyError, NotImplementedError, ValueError) as exc:
+                    emit({"ok": False, "error": str(exc)})
+                    return 1
                 emit(result.to_dict())
                 return 0
             if args.embed_command == "batches":

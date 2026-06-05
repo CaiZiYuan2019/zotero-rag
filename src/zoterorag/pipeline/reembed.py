@@ -126,6 +126,7 @@ def start_reembed_job(
             vector_store_dir=vector_store_dir,
             profile_name=profile_name,
             document_id=document["document_id"],
+            allow_stub_provider=allow_stub_provider,
         )
         result_payload = result.to_dict()
         executed.append(result_payload)

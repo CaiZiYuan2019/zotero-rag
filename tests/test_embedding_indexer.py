@@ -187,6 +187,57 @@ class EmbeddingIndexerTests(unittest.TestCase):
             finally:
                 ledger.close()
 
+    def test_direct_indexing_rejects_non_stub_profile_without_explicit_override(self) -> None:
+        with workspace_tmpdir("embedding-indexer-guard-") as tmpdir:
+            source_dir = tmpdir / "mineru"
+            source_dir.mkdir(parents=True)
+            markdown = source_dir / "full.md"
+            markdown.write_text("# Demo Paper\n\nalpha beta gamma text evidence\n", encoding="utf-8")
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                ledger.upsert_embedding_profiles(
+                    [
+                        EmbeddingProfile(
+                            name="qwen_text",
+                            provider="dashscope",
+                            model="qwen3-vl-embedding",
+                            dimension=8,
+                            modality="text",
+                            enabled=True,
+                            default_for_text=True,
+                        )
+                    ]
+                )
+                normalized = normalize_markdown_document(
+                    source_markdown=markdown,
+                    output_root=tmpdir / "normalized",
+                    document_id="DOC1",
+                    attachment_key="ATT1",
+                )
+                ledger.upsert_normalized_artifact(normalized.ledger_artifact())
+                ledger.replace_document_chunks(normalized.document_id, normalized.chunks)
+
+                with self.assertRaises(NotImplementedError):
+                    index_normalized_document(
+                        ledger=ledger,
+                        vector_store_dir=tmpdir / "vectors",
+                        profile_name="qwen_text",
+                        document_id="DOC1",
+                    )
+
+                result = index_normalized_document(
+                    ledger=ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="qwen_text",
+                    document_id="DOC1",
+                    allow_stub_provider=True,
+                )
+                self.assertEqual(1, result.indexed_chunks)
+                batch = ledger.list_embedding_batches(profile_name="qwen_text", document_id="DOC1")[0]
+                self.assertEqual("stub", batch["provider"])
+            finally:
+                ledger.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -362,12 +362,16 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
 
     @app.post("/embed/index-normalized", dependencies=[Depends(require_access)])
     def embed_index_normalized(payload: dict[str, Any]) -> dict[str, Any]:
-        return index_normalized_document(
-            ledger=ledger,
-            vector_store_dir=config.paths.vector_store_dir,
-            profile_name=str(payload["profile_name"]),
-            document_id=str(payload["document_id"]),
-        ).to_dict()
+        try:
+            return index_normalized_document(
+                ledger=ledger,
+                vector_store_dir=config.paths.vector_store_dir,
+                profile_name=str(payload["profile_name"]),
+                document_id=str(payload["document_id"]),
+                allow_stub_provider=bool(payload.get("allow_stub_provider", False)),
+            ).to_dict()
+        except NotImplementedError as exc:
+            raise HTTPException(status_code=501, detail=str(exc)) from exc
 
     @app.post("/reembed/from-normalized", dependencies=[Depends(require_access)])
     def reembed_from_normalized(payload: dict[str, Any]) -> dict[str, Any]:

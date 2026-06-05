@@ -80,6 +80,16 @@ class ReembedPipelineTests(unittest.TestCase):
                     execute=False,
                 )
                 self.assertEqual("planned", dry_run["job"]["status"])
+
+                executed = start_reembed_job(
+                    ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="qwen-text",
+                    execute=True,
+                    allow_stub_provider=True,
+                )
+                self.assertEqual("completed", executed["job"]["status"])
+                self.assertEqual(1, len(executed["indexed"]))
             finally:
                 ledger.close()
 
