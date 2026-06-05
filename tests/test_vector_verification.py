@@ -53,6 +53,7 @@ class VectorVerificationTests(unittest.TestCase):
                 ok = verify_vector_index(ledger, "profile-a")
                 self.assertTrue(ok.ok)
                 self.assertEqual(1, ok.actual_chunks)
+                self.assertEqual("legacy", ok.active_version)
 
                 ledger.register_vector_index(
                     profile_name="profile-a",

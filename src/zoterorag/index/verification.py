@@ -17,6 +17,7 @@ class VectorIndexVerification:
     expected_dimension: int | None
     registered_documents: int | None = None
     registered_chunks: int | None = None
+    active_version: str = ""
     actual_documents: int | None = None
     actual_chunks: int | None = None
     dimension_errors: int = 0
@@ -30,6 +31,7 @@ class VectorIndexVerification:
             "expected_dimension": self.expected_dimension,
             "registered_documents": self.registered_documents,
             "registered_chunks": self.registered_chunks,
+            "active_version": self.active_version,
             "actual_documents": self.actual_documents,
             "actual_chunks": self.actual_chunks,
             "dimension_errors": self.dimension_errors,
@@ -64,6 +66,7 @@ def verify_vector_index(ledger: StateLedger, profile_name: str) -> VectorIndexVe
     path = Path(index["path"])
     registered_documents = int(index["document_count"])
     registered_chunks = int(index["chunk_count"])
+    active_version = str(index.get("active_version") or "legacy")
     if not path.is_file():
         return VectorIndexVerification(
             profile_name=profile_name,
@@ -72,6 +75,7 @@ def verify_vector_index(ledger: StateLedger, profile_name: str) -> VectorIndexVe
             expected_dimension=expected_dimension,
             registered_documents=registered_documents,
             registered_chunks=registered_chunks,
+            active_version=active_version,
             errors=[f"missing_vector_store:{path}"],
         )
 
@@ -91,19 +95,22 @@ def verify_vector_index(ledger: StateLedger, profile_name: str) -> VectorIndexVe
         if table is None:
             errors.append("missing_vectors_table")
         else:
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(vectors)").fetchall()}
+            version_clause = "AND index_version = ?" if "index_version" in columns else ""
+            version_params = (active_version,) if "index_version" in columns else ()
             row = conn.execute(
-                """
+                f"""
                 SELECT count(DISTINCT document_id) AS documents, count(*) AS chunks
                 FROM vectors
-                WHERE profile_name = ?
+                WHERE profile_name = ? {version_clause}
                 """,
-                (profile_name,),
+                (profile_name, *version_params),
             ).fetchone()
             actual_documents = int(row["documents"])
             actual_chunks = int(row["chunks"])
             for vector_row in conn.execute(
-                "SELECT record_id, vector_json FROM vectors WHERE profile_name = ?",
-                (profile_name,),
+                f"SELECT record_id, vector_json FROM vectors WHERE profile_name = ? {version_clause}",
+                (profile_name, *version_params),
             ):
                 try:
                     vector = json.loads(vector_row["vector_json"])
@@ -129,6 +136,7 @@ def verify_vector_index(ledger: StateLedger, profile_name: str) -> VectorIndexVe
         expected_dimension=expected_dimension,
         registered_documents=registered_documents,
         registered_chunks=registered_chunks,
+        active_version=active_version,
         actual_documents=actual_documents,
         actual_chunks=actual_chunks,
         dimension_errors=dimension_errors,

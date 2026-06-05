@@ -61,17 +61,34 @@ class LocalVectorStore:
                     document_id TEXT NOT NULL,
                     chunk_id TEXT NOT NULL,
                     modality TEXT NOT NULL,
+                    index_version TEXT NOT NULL DEFAULT 'legacy',
                     vector_json TEXT NOT NULL,
                     text TEXT NOT NULL,
                     metadata_json TEXT NOT NULL DEFAULT '{}'
                 )
                 """
             )
+            if "index_version" not in {
+                row["name"] for row in self.conn.execute("PRAGMA table_info(vectors)").fetchall()
+            }:
+                self.conn.execute("ALTER TABLE vectors ADD COLUMN index_version TEXT NOT NULL DEFAULT 'legacy'")
             self.conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_vectors_profile ON vectors(profile_name, modality)"
+                """
+                CREATE TABLE IF NOT EXISTS vector_meta (
+                    profile_name TEXT PRIMARY KEY,
+                    active_version TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_vectors_profile
+                ON vectors(profile_name, modality, index_version)
+                """
             )
 
-    def upsert(self, records: Iterable[VectorRecord]) -> int:
+    def upsert(self, records: Iterable[VectorRecord], *, index_version: str = "legacy") -> int:
         count = 0
         with self.conn:
             for record in records:
@@ -79,28 +96,36 @@ class LocalVectorStore:
                     raise ValueError(
                         f"record {record.record_id} has dimension {len(record.vector)}, expected {self.dimension}"
                     )
+                # Older local stores use record_id as the primary key. Prefix
+                # non-legacy staged versions so rebuilding the same chunk cannot
+                # overwrite the currently published version before commit.
+                stored_record_id = (
+                    record.record_id if index_version == "legacy" else f"{index_version}:{record.record_id}"
+                )
                 self.conn.execute(
                     """
                     INSERT INTO vectors(
                         record_id, profile_name, document_id, chunk_id, modality,
-                        vector_json, text, metadata_json
+                        index_version, vector_json, text, metadata_json
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(record_id) DO UPDATE SET
                         profile_name = excluded.profile_name,
                         document_id = excluded.document_id,
                         chunk_id = excluded.chunk_id,
                         modality = excluded.modality,
+                        index_version = excluded.index_version,
                         vector_json = excluded.vector_json,
                         text = excluded.text,
                         metadata_json = excluded.metadata_json
                     """,
                     (
-                        record.record_id,
+                        stored_record_id,
                         self.profile_name,
                         record.document_id,
                         record.chunk_id,
                         record.modality,
+                        index_version,
                         json.dumps(record.vector),
                         record.text,
                         json.dumps(record.metadata or {}, ensure_ascii=False, sort_keys=True),
@@ -108,6 +133,32 @@ class LocalVectorStore:
                 )
                 count += 1
         return count
+
+    def publish_version(self, index_version: str) -> None:
+        """Atomically switch searches for this profile to a completed version.
+
+        Writers can stage a full rebuild under a fresh `index_version`; readers
+        keep using the previous version until this metadata row is committed.
+        """
+
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO vector_meta(profile_name, active_version, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(profile_name) DO UPDATE SET
+                    active_version = excluded.active_version,
+                    updated_at = excluded.updated_at
+                """,
+                (self.profile_name, index_version),
+            )
+
+    def active_version(self) -> str:
+        row = self.conn.execute(
+            "SELECT active_version FROM vector_meta WHERE profile_name = ?",
+            (self.profile_name,),
+        ).fetchone()
+        return str(row["active_version"]) if row is not None else "legacy"
 
     def search(
         self,
@@ -119,15 +170,16 @@ class LocalVectorStore:
             raise ValueError(
                 f"query vector has dimension {len(query_vector)}, expected {self.dimension}"
             )
+        active_version = self.active_version()
         if modality is None:
             rows = self.conn.execute(
-                "SELECT * FROM vectors WHERE profile_name = ?",
-                (self.profile_name,),
+                "SELECT * FROM vectors WHERE profile_name = ? AND index_version = ?",
+                (self.profile_name, active_version),
             ).fetchall()
         else:
             rows = self.conn.execute(
-                "SELECT * FROM vectors WHERE profile_name = ? AND modality = ?",
-                (self.profile_name, modality),
+                "SELECT * FROM vectors WHERE profile_name = ? AND modality = ? AND index_version = ?",
+                (self.profile_name, modality, active_version),
             ).fetchall()
 
         scored = []
@@ -148,14 +200,14 @@ class LocalVectorStore:
         scored.sort(key=lambda item: item["score"], reverse=True)
         return scored[:top_k]
 
-    def counts(self) -> dict[str, int]:
+    def counts(self, *, index_version: str | None = None) -> dict[str, int]:
+        version = index_version or self.active_version()
         row = self.conn.execute(
             """
             SELECT count(DISTINCT document_id) AS documents, count(*) AS chunks
             FROM vectors
-            WHERE profile_name = ?
+            WHERE profile_name = ? AND index_version = ?
             """,
-            (self.profile_name,),
+            (self.profile_name, version),
         ).fetchone()
         return {"documents": int(row["documents"]), "chunks": int(row["chunks"])}
-

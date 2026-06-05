@@ -108,8 +108,12 @@ def index_normalized_document(
     vector_path = vector_path_for_profile(vector_store_dir, profile_name)
     store = LocalVectorStore(vector_path, profile_name=profile_name, dimension=int(profile["dimension"]))
     try:
-        indexed = store.upsert(records)
-        counts = store.counts()
+        # Stage records under the deterministic batch hash first. Search only
+        # sees this rebuild after publish_version commits, so interrupted
+        # embedding/index runs cannot expose a half-written vector set.
+        indexed = store.upsert(records, index_version=batch_hash)
+        store.publish_version(batch_hash)
+        counts = store.counts(index_version=batch_hash)
     finally:
         store.close()
 
@@ -137,6 +141,7 @@ def index_normalized_document(
         document_count=counts["documents"],
         chunk_count=counts["chunks"],
         active=bool(profile["enabled"]),
+        active_version=batch_hash,
     )
     ledger.checkpoint(
         document_id,

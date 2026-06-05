@@ -149,9 +149,16 @@ class StateLedger:
                     document_count INTEGER NOT NULL DEFAULT 0,
                     chunk_count INTEGER NOT NULL DEFAULT 0,
                     active INTEGER NOT NULL DEFAULT 1,
+                    active_version TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL
                 )
                 """
+            )
+            self._ensure_columns(
+                "vector_indexes",
+                {
+                    "active_version": "TEXT NOT NULL DEFAULT ''",
+                },
             )
             self.conn.execute(
                 """
@@ -625,18 +632,23 @@ class StateLedger:
         document_count: int,
         chunk_count: int,
         active: bool = True,
+        active_version: str = "",
     ) -> None:
         with self.conn:
             self.conn.execute(
                 """
-                INSERT INTO vector_indexes(profile_name, backend, path, document_count, chunk_count, active, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO vector_indexes(
+                    profile_name, backend, path, document_count, chunk_count,
+                    active, active_version, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(profile_name) DO UPDATE SET
                     backend = excluded.backend,
                     path = excluded.path,
                     document_count = excluded.document_count,
                     chunk_count = excluded.chunk_count,
                     active = excluded.active,
+                    active_version = excluded.active_version,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -646,6 +658,7 @@ class StateLedger:
                     document_count,
                     chunk_count,
                     int(active),
+                    active_version,
                     utc_now(),
                 ),
             )
@@ -653,7 +666,7 @@ class StateLedger:
     def list_vector_indexes(self) -> list[dict[str, Any]]:
         rows = self.conn.execute(
             """
-            SELECT profile_name, backend, path, document_count, chunk_count, active, updated_at
+            SELECT profile_name, backend, path, document_count, chunk_count, active, active_version, updated_at
             FROM vector_indexes
             ORDER BY profile_name
             """

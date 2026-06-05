@@ -144,6 +144,8 @@ class EmbeddingIndexerTests(unittest.TestCase):
                 self.assertEqual(1, len(batches))
                 self.assertEqual("completed", batches[0]["status"])
                 self.assertEqual(text_result.embedding_batch_hash, batches[0]["batch_hash"])
+                text_index = next(index for index in ledger.list_vector_indexes() if index["profile_name"] == "stub_text")
+                self.assertEqual(text_result.embedding_batch_hash, text_index["active_version"])
                 self.assertEqual(
                     [chunk["chunk_id"] for chunk in ledger.list_chunks("DOC1", chunk_type="text")],
                     batches[0]["payload"]["input_ids"],

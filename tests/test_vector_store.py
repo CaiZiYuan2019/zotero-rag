@@ -127,3 +127,51 @@ class LocalVectorStoreTests(OptionalModuleTestCase):
             close_method = getattr(store, "close", None)
             if callable(close_method):
                 close_method()
+
+    def test_staged_version_is_invisible_until_published(self) -> None:
+        module, store_class = self._load_store_class()
+        vector_record_class = getattr(module, "VectorRecord", None)
+        if vector_record_class is None:
+            self.skipTest("VectorRecord is required for explicit staging test")
+        with workspace_tmpdir("vector-store-stage-") as tmpdir:
+            store = self._build_store(store_class, module, tmpdir)
+            try:
+                record = vector_record_class(
+                    record_id="record-staged",
+                    chunk_id="chunk-staged",
+                    document_id="doc-staged",
+                    text="staged topic",
+                    vector=[1.0, 0.0, 0.0],
+                    modality="text",
+                    metadata={},
+                )
+                store.upsert([record], index_version="batch-1")
+
+                self.assertEqual([], store.search([1.0, 0.0, 0.0], top_k=1, modality="text"))
+
+                store.publish_version("batch-1")
+                results = store.search([1.0, 0.0, 0.0], top_k=1, modality="text")
+                self.assertEqual("chunk-staged", results[0]["chunk_id"])
+                self.assertEqual("staged topic", results[0]["text"])
+                self.assertEqual({"documents": 1, "chunks": 1}, store.counts())
+
+                replacement = vector_record_class(
+                    record_id="record-staged",
+                    chunk_id="chunk-staged",
+                    document_id="doc-staged",
+                    text="replacement topic",
+                    vector=[0.0, 1.0, 0.0],
+                    modality="text",
+                    metadata={},
+                )
+                store.upsert([replacement], index_version="batch-2")
+                still_active = store.search([1.0, 0.0, 0.0], top_k=1, modality="text")
+                self.assertEqual("staged topic", still_active[0]["text"])
+
+                store.publish_version("batch-2")
+                published = store.search([0.0, 1.0, 0.0], top_k=1, modality="text")
+                self.assertEqual("replacement topic", published[0]["text"])
+            finally:
+                close_method = getattr(store, "close", None)
+                if callable(close_method):
+                    close_method()
