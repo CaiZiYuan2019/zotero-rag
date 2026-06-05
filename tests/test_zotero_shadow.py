@@ -3,8 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 import sqlite3
 import unittest
+from unittest.mock import patch
 
 from tests._support import workspace_tmpdir
+import zoterorag.zotero.shadow as shadow_module
 from zoterorag.zotero.shadow import ZoteroShadow, create_shadow_copy
 
 
@@ -120,3 +122,30 @@ class ZoteroShadowTests(unittest.TestCase):
             build_minimal_zotero_db(source)
             with self.assertRaises(ValueError):
                 create_shadow_copy(source, source)
+
+    def test_create_shadow_copy_retries_readonly_after_immutable_failure(self) -> None:
+        with workspace_tmpdir("zotero-shadow-fallback-") as root:
+            source = root / "zotero.sqlite"
+            shadow = root / "shadow" / "zotero.sqlite"
+            build_minimal_zotero_db(source)
+            calls = []
+
+            def fake_backup(source_path, target_path, *, immutable, timeout_seconds):
+                calls.append((Path(source_path), Path(target_path), immutable, timeout_seconds))
+                if immutable:
+                    raise sqlite3.OperationalError("simulated immutable backup failure")
+                Path(target_path).write_bytes(Path(source_path).read_bytes())
+
+            with patch.object(shadow_module, "_backup_readonly_source", side_effect=fake_backup):
+                target = create_shadow_copy(source, shadow, timeout_seconds=1.5)
+
+            self.assertEqual(shadow.resolve(), target.resolve())
+            self.assertEqual([True, False], [call[2] for call in calls])
+            self.assertEqual([1.5, 1.5], [call[3] for call in calls])
+            self.assertNotEqual(calls[0][1], calls[1][1])
+
+            reader = ZoteroShadow(target)
+            try:
+                self.assertEqual(1, reader.pdf_count())
+            finally:
+                reader.close()

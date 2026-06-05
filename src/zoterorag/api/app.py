@@ -104,6 +104,7 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
             ledger,
             refresh_shadow=bool(payload.get("refresh_shadow", True)),
             limit=payload.get("limit"),
+            shadow_timeout_seconds=float(payload.get("shadow_timeout_seconds", 30.0)),
         )
 
     @app.post("/ingest/start", dependencies=[Depends(require_access)])

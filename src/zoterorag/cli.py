@@ -42,10 +42,12 @@ def build_parser() -> argparse.ArgumentParser:
     progress = sub.add_parser("progress", help="Show detailed local build progress without executing workers.")
     progress.add_argument("--no-ingest-plan", action="store_true")
     progress.add_argument("--recent-limit", type=int, default=10)
-    sub.add_parser("shadow-copy", help="Create a read-only Zotero shadow copy.")
+    shadow_copy = sub.add_parser("shadow-copy", help="Create a read-only Zotero shadow copy.")
+    shadow_copy.add_argument("--timeout-seconds", type=float, default=30.0)
     scan = sub.add_parser("scan", help="Copy Zotero shadow and classify attachments into state.")
     scan.add_argument("--no-refresh-shadow", action="store_true", help="Scan the existing shadow DB without recopying Zotero.")
     scan.add_argument("--limit", type=int, default=None)
+    scan.add_argument("--shadow-timeout-seconds", type=float, default=30.0)
 
     models = sub.add_parser("models", help="List configured embedding profiles.")
     models_sub = models.add_subparsers(dest="models_command", required=True)
@@ -254,7 +256,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "shadow-copy":
-            emit(copy_zotero_shadow(config, ledger))
+            emit(copy_zotero_shadow(config, ledger, timeout_seconds=args.timeout_seconds))
             return 0
 
         if args.command == "scan":
@@ -264,6 +266,7 @@ def main(argv: list[str] | None = None) -> int:
                     ledger,
                     refresh_shadow=not args.no_refresh_shadow,
                     limit=args.limit,
+                    shadow_timeout_seconds=args.shadow_timeout_seconds,
                 )
             )
             return 0

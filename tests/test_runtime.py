@@ -40,6 +40,7 @@ default_for_multimodal = false
                     document_count=3,
                     chunk_count=9,
                     active=True,
+                    active_version="batch-live",
                 )
             finally:
                 ledger.close()
@@ -49,6 +50,7 @@ default_for_multimodal = false
                 after = reopened.list_vector_indexes()[0]
                 self.assertEqual(3, after["document_count"])
                 self.assertEqual(9, after["chunk_count"])
+                self.assertEqual("batch-live", after["active_version"])
             finally:
                 reopened.close()
 

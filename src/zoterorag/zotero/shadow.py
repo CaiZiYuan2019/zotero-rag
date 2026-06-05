@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 import shutil
 import sqlite3
+import time
+import uuid
 
 
 @dataclass(frozen=True)
@@ -18,6 +20,10 @@ class ZoteroAttachment:
     url: str | None
 
 
+class ShadowCopyTimeout(TimeoutError):
+    """Raised when Zotero is too busy to produce a shadow copy promptly."""
+
+
 def _readonly_sqlite_uri(path: Path, *, immutable: bool = False) -> str:
     uri = f"file:{path.as_posix()}?mode=ro"
     if immutable:
@@ -25,7 +31,12 @@ def _readonly_sqlite_uri(path: Path, *, immutable: bool = False) -> str:
     return uri
 
 
-def create_shadow_copy(source_db: str | Path, shadow_db: str | Path) -> Path:
+def create_shadow_copy(
+    source_db: str | Path,
+    shadow_db: str | Path,
+    *,
+    timeout_seconds: float = 30.0,
+) -> Path:
     """Copy a Zotero database to a shadow database using a read-only source.
 
     This function never opens the source database in writable mode. It also
@@ -40,27 +51,74 @@ def create_shadow_copy(source_db: str | Path, shadow_db: str | Path) -> Path:
         raise FileNotFoundError(f"Zotero database not found: {source}")
 
     target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_suffix(target.suffix + ".tmp")
-    if tmp.exists():
-        tmp.unlink()
+    tmp = target.with_name(f"{target.name}.{uuid.uuid4().hex}.tmp")
 
-    # Zotero often leaves rollback-journal sidecars around. Opening the source
-    # as immutable prevents SQLite from attempting lock or journal recovery
-    # operations on the primary Zotero database. This is acceptable for a
-    # point-in-time shadow scanner because the source is treated as immutable
-    # during this copy operation and never written by this process.
-    src_conn = sqlite3.connect(_readonly_sqlite_uri(source, immutable=True), uri=True, timeout=1)
     try:
-        dst_conn = sqlite3.connect(tmp)
+        _backup_readonly_source(source, tmp, immutable=True, timeout_seconds=timeout_seconds)
+    except (sqlite3.OperationalError, ShadowCopyTimeout):
+        _cleanup_shadow_temp(tmp)
+        # Some live Zotero databases keep rollback-journal state that cannot be
+        # copied through an immutable connection. Retry with SQLite's read-only
+        # mode so the source is still never opened for writes, but SQLite can
+        # consult its journal sidecar while creating a consistent shadow.
+        tmp = target.with_name(f"{target.name}.{uuid.uuid4().hex}.tmp")
         try:
-            src_conn.backup(dst_conn)
+            _backup_readonly_source(source, tmp, immutable=False, timeout_seconds=timeout_seconds)
+        except Exception:
+            _cleanup_shadow_temp(tmp)
+            raise
+
+    shutil.move(str(tmp), str(target))
+    return target
+
+
+def _cleanup_shadow_temp(path: Path) -> None:
+    for candidate in (path, Path(str(path) + "-journal"), Path(str(path) + "-wal"), Path(str(path) + "-shm")):
+        try:
+            if candidate.exists():
+                candidate.unlink()
+        except OSError:
+            pass
+
+
+def _backup_readonly_source(
+    source: Path,
+    target: Path,
+    *,
+    immutable: bool,
+    timeout_seconds: float,
+) -> None:
+    src_conn = sqlite3.connect(_readonly_sqlite_uri(source, immutable=immutable), uri=True, timeout=1)
+    started_at = time.monotonic()
+
+    def check_timeout(status: int, remaining: int, total: int) -> None:
+        if timeout_seconds > 0 and time.monotonic() - started_at > timeout_seconds:
+            mode = "immutable" if immutable else "readonly"
+            raise ShadowCopyTimeout(_timeout_message(timeout_seconds, mode))
+
+    try:
+        dst_conn = sqlite3.connect(target)
+        try:
+            # Copy in bounded chunks so active Zotero databases cannot leave the
+            # CLI/API hanging indefinitely while SQLite waits on journal state.
+            try:
+                src_conn.backup(dst_conn, pages=256, progress=check_timeout, sleep=0.05)
+            except sqlite3.OperationalError as exc:
+                if timeout_seconds > 0 and time.monotonic() - started_at > timeout_seconds:
+                    mode = "immutable" if immutable else "readonly"
+                    raise ShadowCopyTimeout(_timeout_message(timeout_seconds, mode)) from exc
+                raise
         finally:
             dst_conn.close()
     finally:
         src_conn.close()
 
-    shutil.move(str(tmp), str(target))
-    return target
+
+def _timeout_message(timeout_seconds: float, mode: str) -> str:
+    return (
+        f"Zotero source stayed busy for more than {timeout_seconds:.1f}s during {mode} backup; "
+        "close Zotero or retry with a larger shadow-copy timeout"
+    )
 
 
 class ZoteroShadow:

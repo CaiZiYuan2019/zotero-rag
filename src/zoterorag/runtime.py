@@ -25,13 +25,27 @@ def initialize_runtime(config_path: str | Path = "config/config.example.toml") -
             document_count=int(existing["document_count"]) if existing else 0,
             chunk_count=int(existing["chunk_count"]) if existing else 0,
             active=profile.enabled,
+            active_version=str(existing.get("active_version") or "") if existing else "",
         )
     return config, ledger
 
 
-def copy_zotero_shadow(config: AppConfig, ledger: StateLedger | None = None) -> dict[str, Any]:
-    shadow_path = create_shadow_copy(config.paths.zotero_db, config.paths.shadow_db)
-    result = {"shadow_db": str(shadow_path), "source_db": str(config.paths.zotero_db)}
+def copy_zotero_shadow(
+    config: AppConfig,
+    ledger: StateLedger | None = None,
+    *,
+    timeout_seconds: float = 30.0,
+) -> dict[str, Any]:
+    shadow_path = create_shadow_copy(
+        config.paths.zotero_db,
+        config.paths.shadow_db,
+        timeout_seconds=timeout_seconds,
+    )
+    result = {
+        "shadow_db": str(shadow_path),
+        "source_db": str(config.paths.zotero_db),
+        "timeout_seconds": timeout_seconds,
+    }
     if ledger is not None:
         job_id = ledger.create_job("shadow_copy", result)
         ledger.checkpoint("zotero_shadow", "shadow_copy", "completed", result)
@@ -45,9 +59,10 @@ def scan_zotero_shadow(
     *,
     refresh_shadow: bool = True,
     limit: int | None = None,
+    shadow_timeout_seconds: float = 30.0,
 ) -> dict[str, Any]:
     if refresh_shadow:
-        copy_zotero_shadow(config, ledger)
+        copy_zotero_shadow(config, ledger, timeout_seconds=shadow_timeout_seconds)
     report = scan_shadow_to_ledger(
         shadow_db=config.paths.shadow_db,
         storage_dir=config.paths.zotero_storage,
