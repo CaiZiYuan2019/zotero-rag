@@ -196,7 +196,17 @@ def search_vector_index(
     ensure_rerank_disabled(rerank)
     if mode == "text" and (query_image_path or query_image_base64):
         raise ValueError("text search does not accept query images")
+    if provider is None and profile["provider"] != "stub":
+        raise NotImplementedError(
+            f"embedding provider {profile['provider']} is not implemented for direct local search; "
+            "pass a real provider implementation for query embedding"
+        )
     embedding_provider = provider or StubEmbeddingProvider(dimension=int(profile["dimension"]))
+    if embedding_provider.dimension != int(profile["dimension"]):
+        raise ValueError(
+            f"provider dimension {embedding_provider.dimension} does not match profile {profile_name} "
+            f"dimension {profile['dimension']}"
+        )
     query_vector = embedding_provider.embed(
         [
             EmbeddingInput(

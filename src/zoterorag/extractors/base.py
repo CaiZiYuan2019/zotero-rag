@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 
 @dataclass(frozen=True)
@@ -27,13 +27,20 @@ class ExtractorProvider(Protocol):
     def fingerprint(self, input_file: Path, options_hash: str) -> str:
         ...
 
-    def submit(self, input_file: Path, options_hash: str) -> ExtractJobState:
+    def submit(
+        self,
+        input_file: Path,
+        options_hash: str,
+        *,
+        options: dict[str, Any] | None = None,
+        api_key: str | None = None,
+    ) -> ExtractJobState:
         ...
 
-    def poll(self, external_job_id: str) -> ExtractJobState:
+    def poll(self, external_job_id: str, *, api_key: str | None = None) -> ExtractJobState:
         ...
 
-    def download(self, external_job_id: str, output_dir: Path) -> ExtractArtifact:
+    def download(self, external_job_id: str, output_dir: Path, *, api_key: str | None = None) -> ExtractArtifact:
         ...
 
 
@@ -46,13 +53,20 @@ class StubExtractorProvider:
     def fingerprint(self, input_file: Path, options_hash: str) -> str:
         return f"stub:{input_file.name}:{options_hash}"
 
-    def submit(self, input_file: Path, options_hash: str) -> ExtractJobState:
+    def submit(
+        self,
+        input_file: Path,
+        options_hash: str,
+        *,
+        options: dict[str, Any] | None = None,
+        api_key: str | None = None,
+    ) -> ExtractJobState:
         return ExtractJobState(external_job_id=self.fingerprint(input_file, options_hash), state="completed")
 
-    def poll(self, external_job_id: str) -> ExtractJobState:
+    def poll(self, external_job_id: str, *, api_key: str | None = None) -> ExtractJobState:
         return ExtractJobState(external_job_id=external_job_id, state="completed")
 
-    def download(self, external_job_id: str, output_dir: Path) -> ExtractArtifact:
+    def download(self, external_job_id: str, output_dir: Path, *, api_key: str | None = None) -> ExtractArtifact:
         output_dir.mkdir(parents=True, exist_ok=True)
         manifest = output_dir / "manifest.json"
         manifest.write_text(

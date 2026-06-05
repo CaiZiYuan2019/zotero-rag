@@ -199,13 +199,13 @@ class FailingSubmitProvider:
     def fingerprint(self, input_file, options_hash: str) -> str:
         return "failing"
 
-    def submit(self, input_file, options_hash: str) -> ExtractJobState:
+    def submit(self, input_file, options_hash: str, *, options=None, api_key=None) -> ExtractJobState:
         raise RuntimeError("submit failed")
 
-    def poll(self, external_job_id: str) -> ExtractJobState:
+    def poll(self, external_job_id: str, *, api_key=None) -> ExtractJobState:
         raise AssertionError("poll should not be called")
 
-    def download(self, external_job_id: str, output_dir) -> ExtractArtifact:
+    def download(self, external_job_id: str, output_dir, *, api_key=None) -> ExtractArtifact:
         raise AssertionError("download should not be called")
 
 

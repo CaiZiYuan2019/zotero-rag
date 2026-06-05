@@ -67,6 +67,8 @@ class ExtractionManager:
         options = dict(request.options or {})
         if "timeout_seconds" not in options:
             options["timeout_seconds"] = recommended_mineru_timeout_seconds(request.selected_page_count)
+        provider_options = dict(options)
+        provider_options.setdefault("page_ranges", selected_pages)
         options_hash = stable_options_hash(options)
         cache_key = extractor_cache_key(
             pdf_sha256=pdf_sha256,
@@ -109,7 +111,12 @@ class ExtractionManager:
         )
 
         try:
-            submitted = self.provider.submit(input_file, options_hash)
+            submitted = self.provider.submit(
+                input_file,
+                options_hash,
+                options=provider_options,
+                api_key=api_key.secret if api_key is not None else None,
+            )
             self.ledger.set_extract_job_state(
                 job["job_id"],
                 state="running" if submitted.state == "running" else submitted.state,
@@ -118,7 +125,10 @@ class ExtractionManager:
                 last_poll_at=utc_now(),
             )
 
-            polled = self.provider.poll(submitted.external_job_id)
+            polled = self.provider.poll(
+                submitted.external_job_id,
+                api_key=api_key.secret if api_key is not None else None,
+            )
             self.ledger.set_extract_job_state(
                 job["job_id"],
                 state=polled.state,
@@ -131,7 +141,11 @@ class ExtractionManager:
                 return ExtractionResult(job=self.ledger.get_extract_job(job_id=job["job_id"]) or job, cache_hit=False)
 
             artifact_dir = self.cache_dir / cache_key
-            artifact = self.provider.download(polled.external_job_id, artifact_dir)
+            artifact = self.provider.download(
+                polled.external_job_id,
+                artifact_dir,
+                api_key=api_key.secret if api_key is not None else None,
+            )
             self.ledger.set_extract_job_state(
                 job["job_id"],
                 state="downloaded",

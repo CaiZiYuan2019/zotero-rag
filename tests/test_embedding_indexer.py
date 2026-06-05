@@ -6,7 +6,7 @@ import unittest
 from tests._support import workspace_tmpdir
 from zoterorag.config import EmbeddingProfile
 from zoterorag.db import StateLedger
-from zoterorag.embeddings import index_normalized_document, search_vector_index
+from zoterorag.embeddings import StubEmbeddingProvider, index_normalized_document, search_vector_index
 from zoterorag.embeddings.profile import embedding_profile_hash
 from zoterorag.normalize import normalize_markdown_document
 
@@ -235,6 +235,25 @@ class EmbeddingIndexerTests(unittest.TestCase):
                 self.assertEqual(1, result.indexed_chunks)
                 batch = ledger.list_embedding_batches(profile_name="qwen_text", document_id="DOC1")[0]
                 self.assertEqual("stub", batch["provider"])
+
+                with self.assertRaises(NotImplementedError):
+                    search_vector_index(
+                        ledger=ledger,
+                        vector_store_dir=tmpdir / "vectors",
+                        profile_name="qwen_text",
+                        query="alpha beta",
+                        mode="text",
+                    )
+
+                hits = search_vector_index(
+                    ledger=ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="qwen_text",
+                    query="alpha beta",
+                    mode="text",
+                    provider=StubEmbeddingProvider(dimension=8),
+                )
+                self.assertTrue(hits)
             finally:
                 ledger.close()
 
