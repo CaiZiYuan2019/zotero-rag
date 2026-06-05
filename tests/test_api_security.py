@@ -4,7 +4,7 @@ import os
 import unittest
 
 from tests._support import OptionalModuleTestCase, workspace_tmpdir
-from zoterorag.api.security import AccessDenied, verify_api_access
+from zoterorag.api.security import AccessDenied, is_loopback_host, verify_api_access
 
 
 class ApiSecurityTests(OptionalModuleTestCase):
@@ -20,6 +20,15 @@ class ApiSecurityTests(OptionalModuleTestCase):
     def test_loopback_allowed_without_token_for_local_bootstrap(self) -> None:
         verify_api_access(supplied_token=None, client_host="127.0.0.1", require_api_token=True)
         verify_api_access(supplied_token=None, client_host="::1", require_api_token=True)
+        verify_api_access(supplied_token=None, client_host="::ffff:127.0.0.1", require_api_token=True)
+
+    def test_loopback_detection_handles_local_and_unknown_hosts(self) -> None:
+        self.assertTrue(is_loopback_host("localhost"))
+        self.assertTrue(is_loopback_host("[::1]"))
+        self.assertTrue(is_loopback_host("::ffff:127.0.0.1"))
+        self.assertFalse(is_loopback_host(None))
+        self.assertFalse(is_loopback_host("192.168.1.50"))
+        self.assertFalse(is_loopback_host("example.invalid"))
 
     def test_non_loopback_rejected_without_configured_token(self) -> None:
         with self.assertRaises(AccessDenied):
@@ -40,6 +49,13 @@ class ApiSecurityTests(OptionalModuleTestCase):
         with self.assertRaises(AccessDenied):
             verify_api_access(supplied_token=None, client_host="10.0.0.5", require_api_token=False)
         verify_api_access(supplied_token="expected-token", client_host="10.0.0.5", require_api_token=False)
+
+    def test_non_loopback_rejected_when_auth_optional_and_no_token_configured(self) -> None:
+        verify_api_access(supplied_token=None, client_host="127.0.0.1", require_api_token=False)
+        with self.assertRaises(AccessDenied):
+            verify_api_access(supplied_token=None, client_host="10.0.0.5", require_api_token=False)
+        with self.assertRaises(AccessDenied):
+            verify_api_access(supplied_token=None, client_host=None, require_api_token=False)
 
     def test_documents_route_uses_api_access_control(self) -> None:
         fastapi_testclient = self.import_first_available(["fastapi.testclient"])
