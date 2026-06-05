@@ -175,6 +175,11 @@ def build_parser() -> argparse.ArgumentParser:
     embed_index = embed_sub.add_parser("index-normalized", help="Index normalized chunks into a local vector store.")
     embed_index.add_argument("--document-id", required=True)
     embed_index.add_argument("--profile", required=True)
+    embed_batches = embed_sub.add_parser("batches", help="List persisted embedding batch progress.")
+    embed_batches.add_argument("--profile", default=None)
+    embed_batches.add_argument("--document-id", default=None)
+    embed_batches.add_argument("--status", default=None)
+    embed_batches.add_argument("--limit", type=int, default=50)
 
     reembed = sub.add_parser("reembed", help="Plan or execute vector-only rebuilds from normalized artifacts.")
     reembed.add_argument("--profile", required=True)
@@ -497,6 +502,18 @@ def main(argv: list[str] | None = None) -> int:
                     document_id=args.document_id,
                 )
                 emit(result.to_dict())
+                return 0
+            if args.embed_command == "batches":
+                emit(
+                    {
+                        "batches": ledger.list_embedding_batches(
+                            profile_name=args.profile,
+                            document_id=args.document_id,
+                            status=args.status,
+                            limit=args.limit,
+                        )
+                    }
+                )
                 return 0
 
         if args.command == "reembed":

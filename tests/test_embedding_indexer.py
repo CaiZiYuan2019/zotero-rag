@@ -110,6 +110,7 @@ class EmbeddingIndexerTests(unittest.TestCase):
 
                 self.assertEqual(1, text_result.indexed_chunks)
                 self.assertEqual(1, mm_result.indexed_chunks)
+                self.assertEqual(64, len(text_result.embedding_batch_hash))
                 self.assertEqual(
                     embedding_profile_hash(
                         next(profile for profile in ledger.list_embedding_profiles() if profile["name"] == "stub_text")
@@ -118,6 +119,16 @@ class EmbeddingIndexerTests(unittest.TestCase):
                 )
                 checkpoint = ledger.get_checkpoint("DOC1", "embed:stub_text")
                 self.assertEqual(text_result.profile_hash, checkpoint["payload"]["profile_hash"])
+                self.assertEqual(text_result.embedding_batch_hash, checkpoint["payload"]["embedding_batch_hash"])
+                batches = ledger.list_embedding_batches(profile_name="stub_text", document_id="DOC1")
+                self.assertEqual(1, len(batches))
+                self.assertEqual("completed", batches[0]["status"])
+                self.assertEqual(text_result.embedding_batch_hash, batches[0]["batch_hash"])
+                self.assertEqual(
+                    [chunk["chunk_id"] for chunk in ledger.list_chunks("DOC1", chunk_type="text")],
+                    batches[0]["payload"]["input_ids"],
+                )
+                self.assertNotIn("alpha beta gamma", repr(batches[0]))
                 self.assertEqual("stub_text", text_hits[0]["metadata"]["profile_name"])
                 self.assertEqual(text_result.profile_hash, text_hits[0]["metadata"]["profile_hash"])
                 self.assertNotIn("images", mm_text_only_hits[0])

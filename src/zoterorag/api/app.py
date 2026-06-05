@@ -306,6 +306,22 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
     ) -> dict[str, Any]:
         return {"chunks": ledger.list_chunks(document_id, chunk_type=chunk_type, limit=limit)}
 
+    @app.get("/embed/batches", dependencies=[Depends(require_access)])
+    def embed_batches(
+        profile_name: str | None = None,
+        document_id: str | None = None,
+        status: str | None = None,
+        limit: int | None = 50,
+    ) -> dict[str, Any]:
+        return {
+            "batches": ledger.list_embedding_batches(
+                profile_name=profile_name,
+                document_id=document_id,
+                status=status,
+                limit=limit,
+            )
+        }
+
     @app.post("/embed/index-normalized", dependencies=[Depends(require_access)])
     def embed_index_normalized(payload: dict[str, Any]) -> dict[str, Any]:
         return index_normalized_document(

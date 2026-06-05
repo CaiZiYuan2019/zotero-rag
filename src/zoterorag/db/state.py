@@ -155,6 +155,32 @@ class StateLedger:
             )
             self.conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS embedding_batches (
+                    batch_hash TEXT PRIMARY KEY,
+                    profile_name TEXT NOT NULL,
+                    profile_hash TEXT NOT NULL,
+                    document_id TEXT NOT NULL,
+                    chunk_type TEXT NOT NULL,
+                    chunk_count INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}'
+                )
+                """
+            )
+            # Embedding workers can use this index to resume or audit a specific
+            # document/profile without scanning all historical batch records.
+            self.conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_embedding_batches_document_profile
+                ON embedding_batches(document_id, profile_name, status)
+                """
+            )
+            self.conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS attachments (
                     attachment_key TEXT PRIMARY KEY,
                     parent_key TEXT,
@@ -639,6 +665,126 @@ class StateLedger:
             }
             for row in rows
         ]
+
+    def upsert_embedding_batch(
+        self,
+        *,
+        batch_hash: str,
+        profile_name: str,
+        profile_hash: str,
+        document_id: str,
+        chunk_type: str,
+        chunk_count: int,
+        status: str,
+        provider: str,
+        model: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Persist resumable embedding batch progress.
+
+        Only stable identifiers, counts, hashes, and small metadata are stored.
+        Raw text, image bytes, and vectors stay out of SQLite so full backups and
+        progress JSON cannot leak expensive provider payloads.
+        """
+
+        now = utc_now()
+        payload_json = json.dumps(payload or {}, ensure_ascii=False, sort_keys=True, default=str)
+        existing = self.conn.execute(
+            """
+            SELECT created_at
+            FROM embedding_batches
+            WHERE batch_hash = ?
+            """,
+            (batch_hash,),
+        ).fetchone()
+        created_at = existing["created_at"] if existing is not None else now
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO embedding_batches(
+                    batch_hash, profile_name, profile_hash, document_id,
+                    chunk_type, chunk_count, status, provider, model,
+                    created_at, updated_at, payload_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(batch_hash) DO UPDATE SET
+                    profile_name = excluded.profile_name,
+                    profile_hash = excluded.profile_hash,
+                    document_id = excluded.document_id,
+                    chunk_type = excluded.chunk_type,
+                    chunk_count = excluded.chunk_count,
+                    status = excluded.status,
+                    provider = excluded.provider,
+                    model = excluded.model,
+                    updated_at = excluded.updated_at,
+                    payload_json = excluded.payload_json
+                """,
+                (
+                    batch_hash,
+                    profile_name,
+                    profile_hash,
+                    document_id,
+                    chunk_type,
+                    int(chunk_count),
+                    status,
+                    provider,
+                    model,
+                    created_at,
+                    now,
+                    payload_json,
+                ),
+            )
+        batch = self.get_embedding_batch(batch_hash)
+        if batch is None:
+            raise KeyError(f"embedding batch not found after upsert: {batch_hash}")
+        return batch
+
+    def get_embedding_batch(self, batch_hash: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT batch_hash, profile_name, profile_hash, document_id,
+                   chunk_type, chunk_count, status, provider, model,
+                   created_at, updated_at, payload_json
+            FROM embedding_batches
+            WHERE batch_hash = ?
+            """,
+            (batch_hash,),
+        ).fetchone()
+        return decode_embedding_batch_row(row)
+
+    def list_embedding_batches(
+        self,
+        *,
+        profile_name: str | None = None,
+        document_id: str | None = None,
+        status: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        query = """
+            SELECT batch_hash, profile_name, profile_hash, document_id,
+                   chunk_type, chunk_count, status, provider, model,
+                   created_at, updated_at, payload_json
+            FROM embedding_batches
+        """
+        where = []
+        params: list[Any] = []
+        if profile_name is not None:
+            where.append("profile_name = ?")
+            params.append(profile_name)
+        if document_id is not None:
+            where.append("document_id = ?")
+            params.append(document_id)
+        if status is not None:
+            where.append("status = ?")
+            params.append(status)
+        if where:
+            query += " WHERE " + " AND ".join(where)
+        query += " ORDER BY updated_at DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        rows = self.conn.execute(query, params).fetchall()
+        return [batch for row in rows if (batch := decode_embedding_batch_row(row)) is not None]
 
     def upsert_attachments(self, attachments: Iterable[dict[str, Any]]) -> int:
         count = 0
@@ -1281,6 +1427,7 @@ class StateLedger:
         scan_statuses = self.conn.execute("SELECT scan_status, count(*) AS n FROM attachments GROUP BY scan_status").fetchall()
         backups = self.conn.execute("SELECT count(*) AS n FROM backups").fetchone()
         extract_jobs = self.conn.execute("SELECT state, count(*) AS n FROM extract_jobs GROUP BY state").fetchall()
+        embedding_batches = self.conn.execute("SELECT status, count(*) AS n FROM embedding_batches GROUP BY status").fetchall()
         normalized = self.conn.execute("SELECT count(*) AS n FROM normalized_artifacts").fetchone()
         chunks = self.conn.execute("SELECT chunk_type, count(*) AS n FROM chunks GROUP BY chunk_type").fetchall()
         return {
@@ -1293,6 +1440,7 @@ class StateLedger:
             "scan_statuses": {row["scan_status"]: row["n"] for row in scan_statuses},
             "backups": backups["n"],
             "extract_jobs": {row["state"]: row["n"] for row in extract_jobs},
+            "embedding_batches": {row["status"]: row["n"] for row in embedding_batches},
             "normalized_artifacts": normalized["n"],
             "chunks": {row["chunk_type"]: row["n"] for row in chunks},
         }
@@ -1360,6 +1508,15 @@ def chunk_match_score(item: dict[str, Any], terms: list[str]) -> float:
 
 
 def decode_extract_job_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    item = dict(row)
+    payload_json = item.pop("payload_json")
+    item["payload"] = json.loads(payload_json)
+    return item
+
+
+def decode_embedding_batch_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
     item = dict(row)

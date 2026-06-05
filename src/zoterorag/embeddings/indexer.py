@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 from pathlib import Path
 from typing import Any, Literal
 
@@ -22,6 +24,7 @@ class IndexResult:
     vector_path: Path
     modality: str
     profile_hash: str
+    embedding_batch_hash: str
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -31,6 +34,7 @@ class IndexResult:
             "vector_path": str(self.vector_path),
             "modality": self.modality,
             "profile_hash": self.profile_hash,
+            "embedding_batch_hash": self.embedding_batch_hash,
         }
 
 
@@ -59,6 +63,27 @@ def index_normalized_document(
         )
 
     inputs = [embedding_input_for_chunk(chunk, artifact, role="document") for chunk in chunks]
+    batch_hash = embedding_batch_hash(
+        profile_hash=profile_hash,
+        document_id=document_id,
+        chunk_type=chunk_type,
+        inputs=inputs,
+    )
+    ledger.upsert_embedding_batch(
+        batch_hash=batch_hash,
+        profile_name=profile_name,
+        profile_hash=profile_hash,
+        document_id=document_id,
+        chunk_type=chunk_type,
+        chunk_count=len(inputs),
+        status="running",
+        provider=embedding_provider.name,
+        model=embedding_provider.model,
+        payload={
+            "input_ids": [item.input_id for item in inputs],
+            "dimension": embedding_provider.dimension,
+        },
+    )
     vectors = {item.input_id: item.vector for item in embedding_provider.embed(inputs)}
     records = [
         VectorRecord(
@@ -87,6 +112,23 @@ def index_normalized_document(
     finally:
         store.close()
 
+    ledger.upsert_embedding_batch(
+        batch_hash=batch_hash,
+        profile_name=profile_name,
+        profile_hash=profile_hash,
+        document_id=document_id,
+        chunk_type=chunk_type,
+        chunk_count=len(inputs),
+        status="completed",
+        provider=embedding_provider.name,
+        model=embedding_provider.model,
+        payload={
+            "input_ids": [item.input_id for item in inputs],
+            "dimension": embedding_provider.dimension,
+            "indexed_chunks": indexed,
+            "vector_path": str(vector_path),
+        },
+    )
     ledger.register_vector_index(
         profile_name=profile_name,
         backend="sqlite-local",
@@ -104,6 +146,7 @@ def index_normalized_document(
             "profile_modality": profile_modality,
             "chunk_type": chunk_type,
             "profile_hash": profile_hash,
+            "embedding_batch_hash": batch_hash,
         },
     )
     return IndexResult(
@@ -113,6 +156,7 @@ def index_normalized_document(
         vector_path=vector_path,
         modality=chunk_type,
         profile_hash=profile_hash,
+        embedding_batch_hash=batch_hash,
     )
 
 
@@ -177,6 +221,39 @@ def embedding_input_for_chunk(chunk: dict[str, Any], artifact: dict[str, Any], r
         image_path=image_path,
         role=role,
     )
+
+
+def embedding_batch_hash(
+    *,
+    profile_hash: str,
+    document_id: str,
+    chunk_type: str,
+    inputs: list[EmbeddingInput],
+) -> str:
+    """Hash a batch without storing raw text, image bytes, or vectors."""
+
+    payload = {
+        "profile_hash": profile_hash,
+        "document_id": document_id,
+        "chunk_type": chunk_type,
+        "inputs": [
+            {
+                "input_id": item.input_id,
+                "text_sha256": hashlib.sha256(item.text.encode("utf-8")).hexdigest(),
+                "image_path": item.image_path,
+                "image_base64_sha256": (
+                    hashlib.sha256(item.image_base64.encode("utf-8")).hexdigest()
+                    if item.image_base64
+                    else None
+                ),
+                "image_mime_type": item.image_mime_type,
+                "role": item.role,
+            }
+            for item in inputs
+        ],
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def search_result_from_vector_row(row: dict[str, Any]) -> SearchResult:

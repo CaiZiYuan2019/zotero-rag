@@ -121,6 +121,45 @@ class StateLedgerTests(unittest.TestCase):
             finally:
                 ledger.close()
 
+    def test_embedding_batch_records_are_upserted_and_filterable(self) -> None:
+        with workspace_tmpdir("state-ledger-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                first = ledger.upsert_embedding_batch(
+                    batch_hash="b" * 64,
+                    profile_name="profile-a",
+                    profile_hash="p" * 64,
+                    document_id="doc-1",
+                    chunk_type="text",
+                    chunk_count=2,
+                    status="running",
+                    provider="stub",
+                    model="stub",
+                    payload={"input_ids": ["c1", "c2"]},
+                )
+                second = ledger.upsert_embedding_batch(
+                    batch_hash="b" * 64,
+                    profile_name="profile-a",
+                    profile_hash="p" * 64,
+                    document_id="doc-1",
+                    chunk_type="text",
+                    chunk_count=2,
+                    status="completed",
+                    provider="stub",
+                    model="stub",
+                    payload={"input_ids": ["c1", "c2"], "indexed_chunks": 2},
+                )
+
+                self.assertEqual("running", first["status"])
+                self.assertEqual(first["created_at"], second["created_at"])
+                self.assertEqual("completed", second["status"])
+                self.assertEqual(2, second["payload"]["indexed_chunks"])
+                self.assertEqual(1, len(ledger.list_embedding_batches(profile_name="profile-a")))
+                self.assertEqual(1, len(ledger.list_embedding_batches(document_id="doc-1", status="completed")))
+                self.assertEqual({"completed": 1}, ledger.status_summary()["embedding_batches"])
+            finally:
+                ledger.close()
+
     def test_activate_embedding_profile_sets_one_default_and_survives_bootstrap(self) -> None:
         with workspace_tmpdir("state-ledger-") as tmpdir:
             ledger = StateLedger(tmpdir / "state.sqlite")
