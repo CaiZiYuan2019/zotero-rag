@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 
 from .backup import create_backup, plan_restore_backup, resolve_backup_manifest, restore_backup, verify_manifest_files
+from .api.server import serve_api, validate_serve_access
 from .diagnostics import run_runtime_diagnostics
 from .documents import get_document, list_documents
 from .embeddings import index_normalized_document, search_vector_index
@@ -40,6 +41,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("init-state", help="Create runtime directories and initialize state.sqlite.")
     sub.add_parser("status", help="Show runtime and state status.")
+    serve = sub.add_parser("serve", help="Start the FastAPI control server.")
+    serve.add_argument("--host", default=None)
+    serve.add_argument("--port", type=int, default=None)
+    serve.add_argument("--check", action="store_true", help="Only validate bind/auth settings without starting Uvicorn.")
     doctor = sub.add_parser("doctor", help="Run non-invasive local readiness diagnostics.")
     doctor.add_argument("--verify-vectors", action="store_true")
     progress = sub.add_parser("progress", help="Show detailed local build progress without executing workers.")
@@ -251,6 +256,22 @@ def main(argv: list[str] | None = None) -> int:
                     "runtime": config_as_public_dict(config),
                 }
             )
+            return 0
+
+        if args.command == "serve":
+            preflight = validate_serve_access(config, host=args.host)
+            if args.check:
+                emit({"serve": {**preflight, "port": args.port or preflight["port"]}})
+                return 0 if preflight["ok"] else 1
+            if not preflight["ok"]:
+                emit({"ok": False, "error": preflight["error"], "serve": preflight})
+                return 1
+            try:
+                ledger.close()
+                serve_api(args.config, host=args.host, port=args.port)
+            except RuntimeError as exc:
+                emit({"ok": False, "error": str(exc)})
+                return 1
             return 0
 
         if args.command == "doctor":
