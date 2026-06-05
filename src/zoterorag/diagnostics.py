@@ -7,6 +7,7 @@ from .api.security import AccessDenied, verify_api_access
 from .config import AppConfig
 from .db import StateLedger
 from .index import verify_vector_index
+from .providers import provider_readiness
 from .zotero import ZoteroShadow
 
 
@@ -29,6 +30,7 @@ def run_runtime_diagnostics(
         "shadow": check_existing_shadow(config),
         "vectors": check_vector_indexes(config, ledger, verify_vectors=verify_vectors),
         "api_access": check_api_access(config),
+        "providers": check_provider_configuration(),
         "external_execution": {
             "ok": True,
             "mineru_executed": False,
@@ -167,4 +169,13 @@ def check_api_access(config: AppConfig) -> dict[str, Any]:
         "ok": checks["external_without_token_denied"],
         "require_api_token": config.server.require_api_token,
         **checks,
+    }
+
+
+def check_provider_configuration() -> dict[str, Any]:
+    readiness = provider_readiness(".env")
+    return {
+        "ok": True,
+        **readiness,
+        "note": "provider diagnostics inspect configuration only and never call MinerU or qwen",
     }

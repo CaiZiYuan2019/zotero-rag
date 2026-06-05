@@ -18,6 +18,7 @@ from ..pipeline import (
     start_ingest_job,
     start_reembed_job,
 )
+from ..providers import build_qwen_embedding_provider, provider_readiness
 from ..review import explain_attachment_review
 from ..runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime, scan_zotero_shadow
 from ..search import fulltext_search, metadata_search, normalize_query_image
@@ -61,6 +62,10 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
     @app.get("/diagnostics", dependencies=[Depends(require_access)])
     def diagnostics(verify_vectors: bool = False) -> dict[str, Any]:
         return run_runtime_diagnostics(config, ledger, verify_vectors=verify_vectors)
+
+    @app.get("/providers/status", dependencies=[Depends(require_access)])
+    def providers_status() -> dict[str, Any]:
+        return provider_readiness(".env")
 
     @app.get("/progress", dependencies=[Depends(require_access)])
     def progress(include_ingest_plan: bool = True, recent_limit: int = 10) -> dict[str, Any]:
@@ -264,21 +269,26 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
         if payload.get("query_image") is not None:
             raise HTTPException(status_code=400, detail="text search does not accept query_image")
         try:
+            profile = selected_embedding_profile(ledger, payload.get("profile_name"), mode="text")
+            provider = explicit_embedding_provider(payload, profile)
             return {
                 "results": search_vector_index(
                     ledger=ledger,
                     vector_store_dir=config.paths.vector_store_dir,
-                    profile_name=payload.get("profile_name"),
+                    profile_name=profile["name"],
                     query=str(payload["query"]),
                     mode="text",
                     top_k=int(payload.get("top_k", 10)),
                     consumer=str(payload.get("consumer", "llm_text")),
                     image_return="none",
                     rerank=bool(payload.get("rerank", False)),
+                    provider=provider,
                 )
             }
         except NotImplementedError as exc:
             raise HTTPException(status_code=501, detail=str(exc)) from exc
+        except (KeyError, RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/search/multimodal", dependencies=[Depends(require_access)])
     def search_multimodal(payload: dict[str, Any]) -> dict[str, Any]:
@@ -290,11 +300,13 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
         except (FileNotFoundError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         try:
+            profile = selected_embedding_profile(ledger, payload.get("profile_name"), mode="multimodal")
+            provider = explicit_embedding_provider(payload, profile)
             return {
                 "results": search_vector_index(
                     ledger=ledger,
                     vector_store_dir=config.paths.vector_store_dir,
-                    profile_name=payload.get("profile_name"),
+                    profile_name=profile["name"],
                     query=str(payload.get("query_text", payload.get("query", ""))),
                     mode="multimodal",
                     top_k=int(payload.get("top_k", 10)),
@@ -306,10 +318,13 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
                     query_image_path=query_image.file_path if query_image else None,
                     query_image_base64=query_image.base64_data if query_image else None,
                     query_image_mime_type=query_image.mime_type if query_image else None,
+                    provider=provider,
                 )
             }
         except NotImplementedError as exc:
             raise HTTPException(status_code=501, detail=str(exc)) from exc
+        except (KeyError, RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/backup/create", dependencies=[Depends(require_access)])
     def backup_create(payload: dict[str, Any]) -> dict[str, Any]:
@@ -368,15 +383,20 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
     @app.post("/embed/index-normalized", dependencies=[Depends(require_access)])
     def embed_index_normalized(payload: dict[str, Any]) -> dict[str, Any]:
         try:
+            profile = selected_embedding_profile(ledger, str(payload["profile_name"]), mode=None)
+            provider = explicit_embedding_provider(payload, profile)
             return index_normalized_document(
                 ledger=ledger,
                 vector_store_dir=config.paths.vector_store_dir,
-                profile_name=str(payload["profile_name"]),
+                profile_name=profile["name"],
                 document_id=str(payload["document_id"]),
+                provider=provider,
                 allow_stub_provider=bool(payload.get("allow_stub_provider", False)),
             ).to_dict()
         except NotImplementedError as exc:
             raise HTTPException(status_code=501, detail=str(exc)) from exc
+        except (KeyError, RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/reembed/from-normalized", dependencies=[Depends(require_access)])
     def reembed_from_normalized(payload: dict[str, Any]) -> dict[str, Any]:
@@ -396,3 +416,29 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return app
+
+
+def explicit_embedding_provider(payload: dict[str, Any], profile: dict[str, Any]) -> Any:
+    provider_name = str(payload.get("embedding_provider", "stub"))
+    if provider_name == "stub":
+        return None
+    if provider_name == "qwen3vl":
+        return build_qwen_embedding_provider(profile, str(payload.get("env", ".env")))
+    raise ValueError(f"unsupported embedding_provider: {provider_name}")
+
+
+def selected_embedding_profile(ledger: Any, profile_name: str | None, *, mode: str | None) -> dict[str, Any]:
+    profiles = ledger.list_embedding_profiles()
+    if profile_name:
+        for profile in profiles:
+            if profile["name"] == profile_name:
+                return profile
+        raise KeyError(f"embedding profile not found: {profile_name}")
+    if mode is None:
+        raise ValueError("profile_name is required")
+    expected_modality = "text" if mode == "text" else "multimodal"
+    default_flag = "default_for_text" if mode == "text" else "default_for_multimodal"
+    for profile in profiles:
+        if profile["enabled"] and profile["modality"] == expected_modality and profile[default_flag]:
+            return profile
+    raise KeyError(f"no default {mode} embedding profile is configured")

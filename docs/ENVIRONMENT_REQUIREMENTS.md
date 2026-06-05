@@ -49,6 +49,12 @@ Install before running `zoterorag serve` or API route tests:
 python -m pip install fastapi>=0.115 uvicorn>=0.30 httpx>=0.27
 ```
 
+Equivalent project extra:
+
+```powershell
+python -m pip install -e .[api]
+```
+
 Notes:
 
 - `fastapi` is needed by `src/zoterorag/api/app.py`.
@@ -129,6 +135,12 @@ python -m pip install -e .
 python -m pip install requests>=2.32 fastapi>=0.115 uvicorn>=0.30 httpx>=0.27 PyMuPDF>=1.24 Pillow>=10.4
 ```
 
+Equivalent project-extra form:
+
+```powershell
+python -m pip install -e .[api,providers,pdf]
+```
+
 Keep `.env` local and untracked. It should contain only secrets and endpoint
 overrides such as:
 
@@ -138,4 +150,3 @@ MINERU_URL=...
 BAILIAN_KEY=...
 BAILIAN_URL=...
 ```
-

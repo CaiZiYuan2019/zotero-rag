@@ -55,6 +55,9 @@ default_for_multimodal = false
                 self.assertEqual("readable", report["checks"]["shadow"]["status"])
                 self.assertEqual(1, report["checks"]["shadow"]["pdf_count"])
                 self.assertTrue(report["checks"]["api_access"]["external_without_token_denied"])
+                self.assertTrue(report["checks"]["providers"]["ok"])
+                self.assertIn("mineru", report["checks"]["providers"])
+                self.assertIn("qwen3vl_embedding", report["checks"]["providers"])
                 self.assertFalse(report["checks"]["external_execution"]["mineru_executed"])
                 self.assertFalse(report["checks"]["external_execution"]["embedding_executed"])
             finally:

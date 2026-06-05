@@ -22,6 +22,7 @@ from .pipeline import (
     start_ingest_job,
     start_reembed_job,
 )
+from .providers import build_qwen_embedding_provider, provider_readiness
 from .review import explain_attachment_review
 from .runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime, scan_zotero_shadow
 from .search import fulltext_search, metadata_search, normalize_query_image
@@ -56,6 +57,11 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--no-refresh-shadow", action="store_true", help="Scan the existing shadow DB without recopying Zotero.")
     scan.add_argument("--limit", type=int, default=None)
     scan.add_argument("--shadow-timeout-seconds", type=float, default=30.0)
+
+    providers = sub.add_parser("providers", help="Inspect external provider configuration without executing it.")
+    providers_sub = providers.add_subparsers(dest="providers_command", required=True)
+    providers_status = providers_sub.add_parser("status")
+    providers_status.add_argument("--env", default=".env")
 
     models = sub.add_parser("models", help="List configured embedding profiles.")
     models_sub = models.add_subparsers(dest="models_command", required=True)
@@ -202,6 +208,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Allow local stub embeddings for non-stub profiles during control-plane tests.",
     )
+    embed_index.add_argument(
+        "--embedding-provider",
+        choices=("stub", "qwen3vl"),
+        default="stub",
+        help="Provider used for vector creation. qwen3vl makes real API calls and must be selected explicitly.",
+    )
+    embed_index.add_argument("--env", default=".env", help="Env file containing qwen credentials when using qwen3vl.")
     embed_batches = embed_sub.add_parser("batches", help="List persisted embedding batch progress.")
     embed_batches.add_argument("--profile", default=None)
     embed_batches.add_argument("--document-id", default=None)
@@ -220,7 +233,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow local stub embeddings for non-stub profiles during control-plane tests.",
     )
 
-    search_vector = sub.add_parser("search-vector", help="Search local vector indexes with the stub provider.")
+    search_vector = sub.add_parser("search-vector", help="Search local vector indexes.")
     search_vector.add_argument("query")
     search_vector.add_argument("--mode", choices=("text", "multimodal"), default="text")
     search_vector.add_argument("--profile", default=None)
@@ -233,6 +246,13 @@ def build_parser() -> argparse.ArgumentParser:
     search_vector.add_argument("--query-image-file", default=None)
     search_vector.add_argument("--query-image-base64", default=None)
     search_vector.add_argument("--query-image-mime-type", default=None)
+    search_vector.add_argument(
+        "--embedding-provider",
+        choices=("stub", "qwen3vl"),
+        default="stub",
+        help="Provider used for query embedding. qwen3vl makes real API calls and must be selected explicitly.",
+    )
+    search_vector.add_argument("--env", default=".env", help="Env file containing qwen credentials when using qwen3vl.")
 
     inspect = sub.add_parser("inspect-shadow", help="Read summary from an existing shadow DB.")
     inspect.add_argument("--limit", type=int, default=5)
@@ -303,6 +323,10 @@ def main(argv: list[str] | None = None) -> int:
                     shadow_timeout_seconds=args.shadow_timeout_seconds,
                 )
             )
+            return 0
+
+        if args.command == "providers" and args.providers_command == "status":
+            emit(provider_readiness(args.env))
             return 0
 
         if args.command == "models" and args.models_command == "list":
@@ -568,14 +592,19 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "embed":
             if args.embed_command == "index-normalized":
                 try:
+                    provider = None
+                    if args.embedding_provider == "qwen3vl":
+                        profile = selected_embedding_profile(ledger, args.profile, mode=None)
+                        provider = build_qwen_embedding_provider(profile, args.env)
                     result = index_normalized_document(
                         ledger=ledger,
                         vector_store_dir=config.paths.vector_store_dir,
                         profile_name=args.profile,
                         document_id=args.document_id,
+                        provider=provider,
                         allow_stub_provider=args.allow_stub_provider,
                     )
-                except (KeyError, NotImplementedError, ValueError) as exc:
+                except (KeyError, NotImplementedError, RuntimeError, ValueError) as exc:
                     emit({"ok": False, "error": str(exc)})
                     return 1
                 emit(result.to_dict())
@@ -632,6 +661,10 @@ def main(argv: list[str] | None = None) -> int:
                     emit({"ok": False, "error": str(exc)})
                     return 1
             try:
+                provider = None
+                if args.embedding_provider == "qwen3vl":
+                    profile = selected_embedding_profile(ledger, args.profile, mode=args.mode)
+                    provider = build_qwen_embedding_provider(profile, args.env)
                 results = search_vector_index(
                     ledger=ledger,
                     vector_store_dir=config.paths.vector_store_dir,
@@ -647,8 +680,9 @@ def main(argv: list[str] | None = None) -> int:
                     query_image_path=query_image.file_path if query_image else None,
                     query_image_base64=query_image.base64_data if query_image else None,
                     query_image_mime_type=query_image.mime_type if query_image else None,
+                    provider=provider,
                 )
-            except (FileNotFoundError, KeyError, ValueError) as exc:
+            except (FileNotFoundError, KeyError, NotImplementedError, RuntimeError, ValueError) as exc:
                 emit({"ok": False, "error": str(exc)})
                 return 1
             emit({"results": results})
@@ -673,6 +707,23 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"Unhandled command: {args.command}", file=sys.stderr)
     return 2
+
+
+def selected_embedding_profile(ledger, profile_name: str | None, *, mode: str | None) -> dict:
+    profiles = ledger.list_embedding_profiles()
+    if profile_name:
+        for profile in profiles:
+            if profile["name"] == profile_name:
+                return profile
+        raise KeyError(f"embedding profile not found: {profile_name}")
+    if mode is None:
+        raise ValueError("profile is required")
+    expected_modality = "text" if mode == "text" else "multimodal"
+    default_flag = "default_for_text" if mode == "text" else "default_for_multimodal"
+    for profile in profiles:
+        if profile["enabled"] and profile["modality"] == expected_modality and profile[default_flag]:
+            return profile
+    raise KeyError(f"no default {mode} embedding profile is configured")
 
 
 if __name__ == "__main__":
