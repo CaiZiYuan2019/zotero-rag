@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 
 from .backup import create_backup, plan_restore_backup, resolve_backup_manifest, restore_backup, verify_manifest_files
+from .diagnostics import run_runtime_diagnostics
 from .documents import get_document, list_documents
 from .embeddings import index_normalized_document, search_vector_index
 from .extractors import ExtractionManager, ExtractionRequest, ExtractorKeyPool, StubExtractorProvider
@@ -39,6 +40,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("init-state", help="Create runtime directories and initialize state.sqlite.")
     sub.add_parser("status", help="Show runtime and state status.")
+    doctor = sub.add_parser("doctor", help="Run non-invasive local readiness diagnostics.")
+    doctor.add_argument("--verify-vectors", action="store_true")
     progress = sub.add_parser("progress", help="Show detailed local build progress without executing workers.")
     progress.add_argument("--no-ingest-plan", action="store_true")
     progress.add_argument("--recent-limit", type=int, default=10)
@@ -249,6 +252,11 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
             return 0
+
+        if args.command == "doctor":
+            result = run_runtime_diagnostics(config, ledger, verify_vectors=args.verify_vectors)
+            emit(result)
+            return 0 if result["ok"] else 1
 
         if args.command == "progress":
             emit(

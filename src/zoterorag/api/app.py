@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from ..backup import create_backup, plan_restore_backup, resolve_backup_manifest
+from ..diagnostics import run_runtime_diagnostics
 from ..documents import get_document as get_document_record
 from ..documents import list_documents as list_document_records
 from ..embeddings import index_normalized_document, search_vector_index
@@ -56,6 +57,10 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
             "state": ledger.status_summary(),
             "progress": build_progress_report(ledger),
         }
+
+    @app.get("/diagnostics", dependencies=[Depends(require_access)])
+    def diagnostics(verify_vectors: bool = False) -> dict[str, Any]:
+        return run_runtime_diagnostics(config, ledger, verify_vectors=verify_vectors)
 
     @app.get("/progress", dependencies=[Depends(require_access)])
     def progress(include_ingest_plan: bool = True, recent_limit: int = 10) -> dict[str, Any]:
