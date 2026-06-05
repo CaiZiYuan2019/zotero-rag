@@ -9,7 +9,14 @@ from ..documents import list_documents as list_document_records
 from ..embeddings import index_normalized_document, search_vector_index
 from ..index import verify_vector_index
 from ..models import describe_embedding_profile, list_embedding_model_catalog
-from ..pipeline import cancel_ingest_job, pause_ingest_job, resume_ingest_job, start_ingest_job, start_reembed_job
+from ..pipeline import (
+    build_progress_report,
+    cancel_ingest_job,
+    pause_ingest_job,
+    resume_ingest_job,
+    start_ingest_job,
+    start_reembed_job,
+)
 from ..review import explain_attachment_review
 from ..runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime, scan_zotero_shadow
 from ..search import fulltext_search, metadata_search, normalize_query_image
@@ -44,7 +51,19 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
 
     @app.get("/status", dependencies=[Depends(require_access)])
     def status() -> dict[str, Any]:
-        return {"runtime": config_as_public_dict(config), "state": ledger.status_summary()}
+        return {
+            "runtime": config_as_public_dict(config),
+            "state": ledger.status_summary(),
+            "progress": build_progress_report(ledger),
+        }
+
+    @app.get("/progress", dependencies=[Depends(require_access)])
+    def progress(include_ingest_plan: bool = True, recent_limit: int = 10) -> dict[str, Any]:
+        return build_progress_report(
+            ledger,
+            include_ingest_plan=include_ingest_plan,
+            recent_limit=recent_limit,
+        )
 
     @app.get("/models/embedding", dependencies=[Depends(require_access)])
     def list_embedding_models() -> dict[str, Any]:

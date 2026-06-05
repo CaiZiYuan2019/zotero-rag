@@ -8,6 +8,7 @@ from ..db import StateLedger
 from ..documents import get_document
 from ..embeddings import search_vector_index
 from ..models import list_embedding_model_catalog
+from ..pipeline import build_progress_report
 from ..runtime import config_as_public_dict
 from ..search import fulltext_search, metadata_search, normalize_query_image
 from ..search.results import ensure_rerank_disabled
@@ -29,6 +30,7 @@ def zotero_rag_status(context: McpToolContext) -> dict[str, Any]:
     return {
         "runtime": config_as_public_dict(context.config),
         "state": context.ledger.status_summary(),
+        "progress": build_progress_report(context.ledger),
     }
 
 

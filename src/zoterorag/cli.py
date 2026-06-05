@@ -12,7 +12,14 @@ from .extractors import ExtractionManager, ExtractionRequest, ExtractorKeyPool, 
 from .index import verify_vector_index
 from .models import describe_embedding_profile, list_embedding_model_catalog
 from .normalize import normalize_markdown_document
-from .pipeline import cancel_ingest_job, pause_ingest_job, resume_ingest_job, start_ingest_job, start_reembed_job
+from .pipeline import (
+    build_progress_report,
+    cancel_ingest_job,
+    pause_ingest_job,
+    resume_ingest_job,
+    start_ingest_job,
+    start_reembed_job,
+)
 from .review import explain_attachment_review
 from .runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime, scan_zotero_shadow
 from .search import fulltext_search, metadata_search, normalize_query_image
@@ -32,6 +39,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("init-state", help="Create runtime directories and initialize state.sqlite.")
     sub.add_parser("status", help="Show runtime and state status.")
+    progress = sub.add_parser("progress", help="Show detailed local build progress without executing workers.")
+    progress.add_argument("--no-ingest-plan", action="store_true")
+    progress.add_argument("--recent-limit", type=int, default=10)
     sub.add_parser("shadow-copy", help="Create a read-only Zotero shadow copy.")
     scan = sub.add_parser("scan", help="Copy Zotero shadow and classify attachments into state.")
     scan.add_argument("--no-refresh-shadow", action="store_true", help="Scan the existing shadow DB without recopying Zotero.")
@@ -224,7 +234,23 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "status":
-            emit({"state": ledger.status_summary(), "runtime": config_as_public_dict(config)})
+            emit(
+                {
+                    "state": ledger.status_summary(),
+                    "progress": build_progress_report(ledger),
+                    "runtime": config_as_public_dict(config),
+                }
+            )
+            return 0
+
+        if args.command == "progress":
+            emit(
+                build_progress_report(
+                    ledger,
+                    include_ingest_plan=not args.no_ingest_plan,
+                    recent_limit=args.recent_limit,
+                )
+            )
             return 0
 
         if args.command == "shadow-copy":
