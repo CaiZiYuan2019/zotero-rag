@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import unittest
 
@@ -56,6 +57,13 @@ class McpToolsTests(unittest.TestCase):
                     consumer="llm_multimodal",
                     image_return="file_ref",
                 )
+                multimodal_base64 = zotero_rag_search_multimodal(
+                    context,
+                    query_text="important figure",
+                    consumer="llm_multimodal",
+                    image_return="base64",
+                    max_image_bytes=1024,
+                )
 
                 self.assertEqual("llm_text", text_default["consumer"])
                 self.assertEqual("none", text_default["image_return"])
@@ -67,6 +75,7 @@ class McpToolsTests(unittest.TestCase):
                 self.assertEqual("file_ref", multimodal["image_return"])
                 self.assertIn("images", multimodal["results"][0])
                 self.assertEqual("images/img001.png", multimodal["results"][0]["images"][0]["file_ref"])
+                self.assertEqual(base64.b64encode(b"fake-image").decode("ascii"), multimodal_base64["results"][0]["images"][0]["base64"])
             finally:
                 context.ledger.close()
 

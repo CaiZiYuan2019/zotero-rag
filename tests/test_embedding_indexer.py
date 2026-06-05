@@ -96,6 +96,26 @@ class EmbeddingIndexerTests(unittest.TestCase):
                     consumer="manual",
                     image_return="file_ref",
                 )
+                mm_base64_hits = search_vector_index(
+                    ledger=ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="stub_mm",
+                    query="important figure",
+                    mode="multimodal",
+                    consumer="llm_multimodal",
+                    image_return="base64",
+                    max_image_bytes=1024,
+                )
+                mm_base64_omitted_hits = search_vector_index(
+                    ledger=ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="stub_mm",
+                    query="important figure",
+                    mode="multimodal",
+                    consumer="llm_multimodal",
+                    image_return="base64",
+                    max_image_bytes=1,
+                )
                 mm_image_query_hits = search_vector_index(
                     ledger=ledger,
                     vector_store_dir=tmpdir / "vectors",
@@ -135,6 +155,11 @@ class EmbeddingIndexerTests(unittest.TestCase):
                 self.assertTrue(mm_text_only_hits[0]["has_images"])
                 self.assertIn("images", mm_manual_hits[0])
                 self.assertEqual("images/img001.png", mm_manual_hits[0]["images"][0]["file_ref"])
+                self.assertNotIn("file_ref", mm_base64_hits[0]["images"][0])
+                self.assertEqual(base64.b64encode(b"fake-image").decode("ascii"), mm_base64_hits[0]["images"][0]["base64"])
+                self.assertEqual("image/png", mm_base64_hits[0]["images"][0]["mime_type"])
+                self.assertIn("omitted_reason", mm_base64_omitted_hits[0]["images"][0])
+                self.assertNotIn("base64", mm_base64_omitted_hits[0]["images"][0])
                 self.assertTrue(mm_image_query_hits)
                 with self.assertRaises(ValueError):
                     search_vector_index(

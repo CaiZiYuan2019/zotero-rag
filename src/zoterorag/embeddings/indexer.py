@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import mimetypes
 from pathlib import Path
 from typing import Any, Literal
 
@@ -170,6 +171,8 @@ def search_vector_index(
     top_k: int = 10,
     consumer: str = "llm_text",
     image_return: str = "none",
+    max_images: int = 5,
+    max_image_bytes: int = 256 * 1024,
     query_image_path: str | None = None,
     query_image_base64: str | None = None,
     query_image_mime_type: str | None = None,
@@ -202,11 +205,18 @@ def search_vector_index(
         raw_results = store.search(query_vector, top_k=top_k, modality=modality)
     finally:
         store.close()
-    results = [search_result_from_vector_row(row) for row in raw_results]
+    artifacts = {
+        row["document_id"]: ledger.get_normalized_artifact(row["document_id"])
+        for row in raw_results
+        if row.get("document_id")
+    }
+    results = [search_result_from_vector_row(row, artifact=artifacts.get(row["document_id"])) for row in raw_results]
     return sanitize_results_for_consumer(
         results,
         consumer=consumer,  # type: ignore[arg-type]
         image_return=image_return,  # type: ignore[arg-type]
+        max_images=max_images,
+        max_image_bytes=max_image_bytes,
     )
 
 
@@ -256,18 +266,21 @@ def embedding_batch_hash(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def search_result_from_vector_row(row: dict[str, Any]) -> SearchResult:
+def search_result_from_vector_row(row: dict[str, Any], *, artifact: dict[str, Any] | None = None) -> SearchResult:
     metadata = dict(row.get("metadata") or {})
     images = []
     if row["modality"] == "image":
         image_path = metadata.get("image_path")
-        images.append(
-            {
-                "image_id": row["chunk_id"],
-                "caption": row["text"],
-                "file_ref": image_path,
-            }
-        )
+        image = {
+            "image_id": row["chunk_id"],
+            "caption": row["text"],
+            "file_ref": image_path,
+            "mime_type": mimetypes.guess_type(str(image_path or ""))[0],
+        }
+        image_abs_path = resolve_artifact_image_path(artifact, image_path)
+        if image_abs_path is not None:
+            image["image_abs_path"] = str(image_abs_path)
+        images.append(image)
     return SearchResult(
         document_id=row["document_id"],
         chunk_id=row["chunk_id"],
@@ -277,6 +290,18 @@ def search_result_from_vector_row(row: dict[str, Any]) -> SearchResult:
         metadata=metadata,
         images=images,
     )
+
+
+def resolve_artifact_image_path(artifact: dict[str, Any] | None, image_path: Any) -> Path | None:
+    if artifact is None or not image_path:
+        return None
+    artifact_dir = Path(str(artifact["artifact_dir"])).resolve()
+    candidate = (artifact_dir / str(image_path)).resolve()
+    try:
+        candidate.relative_to(artifact_dir)
+    except ValueError:
+        return None
+    return candidate
 
 
 def require_embedding_profile(ledger: StateLedger, profile_name: str) -> dict[str, Any]:

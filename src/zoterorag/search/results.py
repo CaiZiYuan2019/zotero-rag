@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass, field
+import mimetypes
+from pathlib import Path
 import re
 from typing import Any, Literal
 
@@ -36,6 +39,7 @@ def sanitize_results_for_consumer(
     consumer: Consumer,
     image_return: ImageReturn = "none",
     max_images: int = 5,
+    max_image_bytes: int = 256 * 1024,
 ) -> list[dict[str, Any]]:
     """Apply output safety rules for manual and LLM consumers."""
 
@@ -68,14 +72,8 @@ def sanitize_results_for_consumer(
         elif consumer == "llm_multimodal":
             if image_return == "base64":
                 item["images"] = [
-                    {
-                        "image_id": img.get("image_id"),
-                        "caption": img.get("caption"),
-                        "base64": img.get("base64"),
-                        "mime_type": img.get("mime_type"),
-                    }
+                    base64_image_payload(img, max_image_bytes=max_image_bytes)
                     for img in images[:max_images]
-                    if img.get("base64")
                 ]
             else:
                 item["images"] = [
@@ -117,3 +115,46 @@ def strip_image_payload_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         "mime_type",
     }
     return {key: value for key, value in metadata.items() if key not in blocked_keys}
+
+
+def base64_image_payload(image: dict[str, Any], *, max_image_bytes: int) -> dict[str, Any]:
+    """Return a bounded base64 payload or an explicit omission reason."""
+
+    payload = {
+        "image_id": image.get("image_id"),
+        "caption": image.get("caption"),
+    }
+    if image.get("base64"):
+        encoded = str(image["base64"])
+        decoded_size = decoded_base64_size(encoded)
+        if decoded_size > max_image_bytes:
+            return {
+                **payload,
+                "omitted_reason": f"image_bytes_exceed_limit:{decoded_size}>{max_image_bytes}",
+            }
+        return {
+            **payload,
+            "base64": encoded,
+            "mime_type": image.get("mime_type") or "application/octet-stream",
+            "byte_count": decoded_size,
+        }
+
+    source = image.get("image_abs_path")
+    if not source:
+        return {**payload, "omitted_reason": "no_base64_or_local_file"}
+    path = Path(str(source))
+    if not path.is_file():
+        return {**payload, "omitted_reason": "local_file_missing"}
+    size = path.stat().st_size
+    if size > max_image_bytes:
+        return {**payload, "omitted_reason": f"image_bytes_exceed_limit:{size}>{max_image_bytes}"}
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    mime_type = image.get("mime_type") or mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    return {**payload, "base64": encoded, "mime_type": mime_type, "byte_count": size}
+
+
+def decoded_base64_size(value: str) -> int:
+    try:
+        return len(base64.b64decode(value, validate=True))
+    except Exception:
+        return len(value.encode("utf-8"))

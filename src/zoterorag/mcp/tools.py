@@ -135,6 +135,8 @@ def zotero_rag_search_multimodal(
     top_k: int = 10,
     consumer: McpConsumer = "llm_text",
     image_return: ImageReturn = "none",
+    max_images: int = 5,
+    max_image_bytes: int = 256 * 1024,
 ) -> dict[str, Any]:
     """MCP multimodal search facade.
 
@@ -161,6 +163,8 @@ def zotero_rag_search_multimodal(
             top_k=top_k,
             consumer=consumer,
             image_return=image_return,
+            max_images=max_images,
+            max_image_bytes=max_image_bytes,
             query_image_path=normalized_image.file_path if normalized_image else None,
             query_image_base64=normalized_image.base64_data if normalized_image else None,
             query_image_mime_type=normalized_image.mime_type if normalized_image else None,

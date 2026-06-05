@@ -200,6 +200,8 @@ def build_parser() -> argparse.ArgumentParser:
     search_vector.add_argument("--top-k", type=int, default=10)
     search_vector.add_argument("--consumer", default="llm_text", choices=("manual", "llm_text", "llm_multimodal"))
     search_vector.add_argument("--image-return", default="none", choices=("file_ref", "base64", "none"))
+    search_vector.add_argument("--max-images", type=int, default=5)
+    search_vector.add_argument("--max-image-bytes", type=int, default=256 * 1024)
     search_vector.add_argument("--query-image-file", default=None)
     search_vector.add_argument("--query-image-base64", default=None)
     search_vector.add_argument("--query-image-mime-type", default=None)
@@ -564,6 +566,8 @@ def main(argv: list[str] | None = None) -> int:
                     top_k=args.top_k,
                     consumer=args.consumer,
                     image_return=args.image_return,
+                    max_images=args.max_images,
+                    max_image_bytes=args.max_image_bytes,
                     query_image_path=query_image.file_path if query_image else None,
                     query_image_base64=query_image.base64_data if query_image else None,
                     query_image_mime_type=query_image.mime_type if query_image else None,
