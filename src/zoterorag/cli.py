@@ -113,6 +113,7 @@ def build_parser() -> argparse.ArgumentParser:
     search_metadata.add_argument("--classification", default=None)
     search_metadata.add_argument("--limit", type=int, default=10)
     search_metadata.add_argument("--consumer", default="llm_text", choices=("manual", "llm_text", "llm_multimodal"))
+    search_metadata.add_argument("--rerank", action="store_true")
 
     search_fulltext = sub.add_parser("search-fulltext", help="Search normalized fulltext chunks without embeddings.")
     search_fulltext.add_argument("query")
@@ -120,6 +121,7 @@ def build_parser() -> argparse.ArgumentParser:
     search_fulltext.add_argument("--limit", type=int, default=10)
     search_fulltext.add_argument("--consumer", default="llm_text", choices=("manual", "llm_text", "llm_multimodal"))
     search_fulltext.add_argument("--image-return", default="none", choices=("file_ref", "base64", "none"))
+    search_fulltext.add_argument("--rerank", action="store_true")
 
     backup = sub.add_parser("backup", help="Create and inspect ZoteroRAG runtime backups.")
     backup_sub = backup.add_subparsers(dest="backup_command", required=True)
@@ -200,6 +202,7 @@ def build_parser() -> argparse.ArgumentParser:
     search_vector.add_argument("--top-k", type=int, default=10)
     search_vector.add_argument("--consumer", default="llm_text", choices=("manual", "llm_text", "llm_multimodal"))
     search_vector.add_argument("--image-return", default="none", choices=("file_ref", "base64", "none"))
+    search_vector.add_argument("--rerank", action="store_true")
     search_vector.add_argument("--max-images", type=int, default=5)
     search_vector.add_argument("--max-image-bytes", type=int, default=256 * 1024)
     search_vector.add_argument("--query-image-file", default=None)
@@ -363,32 +366,36 @@ def main(argv: list[str] | None = None) -> int:
                 return 0 if document is not None else 1
 
         if args.command == "search-metadata":
-            emit(
-                {
-                    "results": metadata_search(
-                        ledger,
-                        query=args.query,
-                        classification=args.classification,
-                        limit=args.limit,
-                        consumer=args.consumer,
-                    )
-                }
-            )
+            try:
+                results = metadata_search(
+                    ledger,
+                    query=args.query,
+                    classification=args.classification,
+                    limit=args.limit,
+                    consumer=args.consumer,
+                    rerank=args.rerank,
+                )
+            except NotImplementedError as exc:
+                emit({"ok": False, "error": str(exc)})
+                return 1
+            emit({"results": results})
             return 0
 
         if args.command == "search-fulltext":
-            emit(
-                {
-                    "results": fulltext_search(
-                        ledger,
-                        query=args.query,
-                        chunk_type=args.chunk_type,
-                        limit=args.limit,
-                        consumer=args.consumer,
-                        image_return=args.image_return,
-                    )
-                }
-            )
+            try:
+                results = fulltext_search(
+                    ledger,
+                    query=args.query,
+                    chunk_type=args.chunk_type,
+                    limit=args.limit,
+                    consumer=args.consumer,
+                    image_return=args.image_return,
+                    rerank=args.rerank,
+                )
+            except NotImplementedError as exc:
+                emit({"ok": False, "error": str(exc)})
+                return 1
+            emit({"results": results})
             return 0
 
         if args.command == "backup":
@@ -568,6 +575,7 @@ def main(argv: list[str] | None = None) -> int:
                     image_return=args.image_return,
                     max_images=args.max_images,
                     max_image_bytes=args.max_image_bytes,
+                    rerank=args.rerank,
                     query_image_path=query_image.file_path if query_image else None,
                     query_image_base64=query_image.base64_data if query_image else None,
                     query_image_mime_type=query_image.mime_type if query_image else None,

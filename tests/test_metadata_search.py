@@ -60,7 +60,10 @@ class MetadataSearchTests(unittest.TestCase):
                 self.assertIn("pylustrator", results[0]["text"])
                 self.assertNotIn("images", results[0])
                 self.assertNotIn("base64", repr(results[0]))
+                self.assertIsNone(results[0]["rerank_score"])
                 self.assertEqual("included_auto", results[0]["metadata"]["classification"])
+                with self.assertRaises(NotImplementedError):
+                    metadata_search(ledger, "pylustrator", rerank=True)
             finally:
                 ledger.close()
 
@@ -99,4 +102,3 @@ class MetadataSearchTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

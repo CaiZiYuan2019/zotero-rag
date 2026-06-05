@@ -29,6 +29,7 @@ class McpToolsTests(unittest.TestCase):
 
                 metadata = zotero_rag_metadata_search(context, query="Figure Paper")
                 text = zotero_rag_search_text(context, query="figure evidence", include_vector=True)
+                rerank_rejected = zotero_rag_search_text(context, query="figure evidence", rerank=True)
                 document = zotero_rag_get_document(context, document_id="DOC1", include_chunks=True)
 
                 serialized = json.dumps(
@@ -39,6 +40,8 @@ class McpToolsTests(unittest.TestCase):
                 self.assertNotIn("base64", serialized)
                 self.assertEqual("llm_text", text["consumer"])
                 self.assertEqual("none", text["image_return"])
+                self.assertFalse(rerank_rejected["results"])
+                self.assertIn("rerank is reserved", rerank_rejected["warnings"][0])
                 self.assertTrue(text["results"])
                 self.assertTrue(document["document"]["chunks"])
             finally:

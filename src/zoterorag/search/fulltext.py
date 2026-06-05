@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..db import StateLedger
-from .results import SearchResult, sanitize_results_for_consumer
+from .results import SearchResult, ensure_rerank_disabled, sanitize_results_for_consumer
 
 
 def fulltext_search(
@@ -14,9 +14,11 @@ def fulltext_search(
     limit: int = 10,
     consumer: str = "llm_text",
     image_return: str = "none",
+    rerank: bool = False,
 ) -> list[dict[str, Any]]:
     """Search normalized Markdown chunks without embeddings or external APIs."""
 
+    ensure_rerank_disabled(rerank)
     rows = ledger.search_chunks_fulltext(query, chunk_type=chunk_type, limit=limit)
     results = []
     for row in rows:

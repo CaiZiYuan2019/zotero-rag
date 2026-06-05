@@ -10,6 +10,7 @@ from ..embeddings import search_vector_index
 from ..models import list_embedding_model_catalog
 from ..runtime import config_as_public_dict
 from ..search import fulltext_search, metadata_search, normalize_query_image
+from ..search.results import ensure_rerank_disabled
 
 
 McpConsumer = Literal["llm_text", "llm_multimodal"]
@@ -41,7 +42,12 @@ def zotero_rag_metadata_search(
     query: str,
     classification: str | None = None,
     top_k: int = 10,
+    rerank: bool = False,
 ) -> dict[str, Any]:
+    try:
+        ensure_rerank_disabled(rerank)
+    except NotImplementedError as exc:
+        return {"results": [], "warnings": [str(exc)]}
     return {
         "results": metadata_search(
             context.ledger,
@@ -49,6 +55,7 @@ def zotero_rag_metadata_search(
             classification=classification,
             limit=top_k,
             consumer="llm_text",
+            rerank=False,
         ),
         "warnings": [],
     }
@@ -63,6 +70,7 @@ def zotero_rag_search_text(
     include_metadata: bool = True,
     include_fulltext: bool = True,
     include_vector: bool = True,
+    rerank: bool = False,
 ) -> dict[str, Any]:
     """Text-only MCP search.
 
@@ -72,6 +80,10 @@ def zotero_rag_search_text(
     """
 
     warnings: list[str] = []
+    try:
+        ensure_rerank_disabled(rerank)
+    except NotImplementedError as exc:
+        return {"results": [], "warnings": [str(exc)], "consumer": "llm_text", "image_return": "none"}
     results: list[dict[str, Any]] = []
     if include_metadata:
         results.extend(
@@ -81,6 +93,7 @@ def zotero_rag_search_text(
                     query=query,
                     limit=top_k,
                     consumer="llm_text",
+                    rerank=False,
                 ),
                 source="metadata",
             )
@@ -95,6 +108,7 @@ def zotero_rag_search_text(
                     limit=top_k,
                     consumer="llm_text",
                     image_return="none",
+                    rerank=False,
                 ),
                 source="fulltext",
             )
@@ -112,6 +126,7 @@ def zotero_rag_search_text(
                         top_k=top_k,
                         consumer="llm_text",
                         image_return="none",
+                        rerank=False,
                     ),
                     source="text_vector",
                 )
@@ -137,6 +152,7 @@ def zotero_rag_search_multimodal(
     image_return: ImageReturn = "none",
     max_images: int = 5,
     max_image_bytes: int = 256 * 1024,
+    rerank: bool = False,
 ) -> dict[str, Any]:
     """MCP multimodal search facade.
 
@@ -150,6 +166,7 @@ def zotero_rag_search_multimodal(
     if consumer == "llm_text":
         image_return = "none"
     try:
+        ensure_rerank_disabled(rerank)
         normalized_image = normalize_query_image(
             query_image,
             allowed_roots=[context.config.paths.data_dir],
@@ -165,6 +182,7 @@ def zotero_rag_search_multimodal(
             image_return=image_return,
             max_images=max_images,
             max_image_bytes=max_image_bytes,
+            rerank=False,
             query_image_path=normalized_image.file_path if normalized_image else None,
             query_image_base64=normalized_image.base64_data if normalized_image else None,
             query_image_mime_type=normalized_image.mime_type if normalized_image else None,

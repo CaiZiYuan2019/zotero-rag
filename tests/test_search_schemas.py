@@ -84,6 +84,7 @@ class SearchSchemaTests(OptionalModuleTestCase):
             payload = item if isinstance(item, dict) else dict(item.__dict__)
             llm_text = payload.get("llm_text", payload.get("text", ""))
             self.assertIsInstance(llm_text, str)
+            self.assertIsNone(payload["rerank_score"])
             self.assertNotIn("images", payload)
             self.assertNotIn("base64", repr(payload))
             self.assertNotIn("file_ref", repr(payload))

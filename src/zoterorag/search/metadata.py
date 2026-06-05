@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..db import StateLedger
-from .results import sanitize_results_for_consumer
+from .results import ensure_rerank_disabled, sanitize_results_for_consumer
 
 
 def metadata_search(
@@ -13,9 +13,11 @@ def metadata_search(
     classification: str | None = None,
     limit: int = 10,
     consumer: str = "llm_text",
+    rerank: bool = False,
 ) -> list[dict[str, Any]]:
     """Search local Zotero metadata without vectors or external services."""
 
+    ensure_rerank_disabled(rerank)
     rows = ledger.search_attachments_metadata(
         query,
         classification=classification,

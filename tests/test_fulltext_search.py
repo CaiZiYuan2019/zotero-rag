@@ -47,10 +47,13 @@ class FulltextSearchTests(unittest.TestCase):
                 )
 
                 self.assertEqual("DOC-FULLTEXT", text_hits[0]["document_id"])
+                self.assertIsNone(text_hits[0]["rerank_score"])
                 self.assertNotIn("images/fig.png", text_hits[0]["text"])
                 self.assertNotIn("images/img001.png", text_hits[0]["text"])
                 self.assertEqual("DOC-FULLTEXT", image_hits[0]["document_id"])
                 self.assertEqual("images/img001.png", image_hits[0]["images"][0]["file_ref"])
+                with self.assertRaises(NotImplementedError):
+                    fulltext_search(ledger, "workflow", rerank=True)
             finally:
                 ledger.close()
 

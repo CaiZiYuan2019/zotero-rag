@@ -46,6 +46,7 @@ def sanitize_results_for_consumer(
     sanitized: list[dict[str, Any]] = []
     for result in results:
         item = result.to_dict() if isinstance(result, SearchResult) else dict(result)
+        item.setdefault("rerank_score", None)
         images = list(item.get("images") or [])
         if consumer == "llm_text" or image_return == "none":
             item["text"] = strip_image_references_from_text(str(item.get("text", "")))
@@ -158,3 +159,10 @@ def decoded_base64_size(value: str) -> int:
         return len(base64.b64decode(value, validate=True))
     except Exception:
         return len(value.encode("utf-8"))
+
+
+def ensure_rerank_disabled(rerank: bool) -> None:
+    """Reject rerank requests until a real RerankProvider is implemented."""
+
+    if rerank:
+        raise NotImplementedError("rerank is reserved but not implemented; use rerank=false")

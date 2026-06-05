@@ -203,45 +203,57 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
 
     @app.post("/search/metadata", dependencies=[Depends(require_access)])
     def search_metadata(payload: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "results": metadata_search(
-                ledger,
-                query=str(payload["query"]),
-                classification=payload.get("classification"),
-                limit=int(payload.get("limit", payload.get("top_k", 10))),
-                consumer=str(payload.get("consumer", "llm_text")),
-            )
-        }
+        try:
+            return {
+                "results": metadata_search(
+                    ledger,
+                    query=str(payload["query"]),
+                    classification=payload.get("classification"),
+                    limit=int(payload.get("limit", payload.get("top_k", 10))),
+                    consumer=str(payload.get("consumer", "llm_text")),
+                    rerank=bool(payload.get("rerank", False)),
+                )
+            }
+        except NotImplementedError as exc:
+            raise HTTPException(status_code=501, detail=str(exc)) from exc
 
     @app.post("/search/fulltext", dependencies=[Depends(require_access)])
     def search_fulltext(payload: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "results": fulltext_search(
-                ledger,
-                query=str(payload["query"]),
-                chunk_type=payload.get("chunk_type"),
-                limit=int(payload.get("limit", payload.get("top_k", 10))),
-                consumer=str(payload.get("consumer", "llm_text")),
-                image_return=str(payload.get("image_return", "none")),
-            )
-        }
+        try:
+            return {
+                "results": fulltext_search(
+                    ledger,
+                    query=str(payload["query"]),
+                    chunk_type=payload.get("chunk_type"),
+                    limit=int(payload.get("limit", payload.get("top_k", 10))),
+                    consumer=str(payload.get("consumer", "llm_text")),
+                    image_return=str(payload.get("image_return", "none")),
+                    rerank=bool(payload.get("rerank", False)),
+                )
+            }
+        except NotImplementedError as exc:
+            raise HTTPException(status_code=501, detail=str(exc)) from exc
 
     @app.post("/search/text", dependencies=[Depends(require_access)])
     def search_text(payload: dict[str, Any]) -> dict[str, Any]:
         if payload.get("query_image") is not None:
             raise HTTPException(status_code=400, detail="text search does not accept query_image")
-        return {
-            "results": search_vector_index(
-                ledger=ledger,
-                vector_store_dir=config.paths.vector_store_dir,
-                profile_name=payload.get("profile_name"),
-                query=str(payload["query"]),
-                mode="text",
-                top_k=int(payload.get("top_k", 10)),
-                consumer=str(payload.get("consumer", "llm_text")),
-                image_return="none",
-            )
-        }
+        try:
+            return {
+                "results": search_vector_index(
+                    ledger=ledger,
+                    vector_store_dir=config.paths.vector_store_dir,
+                    profile_name=payload.get("profile_name"),
+                    query=str(payload["query"]),
+                    mode="text",
+                    top_k=int(payload.get("top_k", 10)),
+                    consumer=str(payload.get("consumer", "llm_text")),
+                    image_return="none",
+                    rerank=bool(payload.get("rerank", False)),
+                )
+            }
+        except NotImplementedError as exc:
+            raise HTTPException(status_code=501, detail=str(exc)) from exc
 
     @app.post("/search/multimodal", dependencies=[Depends(require_access)])
     def search_multimodal(payload: dict[str, Any]) -> dict[str, Any]:
@@ -252,23 +264,27 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
             )
         except (FileNotFoundError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {
-            "results": search_vector_index(
-                ledger=ledger,
-                vector_store_dir=config.paths.vector_store_dir,
-                profile_name=payload.get("profile_name"),
-                query=str(payload.get("query_text", payload.get("query", ""))),
-                mode="multimodal",
-                top_k=int(payload.get("top_k", 10)),
-                consumer=str(payload.get("consumer", "manual")),
-                image_return=str(payload.get("image_return", "file_ref")),
-                max_images=int(payload.get("max_images", 5)),
-                max_image_bytes=int(payload.get("max_image_bytes", 256 * 1024)),
-                query_image_path=query_image.file_path if query_image else None,
-                query_image_base64=query_image.base64_data if query_image else None,
-                query_image_mime_type=query_image.mime_type if query_image else None,
-            )
-        }
+        try:
+            return {
+                "results": search_vector_index(
+                    ledger=ledger,
+                    vector_store_dir=config.paths.vector_store_dir,
+                    profile_name=payload.get("profile_name"),
+                    query=str(payload.get("query_text", payload.get("query", ""))),
+                    mode="multimodal",
+                    top_k=int(payload.get("top_k", 10)),
+                    consumer=str(payload.get("consumer", "manual")),
+                    image_return=str(payload.get("image_return", "file_ref")),
+                    max_images=int(payload.get("max_images", 5)),
+                    max_image_bytes=int(payload.get("max_image_bytes", 256 * 1024)),
+                    rerank=bool(payload.get("rerank", False)),
+                    query_image_path=query_image.file_path if query_image else None,
+                    query_image_base64=query_image.base64_data if query_image else None,
+                    query_image_mime_type=query_image.mime_type if query_image else None,
+                )
+            }
+        except NotImplementedError as exc:
+            raise HTTPException(status_code=501, detail=str(exc)) from exc
 
     @app.post("/backup/create", dependencies=[Depends(require_access)])
     def backup_create(payload: dict[str, Any]) -> dict[str, Any]:

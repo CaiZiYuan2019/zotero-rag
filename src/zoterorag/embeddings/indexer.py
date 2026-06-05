@@ -9,7 +9,7 @@ from typing import Any, Literal
 
 from ..db import StateLedger
 from ..index.local_vector import LocalVectorStore, VectorRecord
-from ..search.results import SearchResult, sanitize_results_for_consumer
+from ..search.results import SearchResult, ensure_rerank_disabled, sanitize_results_for_consumer
 from .base import EmbeddingInput, EmbeddingProvider, StubEmbeddingProvider
 from .profile import embedding_profile_hash
 
@@ -173,6 +173,7 @@ def search_vector_index(
     image_return: str = "none",
     max_images: int = 5,
     max_image_bytes: int = 256 * 1024,
+    rerank: bool = False,
     query_image_path: str | None = None,
     query_image_base64: str | None = None,
     query_image_mime_type: str | None = None,
@@ -180,6 +181,7 @@ def search_vector_index(
 ) -> list[dict[str, Any]]:
     profile = select_profile(ledger, profile_name=profile_name, mode=mode)
     profile_name = profile["name"]
+    ensure_rerank_disabled(rerank)
     if mode == "text" and (query_image_path or query_image_base64):
         raise ValueError("text search does not accept query images")
     embedding_provider = provider or StubEmbeddingProvider(dimension=int(profile["dimension"]))

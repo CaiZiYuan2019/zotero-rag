@@ -151,6 +151,7 @@ class EmbeddingIndexerTests(unittest.TestCase):
                 self.assertNotIn("alpha beta gamma", repr(batches[0]))
                 self.assertEqual("stub_text", text_hits[0]["metadata"]["profile_name"])
                 self.assertEqual(text_result.profile_hash, text_hits[0]["metadata"]["profile_hash"])
+                self.assertIsNone(text_hits[0]["rerank_score"])
                 self.assertNotIn("images", mm_text_only_hits[0])
                 self.assertTrue(mm_text_only_hits[0]["has_images"])
                 self.assertIn("images", mm_manual_hits[0])
@@ -161,6 +162,16 @@ class EmbeddingIndexerTests(unittest.TestCase):
                 self.assertIn("omitted_reason", mm_base64_omitted_hits[0]["images"][0])
                 self.assertNotIn("base64", mm_base64_omitted_hits[0]["images"][0])
                 self.assertTrue(mm_image_query_hits)
+                with self.assertRaises(NotImplementedError):
+                    search_vector_index(
+                        ledger=ledger,
+                        vector_store_dir=tmpdir / "vectors",
+                        profile_name="stub_text",
+                        query="alpha beta gamma",
+                        mode="text",
+                        consumer="llm_text",
+                        rerank=True,
+                    )
                 with self.assertRaises(ValueError):
                     search_vector_index(
                         ledger=ledger,
