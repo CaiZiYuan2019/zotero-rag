@@ -13,6 +13,7 @@ from .index import verify_vector_index
 from .models import describe_embedding_profile, list_embedding_model_catalog
 from .normalize import normalize_markdown_document
 from .pipeline import cancel_ingest_job, pause_ingest_job, resume_ingest_job, start_ingest_job
+from .review import explain_attachment_review
 from .runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime, scan_zotero_shadow
 from .search import fulltext_search, metadata_search
 from .zotero import ZoteroShadow
@@ -88,6 +89,8 @@ def build_parser() -> argparse.ArgumentParser:
     exclude = review_sub.add_parser("exclude")
     exclude.add_argument("--attachment-key", required=True)
     exclude.add_argument("--reason", default="manual exclude")
+    review_explain = review_sub.add_parser("explain")
+    review_explain.add_argument("--attachment-key", required=True)
 
     attachments = sub.add_parser("attachments", help="List persisted attachment scan results.")
     attachments.add_argument("--classification", default=None)
@@ -294,6 +297,13 @@ def main(argv: list[str] | None = None) -> int:
                 ledger.upsert_review_rule(args.attachment_key, "exclude", args.reason)
                 emit({"attachment_key": args.attachment_key, "decision": "exclude"})
                 return 0
+            if args.review_command == "explain":
+                try:
+                    emit(explain_attachment_review(ledger, args.attachment_key))
+                    return 0
+                except KeyError as exc:
+                    emit({"ok": False, "error": str(exc)})
+                    return 1
 
         if args.command == "attachments":
             emit(

@@ -10,6 +10,7 @@ from ..embeddings import index_normalized_document, search_vector_index
 from ..index import verify_vector_index
 from ..models import describe_embedding_profile, list_embedding_model_catalog
 from ..pipeline import cancel_ingest_job, pause_ingest_job, resume_ingest_job, start_ingest_job
+from ..review import explain_attachment_review
 from ..runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime, scan_zotero_shadow
 from ..search import fulltext_search, metadata_search
 from .security import AccessDenied, verify_api_access
@@ -155,6 +156,13 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
             "rules": ledger.list_review_rules(),
             "candidates": ledger.list_attachments(classification="needs_review"),
         }
+
+    @app.get("/review/explain/{attachment_key}", dependencies=[Depends(require_access)])
+    def review_explain(attachment_key: str) -> dict[str, Any]:
+        try:
+            return explain_attachment_review(ledger, attachment_key)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/attachments", dependencies=[Depends(require_access)])
     def attachments(classification: str | None = None, limit: int | None = 100) -> dict[str, Any]:
