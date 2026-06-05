@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import unittest
 
 from tests._support import workspace_tmpdir
@@ -95,6 +96,17 @@ class EmbeddingIndexerTests(unittest.TestCase):
                     consumer="manual",
                     image_return="file_ref",
                 )
+                mm_image_query_hits = search_vector_index(
+                    ledger=ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="stub_mm",
+                    query="important figure",
+                    mode="multimodal",
+                    consumer="llm_text",
+                    image_return="none",
+                    query_image_base64=base64.b64encode(b"query-image").decode("ascii"),
+                    query_image_mime_type="image/png",
+                )
 
                 self.assertEqual(1, text_result.indexed_chunks)
                 self.assertEqual(1, mm_result.indexed_chunks)
@@ -112,6 +124,17 @@ class EmbeddingIndexerTests(unittest.TestCase):
                 self.assertTrue(mm_text_only_hits[0]["has_images"])
                 self.assertIn("images", mm_manual_hits[0])
                 self.assertEqual("images/img001.png", mm_manual_hits[0]["images"][0]["file_ref"])
+                self.assertTrue(mm_image_query_hits)
+                with self.assertRaises(ValueError):
+                    search_vector_index(
+                        ledger=ledger,
+                        vector_store_dir=tmpdir / "vectors",
+                        profile_name="stub_text",
+                        query="alpha beta gamma",
+                        mode="text",
+                        consumer="llm_text",
+                        query_image_base64=base64.b64encode(b"query-image").decode("ascii"),
+                    )
             finally:
                 ledger.close()
 

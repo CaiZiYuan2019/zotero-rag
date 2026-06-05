@@ -9,7 +9,7 @@ from ..documents import get_document
 from ..embeddings import search_vector_index
 from ..models import list_embedding_model_catalog
 from ..runtime import config_as_public_dict
-from ..search import fulltext_search, metadata_search
+from ..search import fulltext_search, metadata_search, normalize_query_image
 
 
 McpConsumer = Literal["llm_text", "llm_multimodal"]
@@ -130,6 +130,7 @@ def zotero_rag_search_multimodal(
     context: McpToolContext,
     *,
     query_text: str,
+    query_image: dict[str, Any] | None = None,
     profile_name: str | None = None,
     top_k: int = 10,
     consumer: McpConsumer = "llm_text",
@@ -147,6 +148,10 @@ def zotero_rag_search_multimodal(
     if consumer == "llm_text":
         image_return = "none"
     try:
+        normalized_image = normalize_query_image(
+            query_image,
+            allowed_roots=[context.config.paths.data_dir],
+        )
         results = search_vector_index(
             ledger=context.ledger,
             vector_store_dir=context.config.paths.vector_store_dir,
@@ -156,6 +161,9 @@ def zotero_rag_search_multimodal(
             top_k=top_k,
             consumer=consumer,
             image_return=image_return,
+            query_image_path=normalized_image.file_path if normalized_image else None,
+            query_image_base64=normalized_image.base64_data if normalized_image else None,
+            query_image_mime_type=normalized_image.mime_type if normalized_image else None,
         )
         warnings: list[str] = []
     except (FileNotFoundError, KeyError, ValueError) as exc:

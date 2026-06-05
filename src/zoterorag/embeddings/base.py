@@ -10,6 +10,8 @@ class EmbeddingInput:
     input_id: str
     text: str
     image_path: str | None = None
+    image_base64: str | None = None
+    image_mime_type: str | None = None
     role: str = "document"
 
 
@@ -40,11 +42,13 @@ class StubEmbeddingProvider:
         return [EmbeddingVector(item.input_id, self._vector_for(item)) for item in inputs]
 
     def _vector_for(self, item: EmbeddingInput) -> list[float]:
-        seed = f"{item.role}\0{item.text}\0{item.image_path or ''}".encode("utf-8")
+        seed = (
+            f"{item.role}\0{item.text}\0{item.image_path or ''}\0"
+            f"{item.image_base64 or ''}\0{item.image_mime_type or ''}"
+        ).encode("utf-8")
         digest = hashlib.sha256(seed).digest()
         values = []
         for index in range(self.dimension):
             byte = digest[index % len(digest)]
             values.append((byte / 127.5) - 1.0)
         return values
-

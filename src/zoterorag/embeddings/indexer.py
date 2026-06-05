@@ -126,13 +126,27 @@ def search_vector_index(
     top_k: int = 10,
     consumer: str = "llm_text",
     image_return: str = "none",
+    query_image_path: str | None = None,
+    query_image_base64: str | None = None,
+    query_image_mime_type: str | None = None,
     provider: EmbeddingProvider | None = None,
 ) -> list[dict[str, Any]]:
     profile = select_profile(ledger, profile_name=profile_name, mode=mode)
     profile_name = profile["name"]
+    if mode == "text" and (query_image_path or query_image_base64):
+        raise ValueError("text search does not accept query images")
     embedding_provider = provider or StubEmbeddingProvider(dimension=int(profile["dimension"]))
     query_vector = embedding_provider.embed(
-        [EmbeddingInput(input_id="query", text=query, role="query")]
+        [
+            EmbeddingInput(
+                input_id="query",
+                text=query,
+                image_path=query_image_path,
+                image_base64=query_image_base64,
+                image_mime_type=query_image_mime_type,
+                role="query",
+            )
+        ]
     )[0].vector
     modality = "text" if mode == "text" else "image"
     store = LocalVectorStore(

@@ -15,7 +15,7 @@ from .normalize import normalize_markdown_document
 from .pipeline import cancel_ingest_job, pause_ingest_job, resume_ingest_job, start_ingest_job
 from .review import explain_attachment_review
 from .runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime, scan_zotero_shadow
-from .search import fulltext_search, metadata_search
+from .search import fulltext_search, metadata_search, normalize_query_image
 from .zotero import ZoteroShadow
 
 
@@ -183,6 +183,9 @@ def build_parser() -> argparse.ArgumentParser:
     search_vector.add_argument("--top-k", type=int, default=10)
     search_vector.add_argument("--consumer", default="llm_text", choices=("manual", "llm_text", "llm_multimodal"))
     search_vector.add_argument("--image-return", default="none", choices=("file_ref", "base64", "none"))
+    search_vector.add_argument("--query-image-file", default=None)
+    search_vector.add_argument("--query-image-base64", default=None)
+    search_vector.add_argument("--query-image-mime-type", default=None)
 
     inspect = sub.add_parser("inspect-shadow", help="Read summary from an existing shadow DB.")
     inspect.add_argument("--limit", type=int, default=5)
@@ -485,20 +488,40 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
 
         if args.command == "search-vector":
-            emit(
-                {
-                    "results": search_vector_index(
-                        ledger=ledger,
-                        vector_store_dir=config.paths.vector_store_dir,
-                        profile_name=args.profile,
-                        query=args.query,
-                        mode=args.mode,
-                        top_k=args.top_k,
-                        consumer=args.consumer,
-                        image_return=args.image_return,
+            query_image = None
+            if args.query_image_file or args.query_image_base64:
+                if args.query_image_file and args.query_image_base64:
+                    emit({"ok": False, "error": "use only one of --query-image-file or --query-image-base64"})
+                    return 1
+                try:
+                    query_image = normalize_query_image(
+                        {
+                            "type": "file_path" if args.query_image_file else "base64",
+                            "value": args.query_image_file or args.query_image_base64,
+                            "mime_type": args.query_image_mime_type,
+                        }
                     )
-                }
-            )
+                except (FileNotFoundError, ValueError) as exc:
+                    emit({"ok": False, "error": str(exc)})
+                    return 1
+            try:
+                results = search_vector_index(
+                    ledger=ledger,
+                    vector_store_dir=config.paths.vector_store_dir,
+                    profile_name=args.profile,
+                    query=args.query,
+                    mode=args.mode,
+                    top_k=args.top_k,
+                    consumer=args.consumer,
+                    image_return=args.image_return,
+                    query_image_path=query_image.file_path if query_image else None,
+                    query_image_base64=query_image.base64_data if query_image else None,
+                    query_image_mime_type=query_image.mime_type if query_image else None,
+                )
+            except (FileNotFoundError, KeyError, ValueError) as exc:
+                emit({"ok": False, "error": str(exc)})
+                return 1
+            emit({"results": results})
             return 0
 
         if args.command == "inspect-shadow":

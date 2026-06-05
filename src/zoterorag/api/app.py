@@ -12,7 +12,7 @@ from ..models import describe_embedding_profile, list_embedding_model_catalog
 from ..pipeline import cancel_ingest_job, pause_ingest_job, resume_ingest_job, start_ingest_job
 from ..review import explain_attachment_review
 from ..runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime, scan_zotero_shadow
-from ..search import fulltext_search, metadata_search
+from ..search import fulltext_search, metadata_search, normalize_query_image
 from .security import AccessDenied, verify_api_access
 
 
@@ -228,6 +228,8 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
 
     @app.post("/search/text", dependencies=[Depends(require_access)])
     def search_text(payload: dict[str, Any]) -> dict[str, Any]:
+        if payload.get("query_image") is not None:
+            raise HTTPException(status_code=400, detail="text search does not accept query_image")
         return {
             "results": search_vector_index(
                 ledger=ledger,
@@ -243,6 +245,13 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
 
     @app.post("/search/multimodal", dependencies=[Depends(require_access)])
     def search_multimodal(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            query_image = normalize_query_image(
+                payload.get("query_image"),
+                allowed_roots=[config.paths.data_dir],
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {
             "results": search_vector_index(
                 ledger=ledger,
@@ -253,6 +262,9 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
                 top_k=int(payload.get("top_k", 10)),
                 consumer=str(payload.get("consumer", "manual")),
                 image_return=str(payload.get("image_return", "file_ref")),
+                query_image_path=query_image.file_path if query_image else None,
+                query_image_base64=query_image.base64_data if query_image else None,
+                query_image_mime_type=query_image.mime_type if query_image else None,
             )
         }
 
