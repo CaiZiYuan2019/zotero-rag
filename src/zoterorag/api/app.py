@@ -9,7 +9,7 @@ from ..documents import list_documents as list_document_records
 from ..embeddings import index_normalized_document, search_vector_index
 from ..index import verify_vector_index
 from ..models import describe_embedding_profile, list_embedding_model_catalog
-from ..pipeline import cancel_ingest_job, pause_ingest_job, resume_ingest_job, start_ingest_job
+from ..pipeline import cancel_ingest_job, pause_ingest_job, resume_ingest_job, start_ingest_job, start_reembed_job
 from ..review import explain_attachment_review
 from ..runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime, scan_zotero_shadow
 from ..search import fulltext_search, metadata_search, normalize_query_image
@@ -314,5 +314,22 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
             profile_name=str(payload["profile_name"]),
             document_id=str(payload["document_id"]),
         ).to_dict()
+
+    @app.post("/reembed/from-normalized", dependencies=[Depends(require_access)])
+    def reembed_from_normalized(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return start_reembed_job(
+                ledger,
+                vector_store_dir=config.paths.vector_store_dir,
+                profile_name=str(payload["profile_name"]),
+                document_id=payload.get("document_id"),
+                force=bool(payload.get("force", False)),
+                execute=bool(payload.get("execute", False)),
+                allow_stub_provider=bool(payload.get("allow_stub_provider", False)),
+            )
+        except NotImplementedError as exc:
+            raise HTTPException(status_code=501, detail=str(exc)) from exc
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return app

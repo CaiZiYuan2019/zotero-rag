@@ -12,7 +12,7 @@ from .extractors import ExtractionManager, ExtractionRequest, ExtractorKeyPool, 
 from .index import verify_vector_index
 from .models import describe_embedding_profile, list_embedding_model_catalog
 from .normalize import normalize_markdown_document
-from .pipeline import cancel_ingest_job, pause_ingest_job, resume_ingest_job, start_ingest_job
+from .pipeline import cancel_ingest_job, pause_ingest_job, resume_ingest_job, start_ingest_job, start_reembed_job
 from .review import explain_attachment_review
 from .runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime, scan_zotero_shadow
 from .search import fulltext_search, metadata_search, normalize_query_image
@@ -175,6 +175,18 @@ def build_parser() -> argparse.ArgumentParser:
     embed_index = embed_sub.add_parser("index-normalized", help="Index normalized chunks into a local vector store.")
     embed_index.add_argument("--document-id", required=True)
     embed_index.add_argument("--profile", required=True)
+
+    reembed = sub.add_parser("reembed", help="Plan or execute vector-only rebuilds from normalized artifacts.")
+    reembed.add_argument("--profile", required=True)
+    reembed.add_argument("--from-normalized", action="store_true", required=True)
+    reembed.add_argument("--document-id", default=None)
+    reembed.add_argument("--force", action="store_true")
+    reembed.add_argument("--execute", action="store_true", help="Execute local stub indexing for pending documents.")
+    reembed.add_argument(
+        "--allow-stub-provider",
+        action="store_true",
+        help="Allow local stub embeddings for non-stub profiles during control-plane tests.",
+    )
 
     search_vector = sub.add_parser("search-vector", help="Search local vector indexes with the stub provider.")
     search_vector.add_argument("query")
@@ -486,6 +498,27 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 emit(result.to_dict())
                 return 0
+
+        if args.command == "reembed":
+            if not args.from_normalized:
+                emit({"ok": False, "error": "only --from-normalized is supported"})
+                return 1
+            try:
+                emit(
+                    start_reembed_job(
+                        ledger,
+                        vector_store_dir=config.paths.vector_store_dir,
+                        profile_name=args.profile,
+                        document_id=args.document_id,
+                        force=args.force,
+                        execute=args.execute,
+                        allow_stub_provider=args.allow_stub_provider,
+                    )
+                )
+                return 0
+            except (KeyError, NotImplementedError, ValueError) as exc:
+                emit({"ok": False, "error": str(exc)})
+                return 1
 
         if args.command == "search-vector":
             query_image = None
