@@ -30,6 +30,14 @@ def cosine_similarity(left: list[float], right: list[float]) -> float:
     return dot / (left_norm * right_norm)
 
 
+def strip_stored_version_prefix(*, stored_record_id: str, index_version: str) -> str:
+    if index_version and index_version != "legacy":
+        prefix = f"{index_version}:"
+        if stored_record_id.startswith(prefix):
+            return stored_record_id[len(prefix) :]
+    return stored_record_id
+
+
 class LocalVectorStore:
     """Small SQLite vector store used for local tests and bootstrap.
 
@@ -133,6 +141,77 @@ class LocalVectorStore:
                         json.dumps(record.vector),
                         record.text,
                         json.dumps(record.metadata or {}, ensure_ascii=False, sort_keys=True),
+                    ),
+                )
+                count += 1
+        return count
+
+    def copy_active_records_to_version(
+        self,
+        *,
+        index_version: str,
+        exclude_document_ids: Iterable[str] = (),
+    ) -> int:
+        """Stage existing active records under a new version.
+
+        Incremental indexing still publishes a complete active version. Before
+        adding changed records for one document, copy all other active records
+        into the new staged version so publishing does not hide previously
+        indexed documents.
+        """
+
+        active_version = self.active_version()
+        excluded = set(exclude_document_ids)
+        rows = self.conn.execute(
+            """
+            SELECT record_id, document_id, chunk_id, modality, index_version,
+                   vector_json, text, metadata_json
+            FROM vectors
+            WHERE profile_name = ? AND index_version = ?
+            """,
+            (self.profile_name, active_version),
+        ).fetchall()
+        count = 0
+        with self.conn:
+            for row in rows:
+                if row["document_id"] in excluded:
+                    continue
+                logical_record_id = strip_stored_version_prefix(
+                    stored_record_id=str(row["record_id"]),
+                    index_version=str(row["index_version"]),
+                )
+                stored_record_id = (
+                    logical_record_id
+                    if index_version == "legacy"
+                    else f"{index_version}:{logical_record_id}"
+                )
+                self.conn.execute(
+                    """
+                    INSERT INTO vectors(
+                        record_id, profile_name, document_id, chunk_id, modality,
+                        index_version, vector_json, text, metadata_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(record_id) DO UPDATE SET
+                        profile_name = excluded.profile_name,
+                        document_id = excluded.document_id,
+                        chunk_id = excluded.chunk_id,
+                        modality = excluded.modality,
+                        index_version = excluded.index_version,
+                        vector_json = excluded.vector_json,
+                        text = excluded.text,
+                        metadata_json = excluded.metadata_json
+                    """,
+                    (
+                        stored_record_id,
+                        self.profile_name,
+                        row["document_id"],
+                        row["chunk_id"],
+                        row["modality"],
+                        index_version,
+                        row["vector_json"],
+                        row["text"],
+                        row["metadata_json"],
                     ),
                 )
                 count += 1

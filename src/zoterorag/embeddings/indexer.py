@@ -117,7 +117,14 @@ def index_normalized_document(
     try:
         # Stage records under the deterministic batch hash first. Search only
         # sees this rebuild after publish_version commits, so interrupted
-        # embedding/index runs cannot expose a half-written vector set.
+        # embedding/index runs cannot expose a half-written vector set. For
+        # incremental single-document indexing, carry forward the existing
+        # active records for other documents so publishing this batch does not
+        # hide previously indexed evidence in the same profile.
+        copied = store.copy_active_records_to_version(
+            index_version=batch_hash,
+            exclude_document_ids=[document_id],
+        )
         indexed = store.upsert(records, index_version=batch_hash)
         store.publish_version(batch_hash)
         counts = store.counts(index_version=batch_hash)
@@ -138,6 +145,7 @@ def index_normalized_document(
             "input_ids": [item.input_id for item in inputs],
             "dimension": embedding_provider.dimension,
             "indexed_chunks": indexed,
+            "carried_forward_chunks": copied,
             "vector_path": str(vector_path),
         },
     )
@@ -156,6 +164,7 @@ def index_normalized_document(
         "indexed",
         {
             "chunks": indexed,
+            "carried_forward_chunks": copied,
             "profile_modality": profile_modality,
             "chunk_type": chunk_type,
             "profile_hash": profile_hash,

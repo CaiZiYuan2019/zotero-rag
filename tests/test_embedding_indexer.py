@@ -257,6 +257,70 @@ class EmbeddingIndexerTests(unittest.TestCase):
             finally:
                 ledger.close()
 
+    def test_incremental_indexing_keeps_previous_documents_visible(self) -> None:
+        with workspace_tmpdir("embedding-indexer-incremental-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                ledger.upsert_embedding_profiles(
+                    [
+                        EmbeddingProfile(
+                            name="stub_text",
+                            provider="stub",
+                            model="stub",
+                            dimension=8,
+                            modality="text",
+                            enabled=True,
+                            default_for_text=True,
+                        )
+                    ]
+                )
+                seed_markdown_document(tmpdir, ledger, document_id="DOC_ALPHA", text="alpha unique evidence")
+                seed_markdown_document(tmpdir, ledger, document_id="DOC_BETA", text="beta unique evidence")
+
+                index_normalized_document(
+                    ledger=ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="stub_text",
+                    document_id="DOC_ALPHA",
+                )
+                index_normalized_document(
+                    ledger=ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="stub_text",
+                    document_id="DOC_BETA",
+                )
+
+                alpha_hits = search_vector_index(
+                    ledger=ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="stub_text",
+                    query="alpha unique evidence",
+                    mode="text",
+                    top_k=5,
+                )
+                indexed = next(index for index in ledger.list_vector_indexes() if index["profile_name"] == "stub_text")
+
+                self.assertEqual(2, indexed["document_count"])
+                self.assertEqual({"DOC_ALPHA", "DOC_BETA"}, {hit["document_id"] for hit in alpha_hits})
+            finally:
+                ledger.close()
+
+
+def seed_markdown_document(tmpdir, ledger: StateLedger, *, document_id: str, text: str):
+    source_dir = tmpdir / f"mineru-{document_id}"
+    source_dir.mkdir(parents=True)
+    markdown = source_dir / "full.md"
+    markdown.write_text(f"# {document_id}\n\n{text}\n", encoding="utf-8")
+    normalized = normalize_markdown_document(
+        source_markdown=markdown,
+        output_root=tmpdir / "normalized",
+        document_id=document_id,
+        attachment_key=f"ATT_{document_id}",
+    )
+    ledger.upsert_normalized_artifact(normalized.ledger_artifact())
+    ledger.replace_document_chunks(normalized.document_id, normalized.chunks)
+    return normalized
+
 
 if __name__ == "__main__":
     unittest.main()
