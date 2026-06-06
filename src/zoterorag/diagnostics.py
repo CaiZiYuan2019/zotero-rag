@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from pathlib import Path
+import shutil
+import tempfile
 from typing import Any
+import uuid
 
 from .api.security import AccessDenied, verify_api_access
 from .config import AppConfig
 from .db import StateLedger
-from .index import verify_vector_index
+from .index import LocalVectorStore, VectorRecord, verify_vector_index
 from .providers import provider_readiness
 from .zotero import ZoteroShadow
 
@@ -16,6 +19,7 @@ def run_runtime_diagnostics(
     ledger: StateLedger,
     *,
     verify_vectors: bool = False,
+    self_test_vector_store: bool = False,
 ) -> dict[str, Any]:
     """Run non-invasive readiness checks for the local control plane.
 
@@ -29,6 +33,16 @@ def run_runtime_diagnostics(
         "zotero_source": check_zotero_source_paths(config),
         "shadow": check_existing_shadow(config),
         "vectors": check_vector_indexes(config, ledger, verify_vectors=verify_vectors),
+        "vector_staging_self_test": (
+            check_vector_staging_self_test(config)
+            if self_test_vector_store
+            else {
+                "ok": True,
+                "enabled": False,
+                "status": "skipped",
+                "note": "pass self_test_vector_store=true to create a temporary local vector index and verify staging",
+            }
+        ),
         "api_access": check_api_access(config),
         "providers": check_provider_configuration(),
         "external_execution": {
@@ -48,12 +62,16 @@ def check_state_db(config: AppConfig, ledger: StateLedger) -> dict[str, Any]:
     state_db = config.paths.state_db
     try:
         summary = ledger.status_summary()
+        journal_mode = ledger.conn.execute("PRAGMA journal_mode").fetchone()[0]
+        busy_timeout = ledger.conn.execute("PRAGMA busy_timeout").fetchone()[0]
     except Exception as exc:
         return {"ok": False, "path": str(state_db), "error": str(exc)}
     return {
-        "ok": state_db.is_file(),
+        "ok": state_db.is_file() and str(journal_mode).casefold() == "wal",
         "path": str(state_db),
         "exists": state_db.is_file(),
+        "journal_mode": str(journal_mode),
+        "busy_timeout_ms": int(busy_timeout),
         "schema_version": summary.get("schema_version"),
         "summary": summary,
     }
@@ -141,6 +159,84 @@ def vector_index_provenance(ledger: StateLedger, index: dict[str, Any]) -> dict[
         "active_version": active_version,
         "active_version_has_completed_batch": bool(matching_active_version),
     }
+
+
+def check_vector_staging_self_test(config: AppConfig) -> dict[str, Any]:
+    """Exercise local vector staging in a temporary store.
+
+    This writes only under the OS temporary directory and removes the temporary
+    directory on success/failure. It does not read Zotero, submit extraction
+    jobs, or call embedding providers.
+    """
+
+    root = Path(tempfile.gettempdir()) / "zoterorag-diagnostics"
+    root.mkdir(parents=True, exist_ok=True)
+    store: LocalVectorStore | None = None
+    tmp = root / f"vector-staging-{uuid.uuid4().hex}"
+    try:
+        tmp.mkdir(parents=True, exist_ok=False)
+        store = LocalVectorStore(tmp / "vectors.sqlite", profile_name="diagnostic", dimension=3)
+        first = VectorRecord(
+            record_id="record-a",
+            document_id="doc-a",
+            chunk_id="chunk-a",
+            vector=[1.0, 0.0, 0.0],
+            text="first staged version",
+            modality="text",
+        )
+        store.upsert([first], index_version="batch-1")
+        before_publish = store.search([1.0, 0.0, 0.0], top_k=1, modality="text")
+        store.publish_version("batch-1")
+        after_publish = store.search([1.0, 0.0, 0.0], top_k=1, modality="text")
+
+        replacement = VectorRecord(
+            record_id="record-a",
+            document_id="doc-a",
+            chunk_id="chunk-a",
+            vector=[0.0, 1.0, 0.0],
+            text="replacement staged version",
+            modality="text",
+        )
+        store.upsert([replacement], index_version="batch-2")
+        active_during_rebuild = store.search([1.0, 0.0, 0.0], top_k=1, modality="text")
+        store.publish_version("batch-2")
+        after_republish = store.search([0.0, 1.0, 0.0], top_k=1, modality="text")
+        counts = store.counts()
+        store.close()
+        store = None
+
+        ok = (
+            before_publish == []
+            and bool(after_publish)
+            and after_publish[0]["text"] == "first staged version"
+            and bool(active_during_rebuild)
+            and active_during_rebuild[0]["text"] == "first staged version"
+            and bool(after_republish)
+            and after_republish[0]["text"] == "replacement staged version"
+            and counts == {"documents": 1, "chunks": 1}
+        )
+        return {
+            "ok": ok,
+            "enabled": True,
+            "status": "passed" if ok else "failed",
+            "temp_root": str(root),
+            "checks": {
+                "staged_invisible_before_publish": before_publish == [],
+                "published_visible": bool(after_publish)
+                and after_publish[0]["text"] == "first staged version",
+                "replacement_invisible_before_republish": bool(active_during_rebuild)
+                and active_during_rebuild[0]["text"] == "first staged version",
+                "replacement_visible_after_republish": bool(after_republish)
+                and after_republish[0]["text"] == "replacement staged version",
+                "counts_after_republish": counts,
+            },
+        }
+    except Exception as exc:
+        return {"ok": False, "enabled": True, "status": "error", "error": str(exc)}
+    finally:
+        if store is not None:
+            store.close()
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def check_api_access(config: AppConfig) -> dict[str, Any]:

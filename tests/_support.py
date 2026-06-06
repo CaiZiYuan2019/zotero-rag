@@ -6,13 +6,14 @@ import importlib
 import inspect
 from pathlib import Path
 import shutil
+import tempfile
 from typing import Any
 import unittest
 import uuid
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WORK_TMP = Path.home() / ".codex" / "memories" / "zoterorag-test-work"
+WORK_TMP = Path(tempfile.gettempdir()) / "zoterorag-test-work"
 
 
 class OptionalModuleTestCase(unittest.TestCase):

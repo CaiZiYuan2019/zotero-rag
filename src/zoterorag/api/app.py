@@ -31,6 +31,11 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
     except ImportError as exc:  # pragma: no cover - depends on optional package
         raise RuntimeError("FastAPI is not installed. Install zotero-rag[api].") from exc
 
+    # With postponed annotations enabled, FastAPI resolves the dependency
+    # signature through module globals. Request is imported lazily to keep the
+    # API extra optional, so expose it here before route functions are defined.
+    globals()["Request"] = Request
+
     config, ledger = initialize_runtime(config_path)
     app = FastAPI(title="ZoteroRAG", version="0.1.0")
 
@@ -60,8 +65,13 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
         }
 
     @app.get("/diagnostics", dependencies=[Depends(require_access)])
-    def diagnostics(verify_vectors: bool = False) -> dict[str, Any]:
-        return run_runtime_diagnostics(config, ledger, verify_vectors=verify_vectors)
+    def diagnostics(verify_vectors: bool = False, self_test_vector_store: bool = False) -> dict[str, Any]:
+        return run_runtime_diagnostics(
+            config,
+            ledger,
+            verify_vectors=verify_vectors,
+            self_test_vector_store=self_test_vector_store,
+        )
 
     @app.get("/providers/status", dependencies=[Depends(require_access)])
     def providers_status() -> dict[str, Any]:

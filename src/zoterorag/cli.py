@@ -48,6 +48,11 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--check", action="store_true", help="Only validate bind/auth settings without starting Uvicorn.")
     doctor = sub.add_parser("doctor", help="Run non-invasive local readiness diagnostics.")
     doctor.add_argument("--verify-vectors", action="store_true")
+    doctor.add_argument(
+        "--self-test-vector-store",
+        action="store_true",
+        help="Create a temporary local vector index to verify staged publish semantics.",
+    )
     progress = sub.add_parser("progress", help="Show detailed local build progress without executing workers.")
     progress.add_argument("--no-ingest-plan", action="store_true")
     progress.add_argument("--recent-limit", type=int, default=10)
@@ -295,7 +300,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "doctor":
-            result = run_runtime_diagnostics(config, ledger, verify_vectors=args.verify_vectors)
+            result = run_runtime_diagnostics(
+                config,
+                ledger,
+                verify_vectors=args.verify_vectors,
+                self_test_vector_store=args.self_test_vector_store,
+            )
             emit(result)
             return 0 if result["ok"] else 1
 

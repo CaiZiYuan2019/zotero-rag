@@ -38,7 +38,16 @@ class StateLedger:
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.db_path, isolation_level=None, timeout=30)
+        self.conn = sqlite3.connect(
+            self.db_path,
+            isolation_level=None,
+            timeout=30,
+            # FastAPI runs synchronous route handlers in a thread pool. The
+            # state ledger is still a single SQLite connection with explicit
+            # transactions; this flag only permits API status/read handlers to
+            # use that connection from the worker thread that FastAPI selects.
+            check_same_thread=False,
+        )
         self.conn.row_factory = sqlite3.Row
         self._configure()
         self.migrate()

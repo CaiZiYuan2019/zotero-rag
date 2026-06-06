@@ -46,6 +46,7 @@ Thumbs.db
 .idea/
 .vscode/
 .tmp/
+.tmp-test-work/
 
 # MinerU example
 mineru_example/

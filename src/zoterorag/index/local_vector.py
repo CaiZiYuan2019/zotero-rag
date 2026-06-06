@@ -48,6 +48,10 @@ class LocalVectorStore:
         self._migrate()
 
     def close(self) -> None:
+        try:
+            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            pass
         self.conn.close()
 
     def _migrate(self) -> None:
