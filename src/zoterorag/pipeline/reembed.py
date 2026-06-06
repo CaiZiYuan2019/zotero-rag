@@ -6,14 +6,16 @@ from typing import Any
 
 from ..db import JobEvent, StateLedger
 from ..embeddings import index_normalized_document
-from ..embeddings.indexer import require_embedding_profile
+from ..embeddings.indexer import require_embedding_profile, vector_path_for_profile
 from ..embeddings.profile import embedding_profile_hash
+from ..index import LocalVectorStore
 
 
 def create_reembed_plan(
     ledger: StateLedger,
     *,
     profile_name: str,
+    vector_store_dir: str | Path | None = None,
     document_id: str | None = None,
     force: bool = False,
 ) -> dict[str, Any]:
@@ -29,13 +31,20 @@ def create_reembed_plan(
     if document_id is not None:
         artifacts = [artifact for artifact in artifacts if artifact["document_id"] == document_id]
     documents = [
-        plan_normalized_document(ledger, artifact=artifact, profile=profile, force=force)
+        plan_normalized_document(
+            ledger,
+            artifact=artifact,
+            profile=profile,
+            force=force,
+            vector_store_dir=vector_store_dir,
+        )
         for artifact in artifacts
     ]
     return {
         "profile_name": profile_name,
         "profile_hash": embedding_profile_hash(profile),
         "document_id": document_id,
+        "vector_store_dir": str(vector_store_dir) if vector_store_dir is not None else None,
         "force": force,
         "from_normalized": True,
         "summary": summarize_reembed_plan(documents),
@@ -70,6 +79,7 @@ def start_reembed_job(
     plan = create_reembed_plan(
         ledger,
         profile_name=profile_name,
+        vector_store_dir=vector_store_dir,
         document_id=document_id,
         force=force,
     )
@@ -163,6 +173,7 @@ def plan_normalized_document(
     artifact: dict[str, Any],
     profile: dict[str, Any],
     force: bool,
+    vector_store_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     profile_hash = embedding_profile_hash(profile)
     profile_name = profile["name"]
@@ -170,6 +181,18 @@ def plan_normalized_document(
     chunks = ledger.list_chunks(artifact["document_id"], chunk_type=chunk_type)
     stage_name = f"embed:{profile_name}"
     checkpoint = ledger.get_checkpoint(artifact["document_id"], stage_name)
+    active_vector = active_document_vector_state(
+        profile=profile,
+        document_id=artifact["document_id"],
+        chunk_type=chunk_type,
+        vector_store_dir=vector_store_dir,
+    )
+    active_vector_chunks = active_vector["chunk_count"]
+    active_profile_hashes = active_vector["profile_hashes"]
+    active_vectors_match_profile = (
+        active_vector_chunks == len(chunks)
+        and active_profile_hashes == [profile_hash]
+    )
     status = "pending"
     reason = "not_indexed"
     checkpoint_hash = None
@@ -178,11 +201,16 @@ def plan_normalized_document(
         reason = f"no_{chunk_type}_chunks"
     elif checkpoint is not None and checkpoint["status"] == "indexed" and not force:
         checkpoint_hash = checkpoint.get("payload", {}).get("profile_hash")
-        if checkpoint_hash == profile_hash:
+        if checkpoint_hash == profile_hash and active_vectors_match_profile:
             status = "done"
             reason = "up_to_date"
+        elif checkpoint_hash == profile_hash:
+            reason = "checkpoint_without_active_vectors"
         else:
             reason = "missing_profile_hash" if checkpoint_hash is None else "profile_changed"
+    elif active_vectors_match_profile and not force:
+        status = "done"
+        reason = "active_vectors_present"
     elif checkpoint is not None and force:
         reason = "full_rebuild"
     return {
@@ -193,9 +221,38 @@ def plan_normalized_document(
         "checkpoint_profile_hash": checkpoint_hash,
         "chunk_type": chunk_type,
         "chunk_count": len(chunks),
+        "active_vector_chunks": active_vector_chunks,
+        "active_vector_profile_hashes": active_profile_hashes,
         "status": status,
         "reason": reason,
     }
+
+
+def active_document_vector_state(
+    *,
+    profile: dict[str, Any],
+    document_id: str,
+    chunk_type: str,
+    vector_store_dir: str | Path | None,
+) -> dict[str, Any]:
+    if vector_store_dir is None:
+        return {"chunk_count": None, "profile_hashes": []}
+    vector_path = vector_path_for_profile(vector_store_dir, str(profile["name"]))
+    if not vector_path.is_file():
+        return {"chunk_count": None, "profile_hashes": []}
+    store = LocalVectorStore(vector_path, profile_name=str(profile["name"]), dimension=int(profile["dimension"]))
+    try:
+        profile_hashes = sorted(
+            value
+            for value in store.document_metadata_values(document_id, "profile_hash", modality=chunk_type)
+            if value
+        )
+        return {
+            "chunk_count": store.document_counts(document_id, modality=chunk_type)["chunks"],
+            "profile_hashes": profile_hashes,
+        }
+    finally:
+        store.close()
 
 
 def summarize_reembed_plan(documents: list[dict[str, Any]]) -> dict[str, Any]:

@@ -14,6 +14,7 @@ from ..models import describe_embedding_profile, list_embedding_model_catalog
 from ..pipeline import (
     build_progress_report,
     cancel_ingest_job,
+    create_reembed_plan,
     pause_ingest_job,
     resume_ingest_job,
     start_ingest_job,
@@ -411,6 +412,21 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
         except NotImplementedError as exc:
             raise HTTPException(status_code=501, detail=str(exc)) from exc
         except (KeyError, RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/reembed/plan", dependencies=[Depends(require_access)])
+    def reembed_plan(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            # This endpoint is intentionally read-only. It lets operators audit
+            # long rebuild recovery state without creating a job or calling qwen.
+            return create_reembed_plan(
+                ledger,
+                vector_store_dir=config.paths.vector_store_dir,
+                profile_name=str(payload["profile_name"]),
+                document_id=payload.get("document_id"),
+                force=bool(payload.get("force", False)),
+            )
+        except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/reembed/from-normalized", dependencies=[Depends(require_access)])

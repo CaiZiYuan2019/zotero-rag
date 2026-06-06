@@ -23,6 +23,7 @@ from .normalize import normalize_markdown_document
 from .pipeline import (
     build_progress_report,
     cancel_ingest_job,
+    create_reembed_plan,
     pause_ingest_job,
     resume_ingest_job,
     start_ingest_job,
@@ -240,6 +241,7 @@ def build_parser() -> argparse.ArgumentParser:
     reembed.add_argument("--from-normalized", action="store_true", required=True)
     reembed.add_argument("--document-id", default=None)
     reembed.add_argument("--force", action="store_true")
+    reembed.add_argument("--plan-only", action="store_true", help="Return a read-only rebuild plan without creating a job.")
     reembed.add_argument("--execute", action="store_true", help="Execute local stub indexing for pending documents.")
     reembed.add_argument(
         "--allow-stub-provider",
@@ -649,6 +651,22 @@ def main(argv: list[str] | None = None) -> int:
                 emit({"ok": False, "error": "only --from-normalized is supported"})
                 return 1
             try:
+                if args.plan_only:
+                    if args.execute:
+                        emit({"ok": False, "error": "--plan-only cannot be combined with --execute"})
+                        return 1
+                    # Read-only planning must not create jobs, checkpoints, or
+                    # provider calls; it only inspects normalized/vector state.
+                    emit(
+                        create_reembed_plan(
+                            ledger,
+                            profile_name=args.profile,
+                            vector_store_dir=config.paths.vector_store_dir,
+                            document_id=args.document_id,
+                            force=args.force,
+                        )
+                    )
+                    return 0
                 emit(
                     start_reembed_job(
                         ledger,

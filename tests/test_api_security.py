@@ -86,6 +86,49 @@ require_api_token = true
             self.assertEqual(200, allowed.status_code)
             self.assertEqual({"documents": []}, allowed.json())
 
+    def test_reembed_plan_route_is_read_only(self) -> None:
+        fastapi_testclient = self.import_first_available(["fastapi.testclient"])
+        from zoterorag.api.app import create_app
+
+        with workspace_tmpdir("api-reembed-plan-") as tmpdir:
+            config_path = tmpdir / "config.toml"
+            config_path.write_text(
+                f"""
+[paths]
+zotero_db = "{(tmpdir / 'zotero.sqlite').as_posix()}"
+zotero_storage = "{(tmpdir / 'storage').as_posix()}"
+data_dir = "{(tmpdir / 'data').as_posix()}"
+
+[server]
+require_api_token = true
+
+[[embedding_profiles]]
+name = "stub_text"
+provider = "stub"
+model = "stub"
+dimension = 8
+modality = "text"
+enabled = true
+default_for_text = true
+""",
+                encoding="utf-8",
+            )
+            os.environ["ZOTERORAG_API_TOKEN"] = "expected-token"
+            app = create_app(config_path)
+            client = fastapi_testclient.TestClient(app)
+
+            planned = client.post(
+                "/reembed/plan",
+                headers={"X-API-Token": "expected-token"},
+                json={"profile_name": "stub_text"},
+            )
+            self.assertEqual(200, planned.status_code)
+            self.assertEqual("stub_text", planned.json()["profile_name"])
+
+            jobs = client.get("/jobs", headers={"X-API-Token": "expected-token"})
+            self.assertEqual(200, jobs.status_code)
+            self.assertEqual([], jobs.json()["jobs"])
+
 
 if __name__ == "__main__":
     unittest.main()

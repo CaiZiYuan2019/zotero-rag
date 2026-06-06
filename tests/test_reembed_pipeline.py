@@ -5,6 +5,7 @@ import unittest
 from tests._support import workspace_tmpdir
 from zoterorag.config import EmbeddingProfile
 from zoterorag.db import StateLedger
+from zoterorag.embeddings import index_normalized_document
 from zoterorag.normalize import normalize_markdown_document
 from zoterorag.pipeline import create_reembed_plan, start_reembed_job
 
@@ -90,6 +91,72 @@ class ReembedPipelineTests(unittest.TestCase):
                 )
                 self.assertEqual("completed", executed["job"]["status"])
                 self.assertEqual(1, len(executed["indexed"]))
+            finally:
+                ledger.close()
+
+    def test_reembed_plan_reuses_active_vectors_when_checkpoint_is_missing(self) -> None:
+        with workspace_tmpdir("reembed-active-vectors-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                seed_profiles(ledger)
+                normalized = seed_normalized_document(tmpdir, ledger)
+                index_normalized_document(
+                    ledger=ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="stub_text",
+                    document_id=normalized.document_id,
+                )
+                ledger.checkpoint(normalized.document_id, "embed:stub_text", "planned", {"lost": "indexed checkpoint"})
+
+                plan = create_reembed_plan(
+                    ledger,
+                    profile_name="stub_text",
+                    vector_store_dir=tmpdir / "vectors",
+                )
+
+                self.assertEqual("done", plan["documents"][0]["status"])
+                self.assertEqual("active_vectors_present", plan["documents"][0]["reason"])
+                self.assertEqual(1, plan["documents"][0]["active_vector_chunks"])
+                self.assertEqual({"done": 1}, plan["summary"]["status_counts"])
+            finally:
+                ledger.close()
+
+    def test_reembed_plan_rebuilds_when_profile_hash_changes(self) -> None:
+        with workspace_tmpdir("reembed-profile-change-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                seed_profiles(ledger)
+                normalized = seed_normalized_document(tmpdir, ledger)
+                index_normalized_document(
+                    ledger=ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="stub_text",
+                    document_id=normalized.document_id,
+                )
+                ledger.upsert_embedding_profiles(
+                    [
+                        EmbeddingProfile(
+                            name="stub_text",
+                            provider="stub",
+                            model="stub",
+                            dimension=8,
+                            modality="text",
+                            enabled=True,
+                            default_for_text=True,
+                            instruction_template="changed retrieval instruction",
+                        )
+                    ]
+                )
+
+                plan = create_reembed_plan(
+                    ledger,
+                    profile_name="stub_text",
+                    vector_store_dir=tmpdir / "vectors",
+                )
+
+                self.assertEqual("pending", plan["documents"][0]["status"])
+                self.assertEqual("profile_changed", plan["documents"][0]["reason"])
+                self.assertEqual(1, plan["documents"][0]["active_vector_chunks"])
             finally:
                 ledger.close()
 

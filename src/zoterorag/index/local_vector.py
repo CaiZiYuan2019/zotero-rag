@@ -294,3 +294,60 @@ class LocalVectorStore:
             (self.profile_name, version),
         ).fetchone()
         return {"documents": int(row["documents"]), "chunks": int(row["chunks"])}
+
+    def document_counts(
+        self,
+        document_id: str,
+        *,
+        modality: str | None = None,
+        index_version: str | None = None,
+    ) -> dict[str, int]:
+        version = index_version or self.active_version()
+        if modality is None:
+            row = self.conn.execute(
+                """
+                SELECT count(*) AS chunks
+                FROM vectors
+                WHERE profile_name = ? AND document_id = ? AND index_version = ?
+                """,
+                (self.profile_name, document_id, version),
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                """
+                SELECT count(*) AS chunks
+                FROM vectors
+                WHERE profile_name = ? AND document_id = ? AND modality = ? AND index_version = ?
+                """,
+                (self.profile_name, document_id, modality, version),
+            ).fetchone()
+        return {"chunks": int(row["chunks"])}
+
+    def document_metadata_values(
+        self,
+        document_id: str,
+        key: str,
+        *,
+        modality: str | None = None,
+        index_version: str | None = None,
+    ) -> set[Any]:
+        version = index_version or self.active_version()
+        if modality is None:
+            rows = self.conn.execute(
+                """
+                SELECT metadata_json
+                FROM vectors
+                WHERE profile_name = ? AND document_id = ? AND index_version = ?
+                """,
+                (self.profile_name, document_id, version),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                """
+                SELECT metadata_json
+                FROM vectors
+                WHERE profile_name = ? AND document_id = ? AND modality = ? AND index_version = ?
+                """,
+                (self.profile_name, document_id, modality, version),
+            ).fetchall()
+        return {json.loads(row["metadata_json"]).get(key) for row in rows}
