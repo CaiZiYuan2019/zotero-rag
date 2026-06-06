@@ -26,6 +26,7 @@ class IndexResult:
     modality: str
     profile_hash: str
     embedding_batch_hash: str
+    reused_existing: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -36,6 +37,7 @@ class IndexResult:
             "modality": self.modality,
             "profile_hash": self.profile_hash,
             "embedding_batch_hash": self.embedding_batch_hash,
+            "reused_existing": self.reused_existing,
         }
 
 
@@ -57,6 +59,67 @@ def index_normalized_document(
     profile_hash = embedding_profile_hash(profile)
     chunk_type = "text" if profile_modality == "text" else "image"
     chunks = ledger.list_chunks(document_id, chunk_type=chunk_type)
+    inputs = [embedding_input_for_chunk(chunk, artifact, role="document") for chunk in chunks]
+    batch_hash = embedding_batch_hash(
+        profile_hash=profile_hash,
+        document_id=document_id,
+        chunk_type=chunk_type,
+        inputs=inputs,
+    )
+    vector_path = vector_path_for_profile(vector_store_dir, profile_name)
+
+    # For expensive providers, a completed batch plus matching active vectors is
+    # enough proof to skip the provider entirely. This keeps accidental reruns
+    # from repeating qwen calls after a long indexing job has already published.
+    existing_batch = ledger.get_embedding_batch(batch_hash)
+    if (
+        existing_batch is not None
+        and existing_batch["status"] == "completed"
+        and active_vectors_match_embedding_batch(
+            vector_path=vector_path,
+            profile_name=profile_name,
+            dimension=int(profile["dimension"]),
+            document_id=document_id,
+            chunk_type=chunk_type,
+            batch_hash=batch_hash,
+            expected_chunks=len(inputs),
+        )
+    ):
+        counts = vector_index_counts(vector_path, profile_name=profile_name, dimension=int(profile["dimension"]))
+        ledger.register_vector_index(
+            profile_name=profile_name,
+            backend="sqlite-local",
+            path=vector_path,
+            document_count=counts["documents"],
+            chunk_count=counts["chunks"],
+            active=bool(profile["enabled"]),
+            active_version=counts["active_version"],
+        )
+        ledger.checkpoint(
+            document_id,
+            f"embed:{profile_name}",
+            "indexed",
+            {
+                "chunks": len(inputs),
+                "carried_forward_chunks": 0,
+                "profile_modality": profile_modality,
+                "chunk_type": chunk_type,
+                "profile_hash": profile_hash,
+                "embedding_batch_hash": batch_hash,
+                "reused_existing_embedding": True,
+            },
+        )
+        return IndexResult(
+            profile_name=profile_name,
+            document_id=document_id,
+            indexed_chunks=len(inputs),
+            vector_path=vector_path,
+            modality=chunk_type,
+            profile_hash=profile_hash,
+            embedding_batch_hash=batch_hash,
+            reused_existing=True,
+        )
+
     if provider is None and profile["provider"] != "stub" and not allow_stub_provider:
         raise NotImplementedError(
             f"embedding provider {profile['provider']} is not implemented for direct local indexing; "
@@ -69,14 +132,6 @@ def index_normalized_document(
             f"provider dimension {embedding_provider.dimension} does not match profile {profile_name} "
             f"dimension {profile['dimension']}"
         )
-
-    inputs = [embedding_input_for_chunk(chunk, artifact, role="document") for chunk in chunks]
-    batch_hash = embedding_batch_hash(
-        profile_hash=profile_hash,
-        document_id=document_id,
-        chunk_type=chunk_type,
-        inputs=inputs,
-    )
     ledger.upsert_embedding_batch(
         batch_hash=batch_hash,
         profile_name=profile_name,
@@ -106,13 +161,13 @@ def index_normalized_document(
                 "heading_path": chunk.get("heading_path", []),
                 "profile_name": profile_name,
                 "profile_hash": profile_hash,
+                "embedding_batch_hash": batch_hash,
                 "consumer_safe": chunk_type == "text",
             },
         )
         for chunk in chunks
     ]
 
-    vector_path = vector_path_for_profile(vector_store_dir, profile_name)
     store = LocalVectorStore(vector_path, profile_name=profile_name, dimension=int(profile["dimension"]))
     try:
         # Stage records under the deterministic batch hash first. Search only
@@ -180,6 +235,43 @@ def index_normalized_document(
         profile_hash=profile_hash,
         embedding_batch_hash=batch_hash,
     )
+
+
+def active_vectors_match_embedding_batch(
+    *,
+    vector_path: Path,
+    profile_name: str,
+    dimension: int,
+    document_id: str,
+    chunk_type: str,
+    batch_hash: str,
+    expected_chunks: int,
+) -> bool:
+    if expected_chunks == 0 or not vector_path.is_file():
+        return False
+    store = LocalVectorStore(vector_path, profile_name=profile_name, dimension=dimension)
+    try:
+        counts = store.document_counts(document_id, modality=chunk_type)
+        batch_hashes = {
+            value
+            for value in store.document_metadata_values(document_id, "embedding_batch_hash", modality=chunk_type)
+            if value
+        }
+        return counts["chunks"] == expected_chunks and batch_hashes == {batch_hash}
+    finally:
+        store.close()
+
+
+def vector_index_counts(vector_path: Path, *, profile_name: str, dimension: int) -> dict[str, Any]:
+    store = LocalVectorStore(vector_path, profile_name=profile_name, dimension=dimension)
+    try:
+        active_version = store.active_version()
+        return {
+            **store.counts(index_version=active_version),
+            "active_version": active_version,
+        }
+    finally:
+        store.close()
 
 
 def search_vector_index(

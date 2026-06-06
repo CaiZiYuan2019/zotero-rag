@@ -6,7 +6,13 @@ import unittest
 from tests._support import workspace_tmpdir
 from zoterorag.config import EmbeddingProfile
 from zoterorag.db import StateLedger
-from zoterorag.embeddings import StubEmbeddingProvider, index_normalized_document, search_vector_index
+from zoterorag.embeddings import (
+    EmbeddingInput,
+    EmbeddingVector,
+    StubEmbeddingProvider,
+    index_normalized_document,
+    search_vector_index,
+)
 from zoterorag.embeddings.profile import embedding_profile_hash
 from zoterorag.normalize import normalize_markdown_document
 
@@ -305,6 +311,90 @@ class EmbeddingIndexerTests(unittest.TestCase):
             finally:
                 ledger.close()
 
+    def test_indexing_reuses_completed_batch_without_provider_call(self) -> None:
+        with workspace_tmpdir("embedding-indexer-cache-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                ledger.upsert_embedding_profiles(
+                    [
+                        EmbeddingProfile(
+                            name="stub_text",
+                            provider="stub",
+                            model="stub",
+                            dimension=8,
+                            modality="text",
+                            enabled=True,
+                            default_for_text=True,
+                        )
+                    ]
+                )
+                seed_markdown_document(tmpdir, ledger, document_id="DOC_CACHE", text="cacheable evidence")
+                first_provider = CountingProvider(dimension=8)
+                first = index_normalized_document(
+                    ledger=ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="stub_text",
+                    document_id="DOC_CACHE",
+                    provider=first_provider,
+                )
+                second_provider = FailingProvider(dimension=8)
+                second = index_normalized_document(
+                    ledger=ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="stub_text",
+                    document_id="DOC_CACHE",
+                    provider=second_provider,
+                )
+
+                self.assertEqual(1, first_provider.calls)
+                self.assertTrue(second.reused_existing)
+                self.assertEqual(first.embedding_batch_hash, second.embedding_batch_hash)
+                self.assertEqual(0, second_provider.calls)
+                checkpoint = ledger.get_checkpoint("DOC_CACHE", "embed:stub_text")
+                self.assertTrue(checkpoint["payload"]["reused_existing_embedding"])
+                batches = ledger.list_embedding_batches(profile_name="stub_text", document_id="DOC_CACHE")
+                self.assertEqual(1, len(batches))
+                self.assertEqual("completed", batches[0]["status"])
+            finally:
+                ledger.close()
+
+    def test_non_stub_profile_can_reuse_completed_batch_without_provider(self) -> None:
+        with workspace_tmpdir("embedding-indexer-qwen-reuse-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                ledger.upsert_embedding_profiles(
+                    [
+                        EmbeddingProfile(
+                            name="qwen_text",
+                            provider="dashscope",
+                            model="qwen3-vl-embedding",
+                            dimension=8,
+                            modality="text",
+                            enabled=True,
+                            default_for_text=True,
+                        )
+                    ]
+                )
+                seed_markdown_document(tmpdir, ledger, document_id="DOC_QWEN", text="qwen reuse evidence")
+                first = index_normalized_document(
+                    ledger=ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="qwen_text",
+                    document_id="DOC_QWEN",
+                    allow_stub_provider=True,
+                )
+                second = index_normalized_document(
+                    ledger=ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="qwen_text",
+                    document_id="DOC_QWEN",
+                )
+
+                self.assertTrue(second.reused_existing)
+                self.assertEqual(first.embedding_batch_hash, second.embedding_batch_hash)
+            finally:
+                ledger.close()
+
 
 def seed_markdown_document(tmpdir, ledger: StateLedger, *, document_id: str, text: str):
     source_dir = tmpdir / f"mineru-{document_id}"
@@ -320,6 +410,33 @@ def seed_markdown_document(tmpdir, ledger: StateLedger, *, document_id: str, tex
     ledger.upsert_normalized_artifact(normalized.ledger_artifact())
     ledger.replace_document_chunks(normalized.document_id, normalized.chunks)
     return normalized
+
+
+class CountingProvider:
+    def __init__(self, dimension: int = 8) -> None:
+        self.name = "counting"
+        self.model = "counting"
+        self.dimension = dimension
+        self.calls = 0
+        self._stub = StubEmbeddingProvider(dimension=dimension)
+
+    def embed(self, inputs: list[EmbeddingInput]) -> list[EmbeddingVector]:
+        self.calls += 1
+        return self._stub.embed(inputs)
+
+
+class FailingProvider:
+    def __init__(self, dimension: int = 8) -> None:
+        self.name = "failing"
+        self.model = "failing"
+        self.dimension = dimension
+        self.calls = 0
+
+    def embed(self, inputs: list[EmbeddingInput]) -> list[EmbeddingVector]:
+        self.calls += 1
+        raise AssertionError(
+            "embedding provider should not be called when a completed batch is reusable"
+        )
 
 
 if __name__ == "__main__":
