@@ -10,7 +10,13 @@ from .api.server import serve_api, validate_serve_access
 from .diagnostics import run_runtime_diagnostics
 from .documents import get_document, list_documents
 from .embeddings import index_normalized_document, search_vector_index
-from .extractors import ExtractionManager, ExtractionRequest, ExtractorKeyPool, StubExtractorProvider
+from .extractors import (
+    ExtractionManager,
+    ExtractionRequest,
+    ExtractorKeyPool,
+    StubExtractorProvider,
+    build_extract_recovery_plan,
+)
 from .index import verify_vector_index
 from .models import describe_embedding_profile, list_embedding_model_catalog
 from .normalize import normalize_markdown_document
@@ -189,6 +195,9 @@ def build_parser() -> argparse.ArgumentParser:
     extract_jobs = extract_sub.add_parser("jobs", help="List persisted extraction jobs.")
     extract_jobs.add_argument("--state", default=None)
     extract_jobs.add_argument("--limit", type=int, default=50)
+    extract_recovery = extract_sub.add_parser("recovery-plan", help="Plan extraction resume actions without executing them.")
+    extract_recovery.add_argument("--state", default=None)
+    extract_recovery.add_argument("--limit", type=int, default=50)
 
     normalize = sub.add_parser("normalize", help="Normalize local Markdown extraction artifacts.")
     normalize_sub = normalize.add_subparsers(dest="normalize_command", required=True)
@@ -562,6 +571,9 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             if args.extract_command == "jobs":
                 emit({"jobs": ledger.list_extract_jobs(state=args.state, limit=args.limit)})
+                return 0
+            if args.extract_command == "recovery-plan":
+                emit(build_extract_recovery_plan(ledger.list_extract_jobs(state=args.state, limit=args.limit)))
                 return 0
 
         if args.command == "normalize":

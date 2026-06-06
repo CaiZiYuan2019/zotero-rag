@@ -82,6 +82,22 @@ class ProgressReportTests(unittest.TestCase):
                 )
                 ledger.upsert_normalized_artifact(normalized.ledger_artifact())
                 ledger.replace_document_chunks(normalized.document_id, normalized.chunks)
+                ledger.upsert_extract_job(
+                    {
+                        "job_id": "extract-running",
+                        "attachment_key": "ATT1",
+                        "pdf_sha256": "a" * 64,
+                        "selected_pages": "",
+                        "cache_key": "cache-running",
+                        "provider": "mineru",
+                        "provider_version": "api-v4-vlm",
+                        "options_hash": "options",
+                        "api_key_alias": "mineru_1",
+                        "external_job_id": "batch-running",
+                        "state": "running",
+                        "local_stage": "poll",
+                    }
+                )
                 index_normalized_document(
                     ledger=ledger,
                     vector_store_dir=tmpdir / "vectors",
@@ -98,6 +114,8 @@ class ProgressReportTests(unittest.TestCase):
                 self.assertEqual(1, report["embedding"]["batch_count"])
                 self.assertEqual({"completed": 1}, report["embedding"]["batches_by_status"])
                 self.assertEqual(1, report["embedding"]["indexed_chunk_count"])
+                self.assertEqual({"poll": 1}, report["extract_recovery"]["by_action"])
+                self.assertEqual(1, report["extract_recovery"]["resumable_without_resubmit"])
                 self.assertEqual(1, report["ingest_plan"]["document_count"])
                 self.assertIn("complete", report["ingest_plan"]["next_stages"])
                 self.assertFalse(report["eta"]["available"])

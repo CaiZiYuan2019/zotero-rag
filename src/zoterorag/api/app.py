@@ -8,6 +8,7 @@ from ..diagnostics import run_runtime_diagnostics
 from ..documents import get_document as get_document_record
 from ..documents import list_documents as list_document_records
 from ..embeddings import index_normalized_document, search_vector_index
+from ..extractors import build_extract_recovery_plan
 from ..index import verify_vector_index
 from ..models import describe_embedding_profile, list_embedding_model_catalog
 from ..pipeline import (
@@ -361,6 +362,10 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
     @app.get("/extract/jobs", dependencies=[Depends(require_access)])
     def extract_jobs(state: str | None = None, limit: int | None = 50) -> dict[str, Any]:
         return {"jobs": ledger.list_extract_jobs(state=state, limit=limit)}
+
+    @app.get("/extract/recovery-plan", dependencies=[Depends(require_access)])
+    def extract_recovery_plan(state: str | None = None, limit: int | None = 50) -> dict[str, Any]:
+        return build_extract_recovery_plan(ledger.list_extract_jobs(state=state, limit=limit))
 
     @app.get("/normalize/artifacts", dependencies=[Depends(require_access)])
     def normalized_artifacts(limit: int | None = 50) -> dict[str, Any]:

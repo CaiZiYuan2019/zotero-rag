@@ -4,6 +4,7 @@ from collections import Counter
 from typing import Any
 
 from ..db import StateLedger
+from ..extractors import build_extract_recovery_plan
 from .ingest import create_ingest_plan
 
 
@@ -30,6 +31,7 @@ def build_progress_report(
         "jobs": summarize_jobs(jobs, recent_limit=recent_limit),
         "library": summarize_library(attachments),
         "extract": summarize_extract_jobs(extract_jobs, recent_limit=recent_limit),
+        "extract_recovery": build_extract_recovery_plan(extract_jobs)["summary"],
         "normalize": summarize_normalized(ledger),
         "embedding": summarize_embedding(batches, vector_indexes, recent_limit=recent_limit),
         "eta": {"available": False, "reason": "workers_do_not_record_timing_estimates_yet"},
