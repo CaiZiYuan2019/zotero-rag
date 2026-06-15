@@ -19,7 +19,9 @@ def validate_serve_access(config: AppConfig, *, host: str | None = None) -> dict
     token_configured = bool(os.environ.get("ZOTERORAG_API_TOKEN"))
     loopback = is_loopback_host(bind_host)
     externally_visible = not loopback
-    ok = loopback or config.server.require_api_token or token_configured
+    # Binding to an external address requires a token to be configured so that
+    # request-level access control can actually enforce authentication.
+    ok = loopback or token_configured
     return {
         "ok": ok,
         "host": bind_host,
@@ -27,7 +29,7 @@ def validate_serve_access(config: AppConfig, *, host: str | None = None) -> dict
         "require_api_token": config.server.require_api_token,
         "token_configured": token_configured,
         "externally_visible": externally_visible,
-        "error": None if ok else "refusing to bind external API without token-capable access control",
+        "error": None if ok else "refusing to bind external API without a configured ZOTERORAG_API_TOKEN",
     }
 
 

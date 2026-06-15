@@ -26,6 +26,33 @@ from ..runtime import config_as_public_dict, copy_zotero_shadow, initialize_runt
 from ..search import fulltext_search, metadata_search, normalize_query_image
 from .security import AccessDenied, verify_api_access
 
+try:
+    from fastapi import HTTPException
+except ImportError:  # pragma: no cover - optional API extra
+    HTTPException = Exception  # type: ignore[misc, assignment]
+
+
+# Server-side limits for pagination and image-return parameters.
+MAX_LIST_LIMIT = 1000
+MAX_TOP_K = 100
+MAX_MAX_IMAGES = 20
+MAX_MAX_IMAGE_BYTES = 5 * 1024 * 1024
+
+
+def _clamp_int(value: Any, default: int, max_value: int) -> int:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        n = default
+    if n < 1:
+        n = default
+    return min(n, max_value)
+
+
+def _client_error(status_code: int = 400) -> HTTPException:
+    """Return a generic HTTP error to avoid leaking internal details."""
+    return HTTPException(status_code=status_code, detail="invalid request")
+
 
 def _find_project_root(start: Path) -> Path:
     path = start.resolve()
@@ -46,6 +73,18 @@ def _resolve_env_path(env_value: str, allowed_root: Path) -> Path:
         resolved.relative_to(allowed_root.resolve())
     except ValueError as exc:
         raise ValueError(f"env path must be inside project root: {env_value}") from exc
+    return resolved
+
+
+def _resolve_backup_out_dir(out_dir: str | Path, allowed_root: Path) -> Path:
+    parsed = Path(str(out_dir))
+    if ".." in parsed.parts:
+        raise ValueError(f"backup output path must not contain '..': {out_dir}")
+    resolved = (allowed_root / parsed).resolve()
+    try:
+        resolved.relative_to(allowed_root.resolve())
+    except ValueError as exc:
+        raise ValueError(f"backup output path must be inside {allowed_root}: {out_dir}") from exc
     return resolved
 
 
@@ -77,7 +116,7 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
         except AccessDenied as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
 
-    @app.get("/health")
+    @app.get("/health", dependencies=[Depends(require_access)])
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
@@ -116,10 +155,15 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
 
     @app.post("/models/embedding/activate", dependencies=[Depends(require_access)])
     def activate_embedding_model(payload: dict[str, Any]) -> dict[str, Any]:
-        activated = ledger.activate_embedding_profile(
-            profile_name=str(payload["profile_name"]),
-            mode=str(payload["mode"]),
-        )
+        try:
+            activated = ledger.activate_embedding_profile(
+                profile_name=str(payload["profile_name"]),
+                mode=str(payload["mode"]),
+            )
+        except KeyError:
+            raise _client_error(400) from None
+        except ValueError:
+            raise _client_error(400) from None
         return {"model": describe_embedding_profile(activated), **list_embedding_model_catalog(ledger)}
 
     @app.get("/vectors", dependencies=[Depends(require_access)])
@@ -132,7 +176,7 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
 
     @app.get("/jobs", dependencies=[Depends(require_access)])
     def list_jobs(kind: str | None = None, status: str | None = None, limit: int | None = 50) -> dict[str, Any]:
-        return {"jobs": ledger.list_jobs(kind=kind, status=status, limit=limit)}
+        return {"jobs": ledger.list_jobs(kind=kind, status=status, limit=_clamp_int(limit, 50, MAX_LIST_LIMIT))}
 
     @app.get("/jobs/{job_id}", dependencies=[Depends(require_access)])
     def get_job(job_id: str) -> dict[str, Any]:
@@ -173,8 +217,8 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
             return start_ingest_job(ledger, **kwargs)
         except NotImplementedError as exc:
             raise HTTPException(status_code=501, detail=str(exc)) from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ValueError:
+            raise _client_error(400) from None
 
     @app.post("/ingest/pause", dependencies=[Depends(require_access)])
     def ingest_pause(payload: dict[str, Any]) -> dict[str, Any]:
@@ -184,8 +228,11 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
                 str(payload["job_id"]),
                 reason=str(payload.get("reason", "manual pause")),
             )
-        except (KeyError, ValueError) as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except KeyError:
+            raise _client_error(400) from None
+        except ValueError as exc:
+            detail = "job not found" if "not found" in str(exc).lower() else "invalid request"
+            raise HTTPException(status_code=404 if detail == "job not found" else 400, detail=detail) from exc
 
     @app.post("/ingest/resume", dependencies=[Depends(require_access)])
     def ingest_resume(payload: dict[str, Any]) -> dict[str, Any]:
@@ -195,8 +242,11 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
                 str(payload["job_id"]),
                 reason=str(payload.get("reason", "manual resume")),
             )
-        except (KeyError, ValueError) as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except KeyError:
+            raise _client_error(400) from None
+        except ValueError as exc:
+            detail = "job not found" if "not found" in str(exc).lower() else "invalid request"
+            raise HTTPException(status_code=404 if detail == "job not found" else 400, detail=detail) from exc
 
     @app.post("/ingest/cancel", dependencies=[Depends(require_access)])
     def ingest_cancel(payload: dict[str, Any]) -> dict[str, Any]:
@@ -206,19 +256,28 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
                 str(payload["job_id"]),
                 reason=str(payload.get("reason", "manual cancel")),
             )
-        except (KeyError, ValueError) as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except KeyError:
+            raise _client_error(400) from None
+        except ValueError as exc:
+            detail = "job not found" if "not found" in str(exc).lower() else "invalid request"
+            raise HTTPException(status_code=404 if detail == "job not found" else 400, detail=detail) from exc
 
     @app.post("/review/include", dependencies=[Depends(require_access)])
     def include_attachment(payload: dict[str, Any]) -> dict[str, str]:
-        key = str(payload["attachment_key"])
+        try:
+            key = str(payload["attachment_key"])
+        except KeyError:
+            raise _client_error(400) from None
         reason = str(payload.get("reason", "manual include"))
         ledger.upsert_review_rule(key, "include", reason)
         return {"attachment_key": key, "decision": "include"}
 
     @app.post("/review/exclude", dependencies=[Depends(require_access)])
     def exclude_attachment(payload: dict[str, Any]) -> dict[str, str]:
-        key = str(payload["attachment_key"])
+        try:
+            key = str(payload["attachment_key"])
+        except KeyError:
+            raise _client_error(400) from None
         reason = str(payload.get("reason", "manual exclude"))
         ledger.upsert_review_rule(key, "exclude", reason)
         return {"attachment_key": key, "decision": "exclude"}
@@ -239,14 +298,14 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
 
     @app.get("/attachments", dependencies=[Depends(require_access)])
     def attachments(classification: str | None = None, limit: int | None = 100) -> dict[str, Any]:
-        return {"attachments": ledger.list_attachments(classification=classification, limit=limit)}
+        return {"attachments": ledger.list_attachments(classification=classification, limit=_clamp_int(limit, 100, MAX_LIST_LIMIT))}
 
     @app.get("/documents", dependencies=[Depends(require_access)])
     def documents(limit: int | None = 50, include_metadata_only: bool = True) -> dict[str, Any]:
         return {
             "documents": list_document_records(
                 ledger,
-                limit=limit,
+                limit=_clamp_int(limit, 50, MAX_LIST_LIMIT),
                 include_metadata_only=include_metadata_only,
             )
         }
@@ -265,13 +324,13 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
                 document_id,
                 include_chunks=include_chunks,
                 chunk_type=chunk_type,
-                limit=limit,
+                limit=_clamp_int(limit, 20, MAX_LIST_LIMIT),
                 consumer=consumer,  # type: ignore[arg-type]
             )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ValueError:
+            raise _client_error(400) from None
         if record is None:
-            raise HTTPException(status_code=404, detail=f"document not found: {document_id}")
+            raise HTTPException(status_code=404, detail="document not found")
         return {"document": record}
 
     @app.post("/search/metadata", dependencies=[Depends(require_access)])
@@ -282,11 +341,13 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
                     ledger,
                     query=str(payload["query"]),
                     classification=payload.get("classification"),
-                    limit=int(payload.get("limit", payload.get("top_k", 10))),
+                    limit=_clamp_int(payload.get("limit", payload.get("top_k", 10)), 10, MAX_TOP_K),
                     consumer=str(payload.get("consumer", "llm_text")),
                     rerank=bool(payload.get("rerank", False)),
                 )
             }
+        except (KeyError, ValueError):
+            raise _client_error(400) from None
         except NotImplementedError as exc:
             raise HTTPException(status_code=501, detail=str(exc)) from exc
 
@@ -298,12 +359,14 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
                     ledger,
                     query=str(payload["query"]),
                     chunk_type=payload.get("chunk_type"),
-                    limit=int(payload.get("limit", payload.get("top_k", 10))),
+                    limit=_clamp_int(payload.get("limit", payload.get("top_k", 10)), 10, MAX_TOP_K),
                     consumer=str(payload.get("consumer", "llm_text")),
                     image_return=str(payload.get("image_return", "none")),
                     rerank=bool(payload.get("rerank", False)),
                 )
             }
+        except (KeyError, ValueError):
+            raise _client_error(400) from None
         except NotImplementedError as exc:
             raise HTTPException(status_code=501, detail=str(exc)) from exc
 
@@ -321,7 +384,7 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
                     profile_name=profile["name"],
                     query=str(payload["query"]),
                     mode="text",
-                    top_k=int(payload.get("top_k", 10)),
+                    top_k=_clamp_int(payload.get("top_k", 10), 10, MAX_TOP_K),
                     consumer=str(payload.get("consumer", "llm_text")),
                     image_return="none",
                     rerank=bool(payload.get("rerank", False)),
@@ -330,8 +393,8 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
             }
         except NotImplementedError as exc:
             raise HTTPException(status_code=501, detail=str(exc)) from exc
-        except (KeyError, RuntimeError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (KeyError, RuntimeError, ValueError):
+            raise _client_error(400) from None
 
     @app.post("/search/multimodal", dependencies=[Depends(require_access)])
     def search_multimodal(payload: dict[str, Any]) -> dict[str, Any]:
@@ -340,8 +403,8 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
                 payload.get("query_image"),
                 allowed_roots=[config.paths.data_dir],
             )
-        except (FileNotFoundError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (FileNotFoundError, ValueError):
+            raise _client_error(400) from None
         try:
             profile = selected_embedding_profile(ledger, payload.get("profile_name"), mode="multimodal")
             provider = explicit_embedding_provider(payload, profile, project_root)
@@ -352,11 +415,11 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
                     profile_name=profile["name"],
                     query=str(payload.get("query_text", payload.get("query", ""))),
                     mode="multimodal",
-                    top_k=int(payload.get("top_k", 10)),
+                    top_k=_clamp_int(payload.get("top_k", 10), 10, MAX_TOP_K),
                     consumer=str(payload.get("consumer", "manual")),
                     image_return=str(payload.get("image_return", "file_ref")),
-                    max_images=int(payload.get("max_images", 5)),
-                    max_image_bytes=int(payload.get("max_image_bytes", 256 * 1024)),
+                    max_images=_clamp_int(payload.get("max_images", 5), 5, MAX_MAX_IMAGES),
+                    max_image_bytes=_clamp_int(payload.get("max_image_bytes", 256 * 1024), 256 * 1024, MAX_MAX_IMAGE_BYTES),
                     rerank=bool(payload.get("rerank", False)),
                     query_image_path=query_image.file_path if query_image else None,
                     query_image_base64=query_image.base64_data if query_image else None,
@@ -366,16 +429,25 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
             }
         except NotImplementedError as exc:
             raise HTTPException(status_code=501, detail=str(exc)) from exc
-        except (KeyError, RuntimeError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (KeyError, RuntimeError, ValueError):
+            raise _client_error(400) from None
 
     @app.post("/backup/create", dependencies=[Depends(require_access)])
     def backup_create(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            out_dir = payload["out"]
+        except KeyError:
+            raise _client_error(400) from None
+        allowed_root = config.paths.data_dir / "backups"
+        try:
+            resolved_out = _resolve_backup_out_dir(out_dir, allowed_root)
+        except ValueError:
+            raise _client_error(400) from None
         return create_backup(
             config,
             ledger,
             mode=str(payload.get("mode", "snapshot")),
-            out_dir=payload["out"],
+            out_dir=resolved_out,
             config_path=config_path,
         ).to_dict()
 
@@ -388,12 +460,14 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
         try:
             manifest_path = resolve_backup_manifest(ledger, str(payload["backup"]))
             return plan_restore_backup(config, manifest_path).to_dict()
-        except (FileNotFoundError, KeyError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except KeyError:
+            raise _client_error(400) from None
+        except (FileNotFoundError, ValueError):
+            raise _client_error(400) from None
 
     @app.get("/extract/jobs", dependencies=[Depends(require_access)])
     def extract_jobs(state: str | None = None, limit: int | None = 50) -> dict[str, Any]:
-        return {"jobs": ledger.list_extract_jobs(state=state, limit=limit)}
+        return {"jobs": ledger.list_extract_jobs(state=state, limit=_clamp_int(limit, 50, MAX_LIST_LIMIT))}
 
     @app.get("/extract/recovery-plan", dependencies=[Depends(require_access)])
     def extract_recovery_plan(state: str | None = None, limit: int | None = 50) -> dict[str, Any]:
@@ -401,7 +475,7 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
 
     @app.get("/normalize/artifacts", dependencies=[Depends(require_access)])
     def normalized_artifacts(limit: int | None = 50) -> dict[str, Any]:
-        return {"artifacts": ledger.list_normalized_artifacts(limit=limit)}
+        return {"artifacts": ledger.list_normalized_artifacts(limit=_clamp_int(limit, 50, MAX_LIST_LIMIT))}
 
     @app.get("/normalize/chunks/{document_id}", dependencies=[Depends(require_access)])
     def normalized_chunks(
@@ -409,7 +483,7 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
         chunk_type: str | None = None,
         limit: int | None = 20,
     ) -> dict[str, Any]:
-        return {"chunks": ledger.list_chunks(document_id, chunk_type=chunk_type, limit=limit)}
+        return {"chunks": ledger.list_chunks(document_id, chunk_type=chunk_type, limit=_clamp_int(limit, 20, MAX_LIST_LIMIT))}
 
     @app.get("/embed/batches", dependencies=[Depends(require_access)])
     def embed_batches(
@@ -423,7 +497,7 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
                 profile_name=profile_name,
                 document_id=document_id,
                 status=status,
-                limit=limit,
+                limit=_clamp_int(limit, 50, MAX_LIST_LIMIT),
             )
         }
 
@@ -442,8 +516,8 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
             ).to_dict()
         except NotImplementedError as exc:
             raise HTTPException(status_code=501, detail=str(exc)) from exc
-        except (KeyError, RuntimeError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (KeyError, RuntimeError, ValueError):
+            raise _client_error(400) from None
 
     @app.post("/reembed/plan", dependencies=[Depends(require_access)])
     def reembed_plan(payload: dict[str, Any]) -> dict[str, Any]:
@@ -457,8 +531,8 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
                 document_id=payload.get("document_id"),
                 force=bool(payload.get("force", False)),
             )
-        except (KeyError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (KeyError, ValueError):
+            raise _client_error(400) from None
 
     @app.post("/reembed/from-normalized", dependencies=[Depends(require_access)])
     def reembed_from_normalized(payload: dict[str, Any]) -> dict[str, Any]:
@@ -474,8 +548,8 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
             )
         except NotImplementedError as exc:
             raise HTTPException(status_code=501, detail=str(exc)) from exc
-        except (KeyError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (KeyError, ValueError):
+            raise _client_error(400) from None
 
     return app
 

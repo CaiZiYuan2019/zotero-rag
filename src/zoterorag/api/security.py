@@ -23,31 +23,21 @@ def verify_api_access(
 ) -> None:
     """Validate external API access.
 
-    If token auth is enabled, every request must provide the configured token.
-    If no token is configured, only loopback clients are accepted. This keeps a
-    new install from accidentally exposing control endpoints on the LAN.
+    If a token is configured, every request must provide it. If no token is
+    configured, only loopback clients are accepted. This keeps a new install
+    from accidentally exposing control endpoints on the LAN.
+
+    All failure paths raise :class:`AccessDenied` with the same message to avoid
+    leaking whether a token is configured.
     """
 
     token = expected_api_token()
     is_loopback = is_loopback_host(client_host)
-    if require_api_token:
-        if not token:
-            # Fresh local installs should be usable from the same machine, but
-            # must not expose control endpoints to the LAN before a token is set.
-            if is_loopback:
-                return
-            raise AccessDenied("ZOTERORAG_API_TOKEN is required for non-loopback access")
-        if supplied_token and hmac.compare_digest(supplied_token, token):
-            return
-        raise AccessDenied("invalid or missing API token")
-
-    if is_loopback:
+    if is_loopback and (not require_api_token or not token):
         return
-    if token:
-        if supplied_token and hmac.compare_digest(supplied_token, token):
-            return
-        raise AccessDenied("non-loopback access requires API token")
-    raise AccessDenied("non-loopback access requires configured API token")
+    if token and supplied_token and hmac.compare_digest(supplied_token, token):
+        return
+    raise AccessDenied("access denied")
 
 
 def is_loopback_host(client_host: str | None) -> bool:

@@ -31,13 +31,17 @@ class ApiServerTests(unittest.TestCase):
         denied = validate_serve_access(unsafe)
         self.assertFalse(denied["ok"])
         self.assertTrue(denied["externally_visible"])
+        self.assertIn("configured ZOTERORAG_API_TOKEN", denied["error"])
 
         safe_required = build_config(host="0.0.0.0", require_api_token=True)
-        self.assertTrue(validate_serve_access(safe_required)["ok"])
+        self.assertFalse(validate_serve_access(safe_required)["ok"])
 
         os.environ["ZOTERORAG_API_TOKEN"] = "expected-token"
         safe_with_token = build_config(host="0.0.0.0", require_api_token=False)
         self.assertTrue(validate_serve_access(safe_with_token)["ok"])
+
+        safe_with_required = build_config(host="0.0.0.0", require_api_token=True)
+        self.assertTrue(validate_serve_access(safe_with_required)["ok"])
 
 
 def build_config(*, host: str, require_api_token: bool) -> AppConfig:

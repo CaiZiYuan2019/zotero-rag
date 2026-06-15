@@ -129,6 +129,91 @@ default_for_text = true
             self.assertEqual(200, jobs.status_code)
             self.assertEqual([], jobs.json()["jobs"])
 
+    def test_health_endpoint_requires_access_control(self) -> None:
+        fastapi_testclient = self.import_first_available(["fastapi.testclient"])
+        from zoterorag.api.app import create_app
+
+        with workspace_tmpdir("api-health-") as tmpdir:
+            config_path = tmpdir / "config.toml"
+            config_path.write_text(
+                f"""
+[paths]
+zotero_db = "{(tmpdir / 'zotero.sqlite').as_posix()}"
+zotero_storage = "{(tmpdir / 'storage').as_posix()}"
+data_dir = "{(tmpdir / 'data').as_posix()}"
+
+[server]
+require_api_token = true
+""",
+                encoding="utf-8",
+            )
+            os.environ["ZOTERORAG_API_TOKEN"] = "expected-token"
+            app = create_app(config_path)
+            client = fastapi_testclient.TestClient(app)
+
+            denied = client.get("/health")
+            self.assertEqual(403, denied.status_code)
+
+            allowed = client.get("/health", headers={"X-API-Token": "expected-token"})
+            self.assertEqual(200, allowed.status_code)
+            self.assertEqual({"status": "ok"}, allowed.json())
+
+    def test_list_limits_are_capped(self) -> None:
+        fastapi_testclient = self.import_first_available(["fastapi.testclient"])
+        from zoterorag.api.app import create_app
+
+        with workspace_tmpdir("api-limits-") as tmpdir:
+            config_path = tmpdir / "config.toml"
+            config_path.write_text(
+                f"""
+[paths]
+zotero_db = "{(tmpdir / 'zotero.sqlite').as_posix()}"
+zotero_storage = "{(tmpdir / 'storage').as_posix()}"
+data_dir = "{(tmpdir / 'data').as_posix()}"
+
+[server]
+require_api_token = true
+""",
+                encoding="utf-8",
+            )
+            os.environ["ZOTERORAG_API_TOKEN"] = "expected-token"
+            app = create_app(config_path)
+            client = fastapi_testclient.TestClient(app)
+
+            # Very large limit is accepted but capped server-side.
+            response = client.get("/documents?limit=99999999", headers={"X-API-Token": "expected-token"})
+            self.assertEqual(200, response.status_code)
+
+    def test_backup_create_rejects_outside_output_path(self) -> None:
+        fastapi_testclient = self.import_first_available(["fastapi.testclient"])
+        from zoterorag.api.app import create_app
+
+        with workspace_tmpdir("api-backup-") as tmpdir:
+            config_path = tmpdir / "config.toml"
+            config_path.write_text(
+                f"""
+[paths]
+zotero_db = "{(tmpdir / 'zotero.sqlite').as_posix()}"
+zotero_storage = "{(tmpdir / 'storage').as_posix()}"
+data_dir = "{(tmpdir / 'data').as_posix()}"
+
+[server]
+require_api_token = true
+""",
+                encoding="utf-8",
+            )
+            os.environ["ZOTERORAG_API_TOKEN"] = "expected-token"
+            app = create_app(config_path)
+            client = fastapi_testclient.TestClient(app)
+
+            denied = client.post(
+                "/backup/create",
+                headers={"X-API-Token": "expected-token"},
+                json={"mode": "snapshot", "out": "../escape"},
+            )
+            self.assertEqual(400, denied.status_code)
+            self.assertEqual("invalid request", denied.json()["detail"])
+
 
 if __name__ == "__main__":
     unittest.main()
