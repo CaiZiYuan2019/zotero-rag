@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import builtins
 import json
 import unittest
+from unittest.mock import patch
 
 from tests._support import workspace_tmpdir
 from zoterorag.db import StateLedger
@@ -152,6 +154,65 @@ class NormalizeMarkdownTests(unittest.TestCase):
             self.assertEqual("embedding_images/img001.png", policy["embedding_relative_path"])
             self.assertEqual(100, policy["embedding_width"])
             self.assertEqual(50, policy["embedding_height"])
+
+    def test_oversized_image_reports_explicit_reason_when_pillow_is_missing(self) -> None:
+        real_import = builtins.__import__
+
+        def block_pil(name: str, *args, **kwargs):
+            if name == "PIL" or name.startswith("PIL."):
+                raise ImportError("Pillow is unavailable")
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=block_pil):
+            with workspace_tmpdir("normalize-md-no-pillow-") as tmpdir:
+                source_dir = tmpdir / "mineru"
+                images_dir = source_dir / "images"
+                images_dir.mkdir(parents=True)
+                image_path = images_dir / "large.png"
+                image_path.write_bytes(png_header(width=2000, height=1000))
+                markdown = source_dir / "full.md"
+                markdown.write_text("# Figure\n\n![Large](images/large.png)\n", encoding="utf-8")
+
+                result = normalize_markdown_document(
+                    source_markdown=markdown,
+                    output_root=tmpdir / "normalized",
+                    document_id="DOC_NO_PILLOW",
+                )
+                image_manifest = json.loads(result.image_manifest.read_text(encoding="utf-8"))
+                policy = image_manifest[0]["embedding_policy"]
+
+                self.assertEqual("pending_resize", policy["status"])
+                self.assertIsNone(policy["embedding_relative_path"])
+                self.assertIn("Pillow", policy["reason"])
+
+    def test_corrupt_image_reports_resize_failure_reason(self) -> None:
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow is not installed")
+
+        with workspace_tmpdir("normalize-md-corrupt-") as tmpdir:
+            source_dir = tmpdir / "mineru"
+            images_dir = source_dir / "images"
+            images_dir.mkdir(parents=True)
+            image_path = images_dir / "large.png"
+            # A syntactically valid PNG header with huge dimensions triggers the
+            # resize path, but the file body is truncated so Pillow fails.
+            image_path.write_bytes(png_header(width=9000, height=9000))
+            markdown = source_dir / "full.md"
+            markdown.write_text("# Figure\n\n![Large](images/large.png)\n", encoding="utf-8")
+
+            result = normalize_markdown_document(
+                source_markdown=markdown,
+                output_root=tmpdir / "normalized",
+                document_id="DOC_CORRUPT",
+            )
+            image_manifest = json.loads(result.image_manifest.read_text(encoding="utf-8"))
+            policy = image_manifest[0]["embedding_policy"]
+
+            self.assertEqual("pending_resize", policy["status"])
+            self.assertIsNone(policy["embedding_relative_path"])
+            self.assertIn("resize failed", policy["reason"])
 
 def png_header(*, width: int, height: int) -> bytes:
     return (

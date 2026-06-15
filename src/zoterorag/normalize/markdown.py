@@ -3,11 +3,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import logging
 from pathlib import Path, PurePosixPath
 import re
 import shutil
 import struct
 from typing import Any
+
+
+logger = logging.getLogger(__name__)
 
 
 MARKDOWN_IMAGE_RE = re.compile(r"(!\[[^\]]*\]\()([^)]+)(\))")
@@ -326,7 +330,11 @@ def resize_embedding_image_with_pillow(
     try:
         from PIL import Image
     except ImportError:
-        return None
+        return {
+            "status": "pending_resize",
+            "embedding_relative_path": None,
+            "reason": "Pillow is not installed; image resizing is unavailable",
+        }
 
     target = embedding_images_dir / ordered_name
     try:
@@ -345,8 +353,14 @@ def resize_embedding_image_with_pillow(
                     Image.Resampling.LANCZOS,
                 )
             save_image_with_limit(resized, target, policy, resample_filter=Image.Resampling.LANCZOS)
-    except Exception:
-        return None
+    except (OSError, ValueError) as exc:
+        logger.warning("Pillow resize failed for %s: %s", source, exc)
+        target.unlink(missing_ok=True)
+        return {
+            "status": "pending_resize",
+            "embedding_relative_path": None,
+            "reason": f"resize failed: {exc}",
+        }
 
     stat = target.stat()
     dimensions = read_image_dimensions(target)

@@ -20,6 +20,7 @@ class RuntimeDiagnosticsTests(unittest.TestCase):
             data_dir = tmpdir / "data"
             storage.mkdir()
             source_db.write_bytes(b"source-placeholder")
+            (tmpdir / ".env").write_text("BAILIAN_KEY=test-key\n", encoding="utf-8")
             config_path.write_text(
                 f"""
 [paths]
@@ -187,6 +188,7 @@ def make_config(tmpdir):
     storage = tmpdir / "storage"
     storage.mkdir(exist_ok=True)
     source_db.write_bytes(b"source-placeholder")
+    (tmpdir / ".env").write_text("BAILIAN_KEY=test-key\n", encoding="utf-8")
     config_path.write_text(
         f"""
 [paths]

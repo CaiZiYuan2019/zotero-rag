@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import unittest
+import uuid
 
 from tests._support import workspace_tmpdir
 from zoterorag.db import StateLedger
@@ -393,6 +394,159 @@ class FailingSubmitProvider:
         raise AssertionError("poll should not be called")
 
     def download(self, external_job_id: str, output_dir, *, api_key=None, source_pdf=None, options=None) -> ExtractArtifact:
+        raise AssertionError("download should not be called")
+
+
+class ExtractionManagerResumeTests(unittest.TestCase):
+    def test_resume_poll_completes_and_downloads_artifact(self) -> None:
+        with workspace_tmpdir("extract-resume-poll-") as tmpdir:
+            source = tmpdir / "paper.pdf"
+            source.write_bytes(b"%PDF-1.4 fake body")
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=RecordingProvider(),
+                )
+                first = manager.ensure_extraction(
+                    ExtractionRequest(input_file=source, attachment_key="ATT1")
+                )
+                job_id = first.job["job_id"]
+
+                # Simulate a restart at the poll stage.
+                ledger.set_extract_job_state(
+                    job_id,
+                    state="running",
+                    local_stage="poll",
+                    payload=first.job.get("payload") or {},
+                )
+                result = manager.resume_extraction(job_id)
+                self.assertEqual("downloaded", result.job["state"])
+                self.assertEqual(str(source), result.job["payload"]["source_pdf"])
+            finally:
+                ledger.close()
+
+    def test_resume_download_failure_marks_retryable(self) -> None:
+        with workspace_tmpdir("extract-resume-download-") as tmpdir:
+            source = tmpdir / "paper.pdf"
+            source.write_bytes(b"%PDF-1.4 fake body")
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=RecordingProvider(),
+                )
+                first = manager.ensure_extraction(
+                    ExtractionRequest(input_file=source, attachment_key="ATT1")
+                )
+                job_id = first.job["job_id"]
+
+                ledger.set_extract_job_state(
+                    job_id,
+                    state="completed",
+                    local_stage="download",
+                    payload=first.job.get("payload") or {},
+                )
+                failing_manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=FailingDownloadProvider(),
+                )
+                with self.assertRaises(RuntimeError):
+                    failing_manager.resume_extraction(job_id)
+
+                job = ledger.get_extract_job(job_id=job_id)
+                self.assertEqual("failed_retryable", job["state"])
+                self.assertIn("download failed", job["error_message"].lower())
+            finally:
+                ledger.close()
+
+    def test_resume_poll_failure_marks_retryable(self) -> None:
+        with workspace_tmpdir("extract-resume-poll-fail-") as tmpdir:
+            source = tmpdir / "paper.pdf"
+            source.write_bytes(b"%PDF-1.4 fake body")
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=FailingPollProvider(),
+                )
+                job_id = str(uuid.uuid4())
+                ledger.upsert_extract_job(
+                    {
+                        "job_id": job_id,
+                        "attachment_key": "ATT1",
+                        "pdf_sha256": "a" * 64,
+                        "selected_pages": "",
+                        "cache_key": "cache-1",
+                        "provider": "recording",
+                        "provider_version": "1",
+                        "options_hash": "options",
+                        "api_key_alias": "stub_stub",
+                        "external_job_id": "batch-1",
+                        "state": "running",
+                        "local_stage": "poll",
+                        "payload": {"input_file": str(source)},
+                    }
+                )
+                with self.assertRaises(RuntimeError):
+                    manager.resume_extraction(job_id)
+
+                job = ledger.get_extract_job(job_id=job_id)
+                self.assertEqual("failed_retryable", job["state"])
+                self.assertIn("poll failed", job["error_message"].lower())
+            finally:
+                ledger.close()
+
+
+class FailingDownloadProvider(RecordingProvider):
+    name = "failing-download"
+    version = "1"
+
+    def download(
+        self,
+        external_job_id: str,
+        output_dir,
+        *,
+        api_key=None,
+        source_pdf=None,
+        options=None,
+    ) -> ExtractArtifact:
+        raise RuntimeError("download failed")
+
+
+class FailingPollProvider:
+    name = "failing-poll"
+    version = "1"
+
+    def fingerprint(self, input_file, options_hash: str) -> str:
+        return "failing-poll"
+
+    def submit(
+        self,
+        input_file,
+        options_hash: str,
+        *,
+        options=None,
+        api_key=None,
+    ) -> ExtractJobState:
+        raise AssertionError("submit should not be called")
+
+    def poll(self, external_job_id: str, *, api_key=None, options=None) -> ExtractJobState:
+        raise RuntimeError("poll failed")
+
+    def download(
+        self,
+        external_job_id: str,
+        output_dir,
+        *,
+        api_key=None,
+        source_pdf=None,
+        options=None,
+    ) -> ExtractArtifact:
         raise AssertionError("download should not be called")
 
 

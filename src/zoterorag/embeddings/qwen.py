@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import mimetypes
 import random
 import time
@@ -12,7 +13,7 @@ from .base import EmbeddingInput, EmbeddingVector
 try:
     from requests.exceptions import ConnectionError as _RequestsConnectionError
     from requests.exceptions import Timeout as _RequestsTimeout
-except Exception:  # pragma: no cover - requests is an optional runtime dependency
+except ImportError:  # pragma: no cover - requests is an optional runtime dependency
     _RequestsTimeout = None
     _RequestsConnectionError = None
 
@@ -202,6 +203,7 @@ def image_data_uri_for_input(
     *,
     max_image_bytes: int,
     input_id: str | None = None,
+    allowed_roots: list[str | Path] | None = None,
 ) -> str | None:
     if item.image_base64:
         if item.image_base64.startswith("data:image/"):
@@ -212,6 +214,15 @@ def image_data_uri_for_input(
         return None
 
     path = Path(item.image_path)
+    if allowed_roots:
+        resolved = path.resolve()
+        roots = [Path(root).expanduser().resolve() for root in allowed_roots]
+        if not any(
+            _is_relative_to(resolved, root) or _is_relative_to(path, root) for root in roots
+        ):
+            raise QwenEmbeddingError(
+                f"image path is outside allowed roots for embedding input {input_id or item.input_id}: {path}"
+            )
     try:
         size = path.stat().st_size
     except FileNotFoundError as exc:
@@ -231,6 +242,14 @@ def image_data_uri_for_input(
     return f"data:{mime_type};base64,{encoded}"
 
 
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
 def raise_for_qwen_error(response: QwenResponse) -> dict[str, Any]:
     if response.status_code != 200:
         # Check the status code before attempting JSON parsing so non-JSON
@@ -238,12 +257,12 @@ def raise_for_qwen_error(response: QwenResponse) -> dict[str, Any]:
         try:
             body = response.json()
             message = body.get("message") or response.text[:500]
-        except Exception:
+        except json.JSONDecodeError:
             message = response.text[:500]
         raise QwenEmbeddingError(f"qwen embedding request failed: HTTP {response.status_code} - {message}")
     try:
         body = response.json()
-    except Exception as exc:
+    except json.JSONDecodeError as exc:
         raise QwenEmbeddingError("qwen embedding response is not valid JSON") from exc
     code = body.get("code")
     if code not in (None, "", 0):
@@ -254,6 +273,6 @@ def raise_for_qwen_error(response: QwenResponse) -> dict[str, Any]:
 def _load_requests_client() -> QwenHTTPClient:
     try:
         import requests
-    except Exception as exc:  # pragma: no cover - depends on optional runtime dependency
+    except ImportError as exc:  # pragma: no cover - depends on optional runtime dependency
         raise QwenEmbeddingError("requests is required for Qwen3VLEmbeddingProvider") from exc
     return requests

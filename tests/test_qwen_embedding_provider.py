@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import unittest
 
 from tests._support import workspace_tmpdir
@@ -150,6 +151,31 @@ class QwenEmbeddingProviderTests(unittest.TestCase):
 
         self.assertIn("not found", str(ctx.exception).lower())
 
+    def test_image_path_outside_allowed_roots_is_rejected(self) -> None:
+        with workspace_tmpdir("qwen-allowed-roots-") as tmpdir:
+            allowed = tmpdir / "allowed"
+            outside = tmpdir / "outside"
+            allowed.mkdir()
+            outside.mkdir()
+            (allowed / "ok.png").write_bytes(b"ok image")
+            (outside / "secret.png").write_bytes(b"secret image")
+
+            provider = Qwen3VLEmbeddingProvider(api_key="sk-test-secret", client=FakeQwenClient(dimension=2560))
+
+            allowed_input = EmbeddingInput(input_id="ok", text="", image_path=str(allowed / "ok.png"))
+            provider.embed([allowed_input])
+
+            outside_input = EmbeddingInput(input_id="leak", text="", image_path=str(outside / "secret.png"))
+            with self.assertRaises(QwenEmbeddingError) as ctx:
+                from zoterorag.embeddings.qwen import image_data_uri_for_input
+
+                image_data_uri_for_input(
+                    outside_input,
+                    max_image_bytes=provider.max_image_bytes,
+                    allowed_roots=[allowed],
+                )
+            self.assertIn("outside allowed roots", str(ctx.exception).lower())
+
 
 class FakeQwenResponse:
     def __init__(
@@ -167,7 +193,7 @@ class FakeQwenResponse:
 
     def json(self):
         if self._json_error:
-            raise ValueError("not valid JSON")
+            raise json.JSONDecodeError("not valid JSON", "", 0)
         return {
             "output": {
                 "embeddings": [

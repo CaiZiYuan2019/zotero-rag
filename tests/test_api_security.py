@@ -215,5 +215,92 @@ require_api_token = true
             self.assertEqual("invalid request", denied.json()["detail"])
 
 
+class ApiControlPlaneTests(OptionalModuleTestCase):
+    def setUp(self) -> None:
+        self._old_token = os.environ.pop("ZOTERORAG_API_TOKEN", None)
+
+    def tearDown(self) -> None:
+        if self._old_token is None:
+            os.environ.pop("ZOTERORAG_API_TOKEN", None)
+        else:
+            os.environ["ZOTERORAG_API_TOKEN"] = self._old_token
+
+    def _client_for(self, tmpdir):
+        fastapi_testclient = self.import_first_available(["fastapi.testclient"])
+        from zoterorag.api.app import create_app
+
+        config_path = tmpdir / "config.toml"
+        config_path.write_text(
+            f"""
+[paths]
+zotero_db = "{(tmpdir / 'zotero.sqlite').as_posix()}"
+zotero_storage = "{(tmpdir / 'storage').as_posix()}"
+data_dir = "{(tmpdir / 'data').as_posix()}"
+
+[server]
+require_api_token = true
+
+[[embedding_profiles]]
+name = "stub_text"
+provider = "stub"
+model = "stub"
+dimension = 8
+modality = "text"
+enabled = true
+default_for_text = true
+""",
+            encoding="utf-8",
+        )
+        os.environ["ZOTERORAG_API_TOKEN"] = "expected-token"
+        app = create_app(config_path)
+        return fastapi_testclient.TestClient(app)
+
+    def test_status_and_progress_endpoints(self) -> None:
+        with workspace_tmpdir("api-control-") as tmpdir:
+            client = self._client_for(tmpdir)
+            headers = {"X-API-Token": "expected-token"}
+
+            status = client.get("/status", headers=headers)
+            self.assertEqual(200, status.status_code)
+            self.assertIn("runtime", status.json())
+
+            progress = client.get("/progress", headers=headers)
+            self.assertEqual(200, progress.status_code)
+            self.assertIn("state", progress.json())
+
+    def test_models_and_ingest_plan_endpoints(self) -> None:
+        with workspace_tmpdir("api-control-") as tmpdir:
+            client = self._client_for(tmpdir)
+            headers = {"X-API-Token": "expected-token"}
+
+            models = client.get("/models/embedding", headers=headers)
+            self.assertEqual(200, models.status_code)
+            self.assertIn("models", models.json())
+
+            activate = client.post(
+                "/models/embedding/activate",
+                headers=headers,
+                json={"profile_name": "stub_text", "mode": "text"},
+            )
+            self.assertEqual(200, activate.status_code)
+
+            ingest = client.post("/ingest/start", headers=headers, json={"execute": False})
+            self.assertEqual(200, ingest.status_code)
+            self.assertEqual("planned", ingest.json()["job"]["status"])
+
+            jobs = client.get("/jobs", headers=headers)
+            self.assertEqual(200, jobs.status_code)
+            self.assertIsInstance(jobs.json()["jobs"], list)
+
+    def test_reembed_plan_endpoint(self) -> None:
+        with workspace_tmpdir("api-control-") as tmpdir:
+            client = self._client_for(tmpdir)
+            headers = {"X-API-Token": "expected-token"}
+
+            plan = client.post("/reembed/plan", headers=headers, json={"profile_name": "stub_text"})
+            self.assertEqual(200, plan.status_code)
+            self.assertEqual("stub_text", plan.json()["profile_name"])
+
+
 if __name__ == "__main__":
     unittest.main()

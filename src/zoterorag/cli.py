@@ -10,6 +10,7 @@ from .api.server import serve_api, validate_serve_access
 from .diagnostics import run_runtime_diagnostics
 from .documents import get_document, list_documents
 from .embeddings import index_normalized_document, search_vector_index
+from .embeddings.indexer import require_embedding_profile, select_profile
 from .extractors import (
     ExtractionManager,
     ExtractionRequest,
@@ -250,26 +251,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow local stub embeddings for non-stub profiles during control-plane tests.",
     )
 
-    search_vector = sub.add_parser("search-vector", help="Search local vector indexes.")
-    search_vector.add_argument("query")
-    search_vector.add_argument("--mode", choices=("text", "multimodal"), default="text")
-    search_vector.add_argument("--profile", default=None)
-    search_vector.add_argument("--top-k", type=int, default=10)
-    search_vector.add_argument("--consumer", default="llm_text", choices=("manual", "llm_text", "llm_multimodal"))
-    search_vector.add_argument("--image-return", default="none", choices=("file_ref", "base64", "none"))
-    search_vector.add_argument("--rerank", action="store_true")
-    search_vector.add_argument("--max-images", type=int, default=5)
-    search_vector.add_argument("--max-image-bytes", type=int, default=256 * 1024)
-    search_vector.add_argument("--query-image-file", default=None)
-    search_vector.add_argument("--query-image-base64", default=None)
-    search_vector.add_argument("--query-image-mime-type", default=None)
-    search_vector.add_argument(
-        "--embedding-provider",
-        choices=("stub", "qwen3vl"),
-        default="stub",
-        help="Provider used for query embedding. qwen3vl makes real API calls and must be selected explicitly.",
-    )
-    search_vector.add_argument("--env", default=".env", help="Env file containing qwen credentials when using qwen3vl.")
+    def _add_search_args(parser: argparse.ArgumentParser, *, default_mode: str, default_consumer: str) -> None:
+        parser.add_argument("query")
+        parser.add_argument("--mode", choices=("text", "multimodal"), default=default_mode)
+        parser.add_argument("--profile", default=None)
+        parser.add_argument("--top-k", type=int, default=10)
+        parser.add_argument(
+            "--consumer",
+            default=default_consumer,
+            choices=("manual", "llm_text", "llm_multimodal"),
+        )
+        parser.add_argument("--image-return", default="none" if default_mode == "text" else "file_ref", choices=("file_ref", "base64", "none"))
+        parser.add_argument("--rerank", action="store_true")
+        parser.add_argument("--max-images", type=int, default=5)
+        parser.add_argument("--max-image-bytes", type=int, default=256 * 1024)
+        parser.add_argument("--query-image-file", default=None)
+        parser.add_argument("--query-image-base64", default=None)
+        parser.add_argument("--query-image-mime-type", default=None)
+        parser.add_argument(
+            "--embedding-provider",
+            choices=("stub", "qwen3vl"),
+            default="stub",
+            help="Provider used for query embedding. qwen3vl makes real API calls and must be selected explicitly.",
+        )
+        parser.add_argument("--env", default=".env", help="Env file containing qwen credentials when using qwen3vl.")
+
+    search_vector = sub.add_parser("search-vector", aliases=["search"], help="Search local vector indexes.")
+    _add_search_args(search_vector, default_mode="text", default_consumer="llm_text")
+
+    search_mm = sub.add_parser("search-mm", help="Search local vector indexes in multimodal mode.")
+    _add_search_args(search_mm, default_mode="multimodal", default_consumer="manual")
 
     inspect = sub.add_parser("inspect-shadow", help="Read summary from an existing shadow DB.")
     inspect.add_argument("--limit", type=int, default=5)
@@ -562,7 +573,11 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "extract":
             if args.extract_command == "dry-run":
-                options = json.loads(args.options_json)
+                try:
+                    options = json.loads(args.options_json)
+                except json.JSONDecodeError as exc:
+                    emit({"ok": False, "error": f"invalid --options-json: {exc}"})
+                    return 1
                 key_pool = ExtractorKeyPool.from_env_file(args.env)
                 manager = ExtractionManager(
                     ledger=ledger,
@@ -635,7 +650,7 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     provider = None
                     if args.embedding_provider == "qwen3vl":
-                        profile = selected_embedding_profile(ledger, args.profile, mode=None)
+                        profile = require_embedding_profile(ledger, args.profile)
                         provider = build_qwen_embedding_provider(profile, args.env)
                     result = index_normalized_document(
                         ledger=ledger,
@@ -700,7 +715,7 @@ def main(argv: list[str] | None = None) -> int:
                 emit({"ok": False, "error": str(exc)})
                 return 1
 
-        if args.command == "search-vector":
+        if args.command in {"search-vector", "search", "search-mm"}:
             query_image = None
             if args.query_image_file or args.query_image_base64:
                 if args.query_image_file and args.query_image_base64:
@@ -720,12 +735,11 @@ def main(argv: list[str] | None = None) -> int:
                     return 1
             try:
                 provider = None
+                profile = select_profile(ledger, profile_name=args.profile, mode=args.mode)
                 if args.embedding_provider == "qwen3vl":
-                    profile = selected_embedding_profile(ledger, args.profile, mode=args.mode)
                     provider = build_qwen_embedding_provider(profile, args.env)
                 elif args.embedding_provider == "stub":
                     from .embeddings import StubEmbeddingProvider
-                    profile = selected_embedding_profile(ledger, args.profile, mode=args.mode)
                     provider = StubEmbeddingProvider(dimension=int(profile["dimension"]))
                 results = search_vector_index(
                     ledger=ledger,
@@ -769,23 +783,6 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"Unhandled command: {args.command}", file=sys.stderr)
     return 2
-
-
-def selected_embedding_profile(ledger, profile_name: str | None, *, mode: str | None) -> dict:
-    profiles = ledger.list_embedding_profiles()
-    if profile_name:
-        for profile in profiles:
-            if profile["name"] == profile_name:
-                return profile
-        raise KeyError(f"embedding profile not found: {profile_name}")
-    if mode is None:
-        raise ValueError("profile is required")
-    expected_modality = "text" if mode == "text" else "multimodal"
-    default_flag = "default_for_text" if mode == "text" else "default_for_multimodal"
-    for profile in profiles:
-        if profile["enabled"] and profile["modality"] == expected_modality and profile[default_flag]:
-            return profile
-    raise KeyError(f"no default {mode} embedding profile is configured")
 
 
 if __name__ == "__main__":

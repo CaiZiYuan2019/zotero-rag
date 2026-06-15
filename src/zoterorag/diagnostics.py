@@ -44,7 +44,7 @@ def run_runtime_diagnostics(
             }
         ),
         "api_access": check_api_access(config),
-        "providers": check_provider_configuration(),
+        "providers": check_provider_configuration(config.paths.data_dir.parent / ".env"),
         "external_execution": {
             "ok": True,
             "mineru_executed": False,
@@ -268,10 +268,13 @@ def check_api_access(config: AppConfig) -> dict[str, Any]:
     }
 
 
-def check_provider_configuration() -> dict[str, Any]:
-    readiness = provider_readiness(".env")
+def check_provider_configuration(env_path: str | Path = ".env") -> dict[str, Any]:
+    env_path = Path(env_path)
+    readiness = provider_readiness(env_path)
     return {
-        "ok": True,
+        "ok": env_path.is_file(),
+        "env_path": str(env_path),
+        "env_exists": env_path.is_file(),
         **readiness,
         "note": "provider diagnostics inspect configuration only and never call MinerU or qwen",
     }

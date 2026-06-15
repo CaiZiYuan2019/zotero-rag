@@ -68,9 +68,9 @@ data/
 
 ```toml
 [paths]
-zotero_db = "E:/ZoteroLib/lib/zotero.sqlite"   # Zotero 主库（只读）
-zotero_storage = "E:/ZoteroLib/lib/storage"     # Zotero 附件存储（只读）
-data_dir = "data"                                # 运行时数据根目录
+zotero_db = "<ZOTERO_DB_PATH>/zotero.sqlite"     # Zotero 主库（只读）
+zotero_storage = "<ZOTERO_STORAGE_PATH>/storage" # Zotero 附件存储（只读）
+data_dir = "data"                                # 运行时数据根目录（相对于项目根目录）
 
 [server]
 host = "127.0.0.1"                               # API 监听地址
@@ -123,10 +123,12 @@ BAILIAN_KEY=your_bailian_api_key
 ```bash
 # 设置环境变量即可启用 token 鉴权
 export ZOTERORAG_API_TOKEN="your-secret-token"
-
-# 不设置时：仅允许 loopback (127.0.0.1, ::1, localhost) 访问
-# require_api_token=false 时：非 loopback 需要 token
 ```
+
+注意：`ZOTERORAG_API_TOKEN` 目前只从 `os.environ` 读取，不会从项目 `.env` 文件加载。如需通过 `.env` 管理，请在启动服务前用 `source .env` 或等价方式将其导入当前 shell 环境。
+
+- 不设置时：仅允许 loopback (`127.0.0.1`, `::1`, `localhost`) 访问。
+- `require_api_token=false` 且未设置 token 时：非 loopback 仍会被拒绝。
 
 ---
 
@@ -662,6 +664,8 @@ curl -X POST http://127.0.0.1:8765/ingest/start \
 ## 7. MCP 工具
 
 ### 7.1 工具列表
+
+> 当前状态：以下工具函数已实现并可通过 Python API 直接调用，但尚未接入 MCP 服务器/传输层（如 `stdio`、`sse`）。因此 `zoterorag mcp` 命令或 MCP 外部调用暂时不可用，后续会补充 server 封装与启动入口。
 
 | 工具名 | 用途 | 图片安全 |
 |--------|------|---------|
