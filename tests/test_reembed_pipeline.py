@@ -61,6 +61,7 @@ class ReembedPipelineTests(unittest.TestCase):
                             modality="text",
                             enabled=True,
                             default_for_text=True,
+                            backend="sqlite-local",
                         )
                     ]
                 )
@@ -154,6 +155,7 @@ class ReembedPipelineTests(unittest.TestCase):
                             enabled=True,
                             default_for_text=True,
                             instruction_template="changed retrieval instruction",
+                            backend="sqlite-local",
                         )
                     ]
                 )
@@ -182,6 +184,7 @@ def seed_profiles(ledger: StateLedger) -> None:
                 modality="text",
                 enabled=True,
                 default_for_text=True,
+                backend="sqlite-local",
             )
         ]
     )

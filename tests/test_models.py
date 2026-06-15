@@ -30,6 +30,7 @@ class EmbeddingModelCatalogTests(unittest.TestCase):
                             query_role_mode="instruction",
                             document_role_mode="plain",
                             instruction_template="retrieve papers",
+                            backend="sqlite-local",
                         ),
                         EmbeddingProfile(
                             name="mm-profile",
@@ -39,12 +40,13 @@ class EmbeddingModelCatalogTests(unittest.TestCase):
                             modality="multimodal",
                             enabled=True,
                             default_for_multimodal=True,
+                            backend="sqlite-local",
                         ),
                     ]
                 )
                 ledger.register_vector_index(
                     profile_name="text-profile",
-                    backend="sqlite-local",
+                            backend="sqlite-local",
                     path=vector_path,
                     document_count=3,
                     chunk_count=11,

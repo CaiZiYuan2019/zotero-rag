@@ -264,6 +264,7 @@ def seed_profiles(ledger: StateLedger) -> None:
                 modality="text",
                 enabled=True,
                 default_for_text=True,
+                backend="sqlite-local",
             ),
             EmbeddingProfile(
                 name="mm-profile",
@@ -273,6 +274,7 @@ def seed_profiles(ledger: StateLedger) -> None:
                 modality="multimodal",
                 enabled=True,
                 default_for_multimodal=True,
+                backend="sqlite-local",
             ),
         ]
     )

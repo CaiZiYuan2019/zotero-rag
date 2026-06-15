@@ -114,6 +114,7 @@ def build_context(tmpdir) -> McpToolContext:
                 modality="text",
                 enabled=True,
                 default_for_text=True,
+                backend="sqlite-local",
             ),
             EmbeddingProfile(
                 name="stub_mm",
@@ -123,6 +124,7 @@ def build_context(tmpdir) -> McpToolContext:
                 modality="multimodal",
                 enabled=True,
                 default_for_multimodal=True,
+                backend="sqlite-local",
             ),
         ),
     )

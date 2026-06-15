@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import re
+import threading
 import time
 from typing import Any, Callable
 
@@ -53,6 +54,7 @@ class ExtractorKeyPool:
         self.per_key_submit_concurrency = per_key_submit_concurrency
         self._clock = clock or time.monotonic
         self._states = {key.alias: ApiKeyRuntimeState(alias=key.alias) for key in self._keys}
+        self._lock = threading.RLock()
 
     @classmethod
     def from_env_file(
@@ -80,21 +82,25 @@ class ExtractorKeyPool:
         return bool(self._keys)
 
     def list_public_keys(self) -> list[dict[str, Any]]:
-        return [
-            {
-                **key.public_dict(),
-                "in_flight": self._states[key.alias].in_flight,
-                "cooldown_remaining_seconds": round(self.cooldown_remaining(key.alias), 3),
-            }
-            for key in self._keys
-        ]
+        with self._lock:
+            return [
+                {
+                    **key.public_dict(),
+                    "in_flight": self._states[key.alias].in_flight,
+                    "cooldown_remaining_seconds": round(
+                        self._cooldown_remaining_unsafe(key.alias), 3
+                    ),
+                }
+                for key in self._keys
+            ]
 
     def next_key(self) -> ApiKeyRef | None:
-        if not self._keys:
-            return None
-        key = self._keys[self._next_index % len(self._keys)]
-        self._next_index += 1
-        return key
+        with self._lock:
+            if not self._keys:
+                return None
+            key = self._keys[self._next_index % len(self._keys)]
+            self._next_index += 1
+            return key
 
     def acquire_key(self) -> ApiKeyRef | None:
         """Reserve a key for a submit/upload worker.
@@ -103,35 +109,46 @@ class ExtractorKeyPool:
         limit or in cooldown. Only aliases should be persisted outside memory.
         """
 
-        if not self._keys:
+        with self._lock:
+            if not self._keys:
+                return None
+            now = self._clock()
+            for offset in range(len(self._keys)):
+                index = (self._next_index + offset) % len(self._keys)
+                key = self._keys[index]
+                state = self._states[key.alias]
+                if state.cooldown_until > now:
+                    continue
+                if state.in_flight >= self.per_key_submit_concurrency:
+                    continue
+                state.in_flight += 1
+                self._next_index = index + 1
+                return key
             return None
-        now = self._clock()
-        for offset in range(len(self._keys)):
-            index = (self._next_index + offset) % len(self._keys)
-            key = self._keys[index]
-            state = self._states[key.alias]
-            if state.cooldown_until > now:
-                continue
-            if state.in_flight >= self.per_key_submit_concurrency:
-                continue
-            state.in_flight += 1
-            self._next_index = index + 1
-            return key
-        return None
 
     def release_key(self, alias: str, *, cooldown_seconds: float = 0.0) -> None:
-        state = self._require_state(alias)
-        state.in_flight = max(0, state.in_flight - 1)
-        if cooldown_seconds > 0:
-            state.cooldown_until = max(state.cooldown_until, self._clock() + cooldown_seconds)
+        with self._lock:
+            state = self._require_state(alias)
+            state.in_flight = max(0, state.in_flight - 1)
+            if cooldown_seconds > 0:
+                state.cooldown_until = max(
+                    state.cooldown_until, self._clock() + cooldown_seconds
+                )
 
     def mark_key_cooldown(self, alias: str, *, cooldown_seconds: float) -> None:
         if cooldown_seconds <= 0:
             return
-        state = self._require_state(alias)
-        state.cooldown_until = max(state.cooldown_until, self._clock() + cooldown_seconds)
+        with self._lock:
+            state = self._require_state(alias)
+            state.cooldown_until = max(
+                state.cooldown_until, self._clock() + cooldown_seconds
+            )
 
     def cooldown_remaining(self, alias: str) -> float:
+        with self._lock:
+            return self._cooldown_remaining_unsafe(alias)
+
+    def _cooldown_remaining_unsafe(self, alias: str) -> float:
         state = self._require_state(alias)
         return max(0.0, state.cooldown_until - self._clock())
 

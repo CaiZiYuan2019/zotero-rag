@@ -66,7 +66,7 @@ def verify_vector_index(ledger: StateLedger, profile_name: str) -> VectorIndexVe
     registered_documents = int(index["document_count"])
     registered_chunks = int(index["chunk_count"])
     active_version = str(index.get("active_version") or "legacy")
-    backend = str(index.get("backend") or "sqlite-local")
+    backend = str(index.get("backend") or "lancedb")
 
     if backend == "lancedb":
         actual_documents, actual_chunks, dimension_errors, errors = _verify_lancedb_store(
@@ -197,6 +197,7 @@ def _verify_lancedb_store(
         try:
             table = db.open_table(table_name)
         except Exception as exc:
+            # Broad because LanceDB raises varying exception types for missing tables.
             return 0, 0, 0, [f"missing_active_table:{table_name}:{exc}"]
 
         rows = table.to_pandas().to_dict("records")
@@ -222,6 +223,7 @@ def _verify_lancedb_store(
         if dimension_errors:
             errors.append(f"dimension_errors:{dimension_errors}")
     except Exception as exc:
+        # Catch-all so a single corrupt index cannot crash the verification report.
         errors.append(f"lancedb_verification_error:{exc}")
 
     return actual_documents, actual_chunks, dimension_errors, errors

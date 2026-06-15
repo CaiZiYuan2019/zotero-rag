@@ -72,9 +72,10 @@ def index_normalized_document(
     document_id: str,
     provider: EmbeddingProvider | None = None,
     allow_stub_provider: bool = False,
-    vector_backend: str = "sqlite-local",
+    vector_backend: str | None = None,
 ) -> IndexResult:
     profile = require_embedding_profile(ledger, profile_name)
+    vector_backend = vector_backend or profile.get("backend", "lancedb")
     artifact = ledger.get_normalized_artifact(document_id)
     if artifact is None:
         raise KeyError(f"normalized artifact not found: {document_id}")
@@ -269,8 +270,9 @@ def active_vectors_match_embedding_batch(
     chunk_type: str,
     batch_hash: str,
     expected_chunks: int,
-    backend: str = "sqlite-local",
+    backend: str | None = None,
 ) -> bool:
+    backend = backend or "lancedb"
     if expected_chunks == 0:
         return False
     if backend == "sqlite-local" and not vector_path.is_file():
@@ -288,7 +290,8 @@ def active_vectors_match_embedding_batch(
         store.close()
 
 
-def vector_index_counts(vector_path: Path, *, profile_name: str, dimension: int, backend: str = "sqlite-local") -> dict[str, Any]:
+def vector_index_counts(vector_path: Path, *, profile_name: str, dimension: int, backend: str | None = None) -> dict[str, Any]:
+    backend = backend or "lancedb"
     store = open_vector_store(vector_path, profile_name=profile_name, dimension=dimension, backend=backend)
     try:
         active_version = store.active_version()
@@ -317,11 +320,12 @@ def search_vector_index(
     query_image_base64: str | None = None,
     query_image_mime_type: str | None = None,
     provider: EmbeddingProvider | None = None,
-    vector_backend: str = "sqlite-local",
+    vector_backend: str | None = None,
     allow_stub_provider: bool = True,
 ) -> list[dict[str, Any]]:
     profile = select_profile(ledger, profile_name=profile_name, mode=mode)
     profile_name = profile["name"]
+    vector_backend = vector_backend or profile.get("backend", "lancedb")
     ensure_rerank_disabled(rerank)
     if mode == "text" and (query_image_path or query_image_base64):
         raise ValueError("text search does not accept query images")
@@ -510,13 +514,14 @@ def select_profile(ledger: StateLedger, *, profile_name: str | None, mode: Searc
 def vector_path_for_profile(
     vector_store_dir: str | Path,
     profile_name: str,
-    backend: str = "sqlite-local",
+    backend: str | None = None,
 ) -> Path:
     """Return the storage path for a profile.
 
     LanceDB stores an entire database directory per profile, while the local
     SQLite backend stores a single file.
     """
+    backend = backend or "lancedb"
     profile_dir = Path(vector_store_dir) / profile_name
     if backend == "lancedb":
         return profile_dir
@@ -528,7 +533,7 @@ def _resolve_registered_vector_store(
     *,
     vector_store_dir: str | Path,
     profile_name: str,
-    fallback_backend: str = "sqlite-local",
+    fallback_backend: str | None = None,
 ) -> tuple[str, Path]:
     """Use the backend and path registered in ``vector_indexes`` when available.
 
@@ -536,6 +541,7 @@ def _resolve_registered_vector_store(
     otherwise open the wrong file type. The explicit ``fallback_backend`` is
     used only when the profile has not been registered yet.
     """
+    fallback_backend = fallback_backend or "lancedb"
     for index in ledger.list_vector_indexes():
         if index["profile_name"] == profile_name:
             return str(index["backend"]), Path(str(index["path"]))

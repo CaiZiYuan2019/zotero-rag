@@ -10,6 +10,7 @@ from ..embeddings import index_normalized_document
 from ..embeddings.indexer import require_embedding_profile, vector_path_for_profile
 from ..embeddings.profile import embedding_profile_hash
 from ..index import open_vector_store
+from ..search.results import RerankNotSupportedError
 
 
 def create_reembed_plan(
@@ -148,7 +149,7 @@ def start_reembed_job(
                     payload=result_payload,
                 )
             )
-        except (FileNotFoundError, KeyError, ValueError, RuntimeError, NotImplementedError) as exc:
+        except (FileNotFoundError, KeyError, ValueError, RuntimeError, RerankNotSupportedError) as exc:
             failed.append({"document": document, "error": str(exc)})
             ledger.add_event(
                 JobEvent(
@@ -160,6 +161,7 @@ def start_reembed_job(
                 )
             )
         except Exception as exc:
+            # Catch-all: a single misbehaving document must not abort the job.
             error_text = traceback.format_exc()
             failed.append({"document": document, "error": str(exc), "traceback": error_text})
             ledger.add_event(
@@ -262,10 +264,20 @@ def active_document_vector_state(
 ) -> dict[str, Any]:
     if vector_store_dir is None:
         return {"chunk_count": None, "profile_hashes": []}
-    vector_path = vector_path_for_profile(vector_store_dir, str(profile["name"]))
-    if not vector_path.is_file():
+    backend = profile.get("backend", "lancedb")
+    vector_path = vector_path_for_profile(
+        vector_store_dir, str(profile["name"]), backend=backend
+    )
+    if backend == "sqlite-local" and not vector_path.is_file():
         return {"chunk_count": None, "profile_hashes": []}
-    store = open_vector_store(vector_path, profile_name=str(profile["name"]), dimension=int(profile["dimension"]))
+    if backend == "lancedb" and not vector_path.is_dir():
+        return {"chunk_count": None, "profile_hashes": []}
+    store = open_vector_store(
+        vector_path,
+        profile_name=str(profile["name"]),
+        dimension=int(profile["dimension"]),
+        backend=backend,
+    )
     try:
         profile_hashes = sorted(
             value

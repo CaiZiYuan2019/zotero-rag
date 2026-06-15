@@ -145,12 +145,13 @@ default_for_multimodal = false
                             modality="text",
                             enabled=True,
                             default_for_text=True,
+                            backend="sqlite-local",
                         )
                     ]
                 )
                 ledger.register_vector_index(
                     profile_name="stub_text",
-                    backend="sqlite-local",
+                            backend="sqlite-local",
                     path=tmpdir / "vectors" / "stub_text" / "vectors.sqlite",
                     document_count=1,
                     chunk_count=3,

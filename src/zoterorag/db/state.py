@@ -663,12 +663,14 @@ class StateLedger:
             profile_json["enabled"] = bool(row["enabled"])
             profile_json["default_for_text"] = bool(row["default_for_text"])
             profile_json["default_for_multimodal"] = bool(row["default_for_multimodal"])
+            backend = profile_json.get("backend", "lancedb")
             profiles.append(
                 {
                     **dict(row),
                     "enabled": bool(row["enabled"]),
                     "default_for_text": bool(row["default_for_text"]),
                     "default_for_multimodal": bool(row["default_for_multimodal"]),
+                    "backend": backend,
                     "profile": profile_json,
                 }
             )

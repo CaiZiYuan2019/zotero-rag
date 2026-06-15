@@ -105,7 +105,7 @@ class StateLedgerTests(unittest.TestCase):
             try:
                 ledger.register_vector_index(
                     profile_name="qwen3vl_cloud_2560_text",
-                    backend="sqlite-local",
+                            backend="sqlite-local",
                     path=tmpdir / "vectors.sqlite",
                     document_count=2,
                     chunk_count=5,

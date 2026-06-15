@@ -44,6 +44,7 @@ class EmbeddingIndexerTests(unittest.TestCase):
                             modality="text",
                             enabled=True,
                             default_for_text=True,
+                            backend="sqlite-local",
                         ),
                         EmbeddingProfile(
                             name="stub_mm",
@@ -53,6 +54,7 @@ class EmbeddingIndexerTests(unittest.TestCase):
                             modality="multimodal",
                             enabled=True,
                             default_for_multimodal=True,
+                            backend="sqlite-local",
                         ),
                     ]
                 )
@@ -175,7 +177,7 @@ class EmbeddingIndexerTests(unittest.TestCase):
                 self.assertIn("omitted_reason", mm_base64_omitted_hits[0]["images"][0])
                 self.assertNotIn("base64", mm_base64_omitted_hits[0]["images"][0])
                 self.assertTrue(mm_image_query_hits)
-                with self.assertRaises(NotImplementedError):
+                with self.assertRaises(RuntimeError):
                     search_vector_index(
                         ledger=ledger,
                         vector_store_dir=tmpdir / "vectors",
@@ -216,6 +218,7 @@ class EmbeddingIndexerTests(unittest.TestCase):
                             modality="text",
                             enabled=True,
                             default_for_text=True,
+                            backend="sqlite-local",
                         )
                     ]
                 )
@@ -301,6 +304,7 @@ class EmbeddingIndexerTests(unittest.TestCase):
                             modality="text",
                             enabled=True,
                             default_for_text=True,
+                            backend="sqlite-local",
                         )
                     ]
                 )
@@ -349,6 +353,7 @@ class EmbeddingIndexerTests(unittest.TestCase):
                             modality="text",
                             enabled=True,
                             default_for_text=True,
+                            backend="sqlite-local",
                         )
                     ]
                 )
@@ -396,6 +401,7 @@ class EmbeddingIndexerTests(unittest.TestCase):
                             modality="text",
                             enabled=True,
                             default_for_text=True,
+                            backend="sqlite-local",
                         )
                     ]
                 )
@@ -434,6 +440,7 @@ class EmbeddingIndexerTests(unittest.TestCase):
                             modality="text",
                             enabled=True,
                             default_for_text=True,
+                            backend="sqlite-local",
                         )
                     ]
                 )
@@ -487,6 +494,7 @@ class EmbeddingIndexerTests(unittest.TestCase):
                             modality="text",
                             enabled=True,
                             default_for_text=True,
+                            backend="sqlite-local",
                         )
                     ]
                 )
@@ -530,6 +538,46 @@ class EmbeddingIndexerTests(unittest.TestCase):
         lancedb_path = vector_path_for_profile("/store", "p1", backend="lancedb")
         self.assertEqual(sqlite_path, Path("/store") / "p1" / "vectors.sqlite")
         self.assertEqual(lancedb_path, Path("/store") / "p1")
+
+    def test_indexer_uses_profile_backend_default(self) -> None:
+        with workspace_tmpdir("embedding-indexer-backend-default-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                ledger.upsert_embedding_profiles(
+                    [
+                        EmbeddingProfile(
+                            name="backend_text",
+                            provider="stub",
+                            model="stub",
+                            dimension=8,
+                            modality="text",
+                            enabled=True,
+                            default_for_text=True,
+                            backend="sqlite-local",
+                        )
+                    ]
+                )
+                seed_markdown_document(
+                    tmpdir, ledger, document_id="DOC_BACKEND", text="backend evidence"
+                )
+                result = index_normalized_document(
+                    ledger=ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="backend_text",
+                    document_id="DOC_BACKEND",
+                )
+                index = next(
+                    index
+                    for index in ledger.list_vector_indexes()
+                    if index["profile_name"] == "backend_text"
+                )
+                self.assertEqual("sqlite-local", index["backend"])
+                self.assertEqual(
+                    tmpdir / "vectors" / "backend_text" / "vectors.sqlite",
+                    result.vector_path,
+                )
+            finally:
+                ledger.close()
 
 
 def seed_markdown_document(tmpdir, ledger: StateLedger, *, document_id: str, text: str):

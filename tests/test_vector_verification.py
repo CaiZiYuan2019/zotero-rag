@@ -68,7 +68,7 @@ class VectorVerificationTests(unittest.TestCase):
                 self._seed_profile_and_index(ledger, tmpdir)
                 ledger.register_vector_index(
                     profile_name="p1",
-                    backend="sqlite-local",
+                            backend="sqlite-local",
                     path=tmpdir / "vectors.sqlite",
                     document_count=2,
                     chunk_count=3,
@@ -101,7 +101,7 @@ class VectorVerificationTests(unittest.TestCase):
                 )
                 ledger.register_vector_index(
                     profile_name="p1",
-                    backend="sqlite-local",
+                            backend="sqlite-local",
                     path=tmpdir / "vectors.sqlite",
                     document_count=0,
                     chunk_count=0,
@@ -136,7 +136,7 @@ class VectorVerificationTests(unittest.TestCase):
 
                 ledger.register_vector_index(
                     profile_name="p1",
-                    backend="sqlite-local",
+                            backend="sqlite-local",
                     path=tmpdir / "vectors.sqlite",
                     document_count=2,
                     chunk_count=3,
@@ -166,6 +166,7 @@ class VectorVerificationTests(unittest.TestCase):
                             modality="text",
                             enabled=True,
                             default_for_text=True,
+                            backend="sqlite-local",
                         )
                     ]
                 )
@@ -201,6 +202,7 @@ class VectorVerificationTests(unittest.TestCase):
                             modality="text",
                             enabled=True,
                             default_for_text=True,
+                            backend="sqlite-local",
                         )
                     ]
                 )
@@ -281,6 +283,7 @@ class VectorVerificationTests(unittest.TestCase):
                             modality="text",
                             enabled=True,
                             default_for_text=True,
+                            backend="sqlite-local",
                         )
                     ]
                 )
