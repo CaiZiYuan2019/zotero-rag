@@ -57,7 +57,7 @@ class ExtractionManager:
         key_pool: ExtractorKeyPool | None = None,
         failure_cooldown_seconds: float = 60.0,
         poll_interval_seconds: float = 30.0,
-        poll_timeout_seconds: float = 1800.0,
+        poll_timeout_seconds: float = 21600.0,
     ) -> None:
         self.ledger = ledger
         self.cache_dir = Path(cache_dir)
