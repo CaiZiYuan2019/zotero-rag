@@ -55,6 +55,91 @@ class RestoreResult:
         }
 
 
+def _resolve_backup_root(config: AppConfig) -> Path:
+    return (config.paths.data_dir / "backups").resolve()
+
+
+def _validate_out_dir(out_dir: str | Path, backup_root: Path) -> Path:
+    parsed = Path(out_dir).expanduser()
+    if not parsed.is_absolute():
+        parsed = backup_root / parsed
+    resolved = parsed.resolve()
+    root_resolved = backup_root.resolve()
+    if resolved != root_resolved and not resolved.is_relative_to(root_resolved):
+        raise ValueError(
+            f"backup out_dir must resolve under the configured backup root: {root_resolved}"
+        )
+    return resolved
+
+
+def _validate_backup_relative_path(relative_path: str) -> None:
+    normalized = relative_path.replace("\\", "/")
+    path = Path(normalized)
+    if path.is_absolute() or ".." in path.parts:
+        raise ValueError(
+            f"backup path must be relative and contain no '..': {relative_path}"
+        )
+
+
+def _checkpoint_state_db(ledger: StateLedger) -> None:
+    """Freeze in-process writes and checkpoint the ledger WAL.
+
+    Must be called while no other thread in this process is writing to the
+    ledger. The ledger's internal lock serializes access for the duration of the
+    checkpoint.
+    """
+    with ledger.conn as raw_conn:
+        cur = raw_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        busy, _log, _checkpointed = cur.fetchone()
+        if busy:
+            raise RuntimeError("state database checkpoint is busy; backup aborted")
+
+
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+
+
+def _is_sqlite_file(path: Path) -> bool:
+    if not path.is_file() or path.stat().st_size < len(_SQLITE_MAGIC):
+        return False
+    with path.open("rb") as handle:
+        return handle.read(len(_SQLITE_MAGIC)) == _SQLITE_MAGIC
+
+
+def _checkpoint_sqlite(path: str | Path) -> None:
+    """Checkpoint a standalone SQLite file if it is using WAL mode."""
+    db_path = Path(path)
+    if not _is_sqlite_file(db_path):
+        return
+    conn = sqlite3.connect(db_path, timeout=30.0)
+    try:
+        conn.execute("PRAGMA busy_timeout=30000")
+        journal = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        if journal != "wal":
+            return
+        cur = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        busy, _log, _checkpointed = cur.fetchone()
+        if busy:
+            raise RuntimeError(f"sqlite checkpoint is busy for {db_path}")
+    finally:
+        conn.close()
+
+
+def _checkpoint_runtime_sqlite_files(source_root: Path) -> None:
+    """Checkpoint any *.sqlite files under a runtime directory before copying.
+
+    Runtime directories may contain opaque files with a ``.sqlite`` suffix, so
+    checkpoint errors are treated as best-effort and do not abort the backup.
+    """
+    if not source_root.exists():
+        return
+    for path in source_root.rglob("*"):
+        if path.is_file() and path.suffix.lower() == ".sqlite":
+            try:
+                _checkpoint_sqlite(path)
+            except sqlite3.Error:
+                continue
+
+
 def create_backup(
     config: AppConfig,
     ledger: StateLedger,
@@ -66,8 +151,17 @@ def create_backup(
     if mode not in {"snapshot", "full"}:
         raise ValueError("mode must be 'snapshot' or 'full'")
 
+    backup_root = _resolve_backup_root(config)
+    backup_root.mkdir(parents=True, exist_ok=True)
+    validated_out = _validate_out_dir(out_dir, backup_root)
+
+    # Freeze writes to the ledger and checkpoint WAL so the state copy is
+    # internally consistent. Other SQLite runtime files are checkpointed below
+    # just before they are copied.
+    _checkpoint_state_db(ledger)
+
     backup_id = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:8]}"
-    root = Path(out_dir).expanduser().resolve() / backup_id
+    root = validated_out / backup_id
     root.mkdir(parents=True, exist_ok=False)
 
     files: list[dict[str, Any]] = []
@@ -82,14 +176,21 @@ def create_backup(
         files.append(file_manifest_entry(config_target, f"config/{config_source.name}"))
 
     if config.paths.shadow_db.is_file():
+        _checkpoint_sqlite(config.paths.shadow_db)
         shadow_target = root / "shadow" / "zotero.sqlite"
         copy_file(config.paths.shadow_db, shadow_target)
         files.append(file_manifest_entry(shadow_target, "shadow/zotero.sqlite"))
 
     if mode == "full":
-        files.extend(copy_runtime_tree(config.paths.vector_store_dir, root / "vector_store", root))
+        _checkpoint_runtime_sqlite_files(config.paths.vector_store_dir)
+        files.extend(
+            copy_runtime_tree(
+                config.paths.vector_store_dir, root / "vector_store", root
+            )
+        )
         for dirname in ("extract_cache", "normalized", "embedding_cache"):
             source = config.paths.data_dir / dirname
+            _checkpoint_runtime_sqlite_files(source)
             files.extend(copy_runtime_tree(source, root / dirname, root))
 
     manifest = {
@@ -113,7 +214,9 @@ def create_backup(
         "files": files,
     }
     manifest_path = root / BACKUP_MANIFEST
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     files.append(file_manifest_entry(manifest_path, BACKUP_MANIFEST))
 
     result = BackupResult(
@@ -180,22 +283,38 @@ def restore_backup(
     if close_ledger_before_apply:
         ledger.close()
 
+    manifest = read_manifest(planned.manifest_path)
+    expected_by_path = {
+        item["path"]: item.get("sha256") for item in manifest.get("files", [])
+    }
+    backup_root = planned.manifest_path.parent
+
     applied_files: list[dict[str, Any]] = []
+    errors: list[str] = []
     for item in planned.files:
         if not item.get("restorable", False):
             applied_files.append({**item, "applied": False})
             continue
         source = Path(item["source_path"])
         target = Path(item["target_path"])
-        restore_file(source, target)
-        applied_files.append({**item, "applied": True})
+        try:
+            restore_file(
+                source,
+                target,
+                expected_sha256=expected_by_path.get(item["path"]),
+                allowed_root=backup_root,
+            )
+            applied_files.append({**item, "applied": True})
+        except (FileNotFoundError, ValueError) as exc:
+            applied_files.append({**item, "applied": False, "error": str(exc)})
+            errors.append(f"{item['path']}: {exc}")
 
     return RestoreResult(
         manifest_path=planned.manifest_path,
         mode=planned.mode,
-        applied=True,
+        applied=confirm and not errors,
         files=applied_files,
-        errors=[],
+        errors=errors,
         pre_restore_backup=pre_restore.to_dict(),
     )
 
@@ -206,7 +325,10 @@ def resolve_backup_manifest(ledger: StateLedger, backup_ref: str | Path) -> Path
         return ref_path
     for backup in ledger.list_backups():
         if backup["backup_id"] == str(backup_ref):
-            manifest_path = Path(backup["manifest"].get("manifest_path") or Path(backup["path"]) / BACKUP_MANIFEST)
+            manifest_path = Path(
+                backup["manifest"].get("manifest_path")
+                or Path(backup["path"]) / BACKUP_MANIFEST
+            )
             return manifest_path
     raise KeyError(f"backup not found: {backup_ref}")
 
@@ -236,7 +358,9 @@ def copy_file(source: str | Path, target: str | Path) -> None:
     shutil.copy2(source_path, target_path)
 
 
-def copy_runtime_tree(source: Path, target: Path, backup_root: Path) -> list[dict[str, Any]]:
+def copy_runtime_tree(
+    source: Path, target: Path, backup_root: Path
+) -> list[dict[str, Any]]:
     if not source.exists():
         return []
     entries: list[dict[str, Any]] = []
@@ -251,7 +375,9 @@ def copy_runtime_tree(source: Path, target: Path, backup_root: Path) -> list[dic
         relative = path.relative_to(source_root)
         target_path = target / relative
         copy_file(path, target_path)
-        entries.append(file_manifest_entry(target_path, str(target_path.relative_to(backup_root))))
+        entries.append(
+            file_manifest_entry(target_path, str(target_path.relative_to(backup_root)))
+        )
     return entries
 
 
@@ -271,7 +397,32 @@ def build_restore_file_plan(
     planned: list[dict[str, Any]] = []
     for item in manifest.get("files", []):
         relative_path = str(item["path"]).replace("\\", "/")
+        try:
+            _validate_backup_relative_path(relative_path)
+        except ValueError as exc:
+            planned.append(
+                {
+                    "path": relative_path,
+                    "source_path": None,
+                    "target_path": None,
+                    "restorable": False,
+                    "reason": "invalid_relative_path",
+                    "error": str(exc),
+                }
+            )
+            continue
         source = (root / relative_path).resolve()
+        if not source.is_relative_to(root.resolve()):
+            planned.append(
+                {
+                    "path": relative_path,
+                    "source_path": str(source),
+                    "target_path": None,
+                    "restorable": False,
+                    "reason": "path_escapes_backup_root",
+                }
+            )
+            continue
         target = restore_target_for_relative_path(config, relative_path)
         if target is None:
             planned.append(
@@ -295,7 +446,9 @@ def build_restore_file_plan(
     return planned
 
 
-def restore_target_for_relative_path(config: AppConfig, relative_path: str) -> Path | None:
+def restore_target_for_relative_path(
+    config: AppConfig, relative_path: str
+) -> Path | None:
     if relative_path == "state/state.sqlite":
         return config.paths.state_db
     if relative_path == "shadow/zotero.sqlite":
@@ -323,14 +476,29 @@ def ensure_restore_target_allowed(config: AppConfig, target: Path) -> None:
     raise ValueError(f"restore target escapes runtime data directory: {target}")
 
 
-def restore_file(source: str | Path, target: str | Path) -> None:
+def restore_file(
+    source: str | Path,
+    target: str | Path,
+    *,
+    expected_sha256: str | None = None,
+    allowed_root: Path | None = None,
+) -> None:
     source_path = Path(source)
     target_path = Path(target)
+    if allowed_root is not None:
+        resolved_source = source_path.resolve()
+        resolved_root = allowed_root.resolve()
+        if not resolved_source.is_relative_to(resolved_root):
+            raise ValueError(f"restore source escapes allowed root: {source_path}")
     if not source_path.is_file():
         raise FileNotFoundError(f"backup file missing during restore: {source_path}")
     target_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_target = target_path.with_name(f"{target_path.name}.restore_tmp")
     shutil.copy2(source_path, temporary_target)
+    if expected_sha256 is not None:
+        if sha256_file(temporary_target) != expected_sha256:
+            temporary_target.unlink(missing_ok=True)
+            raise ValueError(f"sha256 mismatch for {source_path}")
     temporary_target.replace(target_path)
 
 
@@ -358,13 +526,23 @@ def verify_manifest_files(manifest_path: str | Path) -> list[str]:
     root = manifest_file.parent
     errors = []
     for item in manifest.get("files", []):
-        path = root / item["path"]
-        if not path.is_file():
+        relative_path = str(item["path"]).replace("\\", "/")
+        try:
+            _validate_backup_relative_path(relative_path)
+        except ValueError:
+            errors.append(f"invalid_path:{item['path']}")
+            continue
+        path = root / relative_path
+        resolved = path.resolve()
+        if not resolved.is_relative_to(root.resolve()):
+            errors.append(f"escape:{item['path']}")
+            continue
+        if not resolved.is_file():
             errors.append(f"missing:{item['path']}")
             continue
-        if path.stat().st_size != item["size"]:
+        if resolved.stat().st_size != item["size"]:
             errors.append(f"size:{item['path']}")
             continue
-        if sha256_file(path) != item["sha256"]:
+        if sha256_file(resolved) != item["sha256"]:
             errors.append(f"sha256:{item['path']}")
     return errors
