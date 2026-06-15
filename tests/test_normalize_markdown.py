@@ -5,7 +5,7 @@ import unittest
 
 from tests._support import workspace_tmpdir
 from zoterorag.db import StateLedger
-from zoterorag.normalize import normalize_markdown_document
+from zoterorag.normalize import ImagePolicy, normalize_markdown_document
 
 
 class NormalizeMarkdownTests(unittest.TestCase):
@@ -121,6 +121,37 @@ class NormalizeMarkdownTests(unittest.TestCase):
             self.assertEqual(2, image_chunks[0]["metadata"]["image_run_count"])
             self.assertEqual("pending_resize", image_chunks[0]["metadata"]["image_embedding_status"])
             self.assertIsNone(image_chunks[0]["metadata"]["image_embedding_path"])
+
+    def test_oversized_image_gets_resized_embedding_derivative_when_pillow_is_available(self) -> None:
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow is not installed")
+
+        with workspace_tmpdir("normalize-md-resize-") as tmpdir:
+            source_dir = tmpdir / "mineru"
+            images_dir = source_dir / "images"
+            images_dir.mkdir(parents=True)
+            image_path = images_dir / "large.png"
+            Image.new("RGB", (240, 120), color=(12, 34, 56)).save(image_path)
+            markdown = source_dir / "full.md"
+            markdown.write_text("# Figure\n\n![Large](images/large.png)\n", encoding="utf-8")
+
+            result = normalize_markdown_document(
+                source_markdown=markdown,
+                output_root=tmpdir / "normalized",
+                document_id="DOC_RESIZE",
+                image_policy=ImagePolicy(embedding_max_long_edge=100),
+            )
+            image_manifest = json.loads(result.image_manifest.read_text(encoding="utf-8"))
+            policy = image_manifest[0]["embedding_policy"]
+
+            self.assertTrue((result.artifact_dir / "images" / "img001.png").is_file())
+            self.assertTrue((result.artifact_dir / "embedding_images" / "img001.png").is_file())
+            self.assertEqual("ready_resized", policy["status"])
+            self.assertEqual("embedding_images/img001.png", policy["embedding_relative_path"])
+            self.assertEqual(100, policy["embedding_width"])
+            self.assertEqual(50, policy["embedding_height"])
 
 def png_header(*, width: int, height: int) -> bytes:
     return (

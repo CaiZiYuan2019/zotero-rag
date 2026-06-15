@@ -22,6 +22,8 @@ class ImagePolicy:
     embedding_dir_name: str = "embedding_images"
     embedding_max_long_edge: int = 1600
     embedding_max_bytes: int = 5 * 1024 * 1024
+    embedding_resize_enabled: bool = True
+    embedding_min_long_edge: int = 64
 
 
 @dataclass(frozen=True)
@@ -280,6 +282,15 @@ def prepare_embedding_image(
     """
 
     if "exceeds_embedding_limits" in quality_flags:
+        if policy.embedding_resize_enabled:
+            resized = resize_embedding_image_with_pillow(
+                source=source,
+                embedding_images_dir=embedding_images_dir,
+                ordered_name=ordered_name,
+                policy=policy,
+            )
+            if resized is not None:
+                return resized
         return {
             "status": "pending_resize",
             "embedding_relative_path": None,
@@ -295,6 +306,100 @@ def prepare_embedding_image(
         "embedding_sha256": sha256_file(embedding_target),
         "embedding_size": stat.st_size,
     }
+
+
+def resize_embedding_image_with_pillow(
+    *,
+    source: Path,
+    embedding_images_dir: Path,
+    ordered_name: str,
+    policy: ImagePolicy,
+) -> dict[str, Any] | None:
+    """Resize/compress an embedding derivative with optional Pillow.
+
+    Pillow is deliberately imported lazily so the control plane remains usable
+    without optional image dependencies. If Pillow cannot decode the file or
+    cannot bring it under provider limits, callers keep the explicit
+    `pending_resize` state instead of using the original image.
+    """
+
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+
+    target = embedding_images_dir / ordered_name
+    try:
+        with Image.open(source) as image:
+            image.load()
+            resized = image.copy()
+            original_width, original_height = resized.size
+            long_edge = max(original_width, original_height)
+            if long_edge > policy.embedding_max_long_edge:
+                scale = policy.embedding_max_long_edge / long_edge
+                resized = resized.resize(
+                    (
+                        max(1, int(round(original_width * scale))),
+                        max(1, int(round(original_height * scale))),
+                    ),
+                    Image.Resampling.LANCZOS,
+                )
+            save_image_with_limit(resized, target, policy, resample_filter=Image.Resampling.LANCZOS)
+    except Exception:
+        return None
+
+    stat = target.stat()
+    dimensions = read_image_dimensions(target)
+    if stat.st_size > policy.embedding_max_bytes:
+        target.unlink(missing_ok=True)
+        return None
+    return {
+        "status": "ready_resized",
+        "embedding_relative_path": str(PurePosixPath(embedding_images_dir.name) / ordered_name),
+        "embedding_sha256": sha256_file(target),
+        "embedding_size": stat.st_size,
+        "embedding_width": dimensions.get("width"),
+        "embedding_height": dimensions.get("height"),
+        "embedding_pixel_count": dimensions.get("pixel_count"),
+    }
+
+
+def save_image_with_limit(image: Any, target: Path, policy: ImagePolicy, *, resample_filter: Any) -> None:
+    image_format = image.format or target.suffix.lower().lstrip(".") or "png"
+    save_format = "JPEG" if image_format.lower() in {"jpg", "jpeg"} else image_format.upper()
+    if save_format == "JPG":
+        save_format = "JPEG"
+
+    candidate = image
+    quality_values = [92, 85, 75, 65, 55]
+    for quality in quality_values:
+        save_image_candidate(candidate, target, save_format, quality=quality)
+        if target.stat().st_size <= policy.embedding_max_bytes:
+            return
+
+    while max(candidate.size) > policy.embedding_min_long_edge:
+        scale = 0.85
+        candidate = candidate.resize(
+            (
+                max(1, int(round(candidate.size[0] * scale))),
+                max(1, int(round(candidate.size[1] * scale))),
+            ),
+            resample_filter,
+        )
+        save_image_candidate(candidate, target, save_format, quality=65)
+        if target.stat().st_size <= policy.embedding_max_bytes:
+            return
+
+
+def save_image_candidate(image: Any, target: Path, save_format: str, *, quality: int) -> None:
+    save_kwargs: dict[str, Any] = {}
+    if save_format == "JPEG":
+        if image.mode not in {"RGB", "L"}:
+            image = image.convert("RGB")
+        save_kwargs.update({"quality": quality, "optimize": True})
+    elif save_format == "PNG":
+        save_kwargs.update({"optimize": True})
+    image.save(target, format=save_format, **save_kwargs)
 
 
 def assign_image_runs(images: list[dict[str, Any]], markdown_text: str) -> list[dict[str, Any]]:
