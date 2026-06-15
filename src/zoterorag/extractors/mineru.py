@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import re
+import shutil
 import zipfile
 from typing import Any, Protocol
 
@@ -303,10 +304,27 @@ def raise_for_mineru_api_error(
     return body
 
 
+def _zip_member_is_symlink(member: zipfile.ZipInfo) -> bool:
+    # ZipInfo stores Unix st_mode in the high 16 bits of external_attr.
+    # S_IFLNK == 0o120000, so the file-type nibble is 0o12.
+    if member.create_system != 3:  # not Unix
+        return False
+    st_mode = member.external_attr >> 16
+    return (st_mode & 0o170000) == 0o120000
+
+
 def safe_extract_zip(zip_path: Path, output_dir: Path) -> None:
     root = output_dir.resolve()
+    root.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path, "r") as archive:
         for member in archive.infolist():
+            if member.is_dir():
+                continue
+            if _zip_member_is_symlink(member):
+                raise MinerUAPIError(
+                    f"ZIP member is a symlink and not allowed: {member.filename}",
+                    stage="extract",
+                )
             target = (output_dir / member.filename).resolve()
             try:
                 target.relative_to(root)
@@ -315,7 +333,9 @@ def safe_extract_zip(zip_path: Path, output_dir: Path) -> None:
                     f"Unsafe ZIP member path from MinerU result: {member.filename}",
                     stage="extract",
                 ) from exc
-        archive.extractall(output_dir)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(member) as src, target.open("wb") as dst:
+                shutil.copyfileobj(src, dst)
 
 
 def sanitize_data_id(text: str) -> str:

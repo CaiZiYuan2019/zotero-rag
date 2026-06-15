@@ -82,6 +82,14 @@ class MinerUProviderTests(unittest.TestCase):
             with self.assertRaises(MinerUAPIError):
                 safe_extract_zip(zip_path, tmpdir / "out")
 
+    def test_safe_extract_rejects_zip_symlink(self) -> None:
+        with workspace_tmpdir("mineru-zip-") as tmpdir:
+            zip_path = tmpdir / "bad.zip"
+            zip_path.write_bytes(build_zip_with_symlink("secret.txt", "/etc/passwd"))
+            with self.assertRaises(MinerUAPIError) as ctx:
+                safe_extract_zip(zip_path, tmpdir / "out")
+            self.assertIn("symlink", str(ctx.exception))
+
 
 class FakeResponse:
     def __init__(
@@ -157,6 +165,16 @@ def build_zip(files: dict[str, str]) -> bytes:
     with zipfile.ZipFile(buffer, "w") as archive:
         for name, content in files.items():
             archive.writestr(name, content)
+    return buffer.getvalue()
+
+
+def build_zip_with_symlink(link_name: str, target: str) -> bytes:
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        info = zipfile.ZipInfo(link_name)
+        info.create_system = 3  # Unix
+        info.external_attr = 0o120777 << 16  # symlink
+        archive.writestr(info, target)
     return buffer.getvalue()
 
 
