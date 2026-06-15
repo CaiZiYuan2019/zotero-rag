@@ -27,6 +27,28 @@ from ..search import fulltext_search, metadata_search, normalize_query_image
 from .security import AccessDenied, verify_api_access
 
 
+def _find_project_root(start: Path) -> Path:
+    path = start.resolve()
+    for parent in [path, *path.parents]:
+        if (parent / "pyproject.toml").is_file() or (parent / ".git").is_dir():
+            return parent
+    return path
+
+
+def _resolve_env_path(env_value: str, allowed_root: Path) -> Path:
+    if not env_value:
+        raise ValueError("env path is required")
+    parsed = Path(env_value)
+    if ".." in parsed.parts:
+        raise ValueError(f"env path must not contain '..': {env_value}")
+    resolved = (allowed_root / parsed).resolve()
+    try:
+        resolved.relative_to(allowed_root.resolve())
+    except ValueError as exc:
+        raise ValueError(f"env path must be inside project root: {env_value}") from exc
+    return resolved
+
+
 def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
     try:
         from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -39,6 +61,7 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
     globals()["Request"] = Request
 
     config, ledger = initialize_runtime(config_path)
+    project_root = _find_project_root(Path(config_path))
     app = FastAPI(title="ZoteroRAG", version="0.1.0")
 
     def require_access(
@@ -142,7 +165,7 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
             )
             if execute:
                 kwargs["extract_manager"] = _build_extract_manager(
-                    ledger, config.paths.extract_cache_dir, str(payload.get("env", ".env"))
+                    ledger, config.paths.extract_cache_dir, str(payload.get("env", ".env")), project_root
                 )
                 kwargs["extract_cache_dir"] = config.paths.extract_cache_dir
                 kwargs["normalized_dir"] = config.paths.normalized_dir
@@ -290,7 +313,7 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
             raise HTTPException(status_code=400, detail="text search does not accept query_image")
         try:
             profile = selected_embedding_profile(ledger, payload.get("profile_name"), mode="text")
-            provider = explicit_embedding_provider(payload, profile)
+            provider = explicit_embedding_provider(payload, profile, project_root)
             return {
                 "results": search_vector_index(
                     ledger=ledger,
@@ -321,7 +344,7 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         try:
             profile = selected_embedding_profile(ledger, payload.get("profile_name"), mode="multimodal")
-            provider = explicit_embedding_provider(payload, profile)
+            provider = explicit_embedding_provider(payload, profile, project_root)
             return {
                 "results": search_vector_index(
                     ledger=ledger,
@@ -408,7 +431,7 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
     def embed_index_normalized(payload: dict[str, Any]) -> dict[str, Any]:
         try:
             profile = selected_embedding_profile(ledger, str(payload["profile_name"]), mode=None)
-            provider = explicit_embedding_provider(payload, profile)
+            provider = explicit_embedding_provider(payload, profile, project_root)
             return index_normalized_document(
                 ledger=ledger,
                 vector_store_dir=config.paths.vector_store_dir,
@@ -457,13 +480,14 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
     return app
 
 
-def _build_extract_manager(ledger: Any, extract_cache_dir: Any, env_path: str) -> Any:
+def _build_extract_manager(ledger: Any, extract_cache_dir: Any, env_path: str, project_root: Path) -> Any:
     """Build an ExtractionManager wired to real MinerU provider and key pool."""
     from ..providers import build_mineru_provider
     from ..extractors import ExtractorKeyPool, ExtractionManager
 
-    key_pool = ExtractorKeyPool.from_env_file(env_path)
-    provider = build_mineru_provider(env_path)
+    resolved_env_path = _resolve_env_path(env_path, project_root)
+    key_pool = ExtractorKeyPool.from_env_file(resolved_env_path)
+    provider = build_mineru_provider(resolved_env_path)
     return ExtractionManager(
         ledger=ledger,
         cache_dir=extract_cache_dir,
@@ -472,12 +496,13 @@ def _build_extract_manager(ledger: Any, extract_cache_dir: Any, env_path: str) -
     )
 
 
-def explicit_embedding_provider(payload: dict[str, Any], profile: dict[str, Any]) -> Any:
+def explicit_embedding_provider(payload: dict[str, Any], profile: dict[str, Any], project_root: Path) -> Any:
     provider_name = str(payload.get("embedding_provider", "stub"))
     if provider_name == "stub":
         return None
     if provider_name == "qwen3vl":
-        return build_qwen_embedding_provider(profile, str(payload.get("env", ".env")))
+        resolved_env_path = _resolve_env_path(str(payload.get("env", ".env")), project_root)
+        return build_qwen_embedding_provider(profile, resolved_env_path)
     raise ValueError(f"unsupported embedding_provider: {provider_name}")
 
 

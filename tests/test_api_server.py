@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import unittest
 
+from zoterorag.api.app import _find_project_root, _resolve_env_path
 from zoterorag.api.server import validate_serve_access
 from zoterorag.config import AppConfig, PathsConfig, ServerConfig
 
@@ -47,6 +48,31 @@ def build_config(*, host: str, require_api_token: bool) -> AppConfig:
         ),
         server=ServerConfig(host=host, port=8765, require_api_token=require_api_token),
     )
+
+
+class EnvPathValidationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.project_root = _find_project_root(Path(__file__).parent.parent / "config" / "config.example.toml")
+
+    def test_relative_env_path_inside_project_is_accepted(self) -> None:
+        resolved = _resolve_env_path(".env", self.project_root)
+        self.assertEqual(self.project_root / ".env", resolved)
+
+    def test_env_path_with_dotdot_is_rejected(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            _resolve_env_path("../secret.env", self.project_root)
+        self.assertIn("..", str(ctx.exception))
+
+    def test_absolute_env_path_outside_project_is_rejected(self) -> None:
+        outside = Path(self.project_root.anchor) / "secret.env"
+        with self.assertRaises(ValueError) as ctx:
+            _resolve_env_path(str(outside), self.project_root)
+        self.assertIn("inside project root", str(ctx.exception))
+
+    def test_absolute_env_path_inside_project_is_accepted(self) -> None:
+        inside = self.project_root / "config" / "prod.env"
+        resolved = _resolve_env_path(str(inside), self.project_root)
+        self.assertEqual(inside.resolve(), resolved)
 
 
 if __name__ == "__main__":
