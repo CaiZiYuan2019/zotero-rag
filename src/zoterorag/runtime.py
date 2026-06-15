@@ -4,23 +4,35 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from .config import AppConfig, load_config
+from .config import AppConfig, EmbeddingProfile, load_config
 from .db import StateLedger
 from .zotero import create_shadow_copy, scan_shadow_to_ledger
 
 
-def initialize_runtime(config_path: str | Path = "config/config.example.toml") -> tuple[AppConfig, StateLedger]:
+def vector_store_path_for_profile(vector_store_dir: str | Path, profile: EmbeddingProfile) -> Path:
+    """Return the storage path for *profile* based on its backend.
+
+    LanceDB stores an entire database directory per profile, while the local
+    SQLite backend stores a single file.
+    """
+    profile_dir = Path(vector_store_dir) / profile.name
+    if profile.backend == "lancedb":
+        return profile_dir
+    return profile_dir / "vectors.sqlite"
+
+
+def initialize_runtime(config_path: str | Path = "config/config.toml") -> tuple[AppConfig, StateLedger]:
     config = load_config(config_path)
     config.ensure_runtime_dirs()
     ledger = StateLedger(config.paths.state_db)
     ledger.upsert_embedding_profiles(config.embedding_profiles)
     existing_indexes = {item["profile_name"]: item for item in ledger.list_vector_indexes()}
     for profile in config.embedding_profiles:
-        vector_path = config.paths.vector_store_dir / profile.name / "vectors.sqlite"
+        vector_path = vector_store_path_for_profile(config.paths.vector_store_dir, profile)
         existing = existing_indexes.get(profile.name)
         ledger.register_vector_index(
             profile_name=profile.name,
-            backend="sqlite-local",
+            backend=profile.backend,
             path=vector_path,
             document_count=int(existing["document_count"]) if existing else 0,
             chunk_count=int(existing["chunk_count"]) if existing else 0,
