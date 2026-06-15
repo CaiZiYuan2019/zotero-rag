@@ -106,7 +106,7 @@ def build_parser() -> argparse.ArgumentParser:
     ingest_start.add_argument(
         "--execute",
         action="store_true",
-        help="Reserved for future workers. Currently rejected to avoid external API calls.",
+        help="Execute the ingest pipeline (extract -> normalize -> embed). Uses real MinerU and Qwen APIs when keys are configured.",
     )
     ingest_pause = ingest_sub.add_parser("pause")
     ingest_pause.add_argument("job_id")
