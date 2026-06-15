@@ -2,12 +2,32 @@ from __future__ import annotations
 
 import json
 import logging
+import multiprocessing
 import sqlite3
 import unittest
 from unittest.mock import MagicMock
 
 from tests._support import workspace_tmpdir
 from zoterorag.index.local_vector import LocalVectorStore, VectorRecord
+
+
+def _upsert_worker(path: str, profile_name: str, start: int, count: int) -> None:
+    store = LocalVectorStore(path, profile_name=profile_name, dimension=3)
+    try:
+        records = [
+            VectorRecord(
+                record_id=f"r{i}",
+                document_id=f"DOC{i}",
+                chunk_id=f"c{i}",
+                vector=[1.0, 0.0, 0.0],
+                text=f"text {i}",
+                modality="text",
+            )
+            for i in range(start, start + count)
+        ]
+        store.upsert(records)
+    finally:
+        store.close()
 
 
 class LocalVectorStoreTests(unittest.TestCase):
@@ -93,6 +113,29 @@ class LocalVectorStoreTests(unittest.TestCase):
                     any("dimension mismatch" in message for message in cm.output),
                     cm.output,
                 )
+            finally:
+                store.close()
+
+    def test_concurrent_upsert_across_processes(self) -> None:
+        with workspace_tmpdir("local-vector-cross-proc-") as tmpdir:
+            path = tmpdir / "vectors.sqlite"
+            p1 = multiprocessing.Process(
+                target=_upsert_worker, args=(str(path), "p1", 0, 50)
+            )
+            p2 = multiprocessing.Process(
+                target=_upsert_worker, args=(str(path), "p1", 50, 50)
+            )
+            p1.start()
+            p2.start()
+            p1.join(timeout=60)
+            p2.join(timeout=60)
+            self.assertEqual(0, p1.exitcode)
+            self.assertEqual(0, p2.exitcode)
+            store = LocalVectorStore(path, profile_name="p1", dimension=3)
+            try:
+                counts = store.counts()
+                self.assertEqual(100, counts["chunks"])
+                self.assertEqual(100, counts["documents"])
             finally:
                 store.close()
 
