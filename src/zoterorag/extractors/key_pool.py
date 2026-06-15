@@ -18,6 +18,12 @@ class ApiKeyRef:
     def public_dict(self) -> dict[str, str]:
         return {"alias": self.alias, "redacted": redact_secret(self.secret)}
 
+    def __repr__(self) -> str:
+        return f"ApiKeyRef(alias={self.alias!r}, secret={redact_secret(self.secret)})"
+
+    def __str__(self) -> str:
+        return f"ApiKeyRef(alias={self.alias}, secret={redact_secret(self.secret)})"
+
 
 @dataclass
 class ApiKeyRuntimeState:

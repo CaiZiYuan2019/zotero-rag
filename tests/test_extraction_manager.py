@@ -100,6 +100,18 @@ class ExtractionManagerTests(unittest.TestCase):
             self.assertNotIn("sk-test-secret", public)
             self.assertIn("mineru_second", public)
 
+    def test_api_key_ref_repr_and_str_redact_secret(self) -> None:
+        key = ApiKeyRef(alias="mineru_a", secret="sk-test-secret-xyz")
+        repr_text = repr(key)
+        str_text = str(key)
+
+        self.assertIn("mineru_a", repr_text)
+        self.assertIn("mineru_a", str_text)
+        self.assertNotIn("sk-test-secret-xyz", repr_text)
+        self.assertNotIn("sk-test-secret-xyz", str_text)
+        self.assertIn("<redacted>", repr_text)
+        self.assertIn("<redacted>", str_text)
+
     def test_key_pool_skips_busy_and_cooldown_keys(self) -> None:
         clock = FakeClock()
         pool = ExtractorKeyPool(
