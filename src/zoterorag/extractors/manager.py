@@ -214,6 +214,8 @@ class ExtractionManager:
             final_job = self.ledger.get_extract_job(job_id=job["job_id"]) or job
             return ExtractionResult(job=final_job, cache_hit=False)
         except Exception as exc:
+            # Catch-all: any provider failure marks this job failed_retryable and
+            # records the error without crashing the caller.
             if api_key is not None:
                 self.key_pool.mark_key_cooldown(
                     api_key.alias,
@@ -260,6 +262,8 @@ class ExtractionManager:
                 return self._resume_submit(job, api_key_secret=api_key.secret if api_key else None)
             raise RuntimeError(f"unsupported extract recovery action: {recovery.action}")
         except Exception as exc:
+            # Catch-all: any provider failure marks this job failed_retryable and
+            # records the error without crashing the caller.
             if api_key is not None:
                 self.key_pool.mark_key_cooldown(
                     api_key.alias,

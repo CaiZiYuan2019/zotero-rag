@@ -64,7 +64,9 @@ data/
 
 ## 2. 配置说明
 
-### 2.1 主配置文件 (`config/config.example.toml`)
+### 2.1 主配置文件 (`config/config.toml`)
+
+运行时默认读取 `config/config.toml`。`config/config.example.toml` 仅作为模板。
 
 ```toml
 [paths]
@@ -83,9 +85,16 @@ provider = "dashscope"
 model = "qwen3-vl-embedding"
 dimension = 2560
 modality = "text"
+backend = "lancedb"                               # 默认向量后端
 enabled = true
 default_for_text = true
 default_for_multimodal = false
+batch_size = 16
+query_role_mode = "instruction"
+document_role_mode = "plain"
+instruction_template = ""
+image_policy = {}
+rate_limit = {}
 
 [[embedding_profiles]]
 name = "qwen3vl_cloud_2560_multimodal"
@@ -93,9 +102,16 @@ provider = "dashscope"
 model = "qwen3-vl-embedding"
 dimension = 2560
 modality = "multimodal"
+backend = "lancedb"                               # 默认向量后端
 enabled = true
 default_for_text = false
 default_for_multimodal = true
+batch_size = 16
+query_role_mode = "instruction"
+document_role_mode = "plain"
+instruction_template = ""
+image_policy = {}
+rate_limit = {}
 ```
 
 ### 2.2 API 密钥文件 (`.env`)
@@ -700,10 +716,11 @@ curl -X POST http://127.0.0.1:8765/ingest/start \
 
 ```bash
 # 快照备份（配置、state.sqlite、规则、manifest信息）
-zoterorag backup create --mode snapshot --out backups/
+# 备份目录必须位于配置的备份根目录 data/backups/ 下
+zoterorag backup create --mode snapshot --out data/backups/
 
 # 全量备份（快照 + MinerU缓存 + 标准化产物 + embedding缓存 + 向量库）
-zoterorag backup create --mode full --out D:/Backup/ZoteroRAG/
+zoterorag backup create --mode full --out data/backups/
 ```
 
 ### 8.2 管理与恢复
@@ -821,7 +838,7 @@ zoterorag vectors verify --profile qwen3vl_cloud_2560_text
 zoterorag vectors verify --profile qwen3vl_cloud_2560_multimodal
 
 # 11. 备份
-zoterorag backup create --mode full --out backups/
+zoterorag backup create --mode full --out data/backups/
 ```
 
 ### 10.2 日常增量更新
@@ -911,7 +928,7 @@ shadow DB ──→ scan/classify ──→ attachments (state DB)
 
 | 后端 | 文件 | 适用场景 |
 |------|------|---------|
-| `sqlite-local` | `data/vector_store/<profile>/vectors.sqlite` | 默认，零依赖，适合中小型库 |
-| `lancedb` | `data/vector_store/<profile>/` (目录) | 生产环境，需 `pip install lancedb` |
+| `lancedb` | `data/vector_store/<profile>/` (目录) | **默认**，生产环境，需 `pip install lancedb` |
+| `sqlite-local` | `data/vector_store/<profile>/vectors.sqlite` | 零依赖，适合测试/中小型库 |
 
-通过 `open_vector_store(path, backend="sqlite-local"|"lancedb")` 工厂函数统一创建。
+通过 `open_vector_store(path, backend="sqlite-local"|"lancedb")` 工厂函数统一创建；未指定时默认为 `lancedb`。

@@ -15,7 +15,7 @@ from .base import ExtractArtifact, ExtractJobState
 try:
     from requests.exceptions import ConnectionError as _RequestsConnectionError
     from requests.exceptions import Timeout as _RequestsTimeout
-except Exception:  # pragma: no cover - requests is an optional runtime dependency
+except ImportError:  # pragma: no cover - requests is an optional runtime dependency
     _RequestsTimeout = None
     _RequestsConnectionError = None
 
@@ -181,7 +181,7 @@ class MinerUProvider:
         for attempt in range(self.max_retries):
             try:
                 response = request_fn()
-            except Exception as exc:
+            except OSError as exc:
                 last_exception = exc
                 if not self._is_retryable_exception(exc) or attempt == self.max_retries - 1:
                     raise
@@ -457,7 +457,7 @@ def raise_for_mineru_api_error(
         )
     try:
         body = response.json()
-    except Exception as exc:
+    except json.JSONDecodeError as exc:
         raise MinerUAPIError("MinerU API response is not valid JSON.", stage=stage, batch_id=batch_id) from exc
     if body.get("code") != 0:
         raise MinerUAPIError(
@@ -518,6 +518,6 @@ def find_first_file(root: Path, filename: str) -> Path | None:
 def _load_requests_client() -> MinerUHTTPClient:
     try:
         import requests
-    except Exception as exc:  # pragma: no cover - depends on optional runtime dependency
+    except ImportError as exc:  # pragma: no cover - depends on optional runtime dependency
         raise MinerUAPIError("requests is required for MinerUProvider.", stage="config") from exc
     return requests

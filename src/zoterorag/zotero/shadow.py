@@ -64,7 +64,7 @@ def create_shadow_copy(
         tmp = target.with_name(f"{target.name}.{uuid.uuid4().hex}.tmp")
         try:
             _backup_readonly_source(source, tmp, immutable=False, timeout_seconds=timeout_seconds)
-        except Exception:
+        except (sqlite3.OperationalError, ShadowCopyTimeout, OSError):
             _cleanup_shadow_temp(tmp)
             raise
 

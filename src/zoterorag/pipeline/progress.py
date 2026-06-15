@@ -57,11 +57,12 @@ def build_progress_report(
             # short reason without leaking internal details.
             report["ingest_plan"] = {"available": False, "reason": str(exc)}
         except Exception as exc:
+            # Catch-all: progress reporting must remain available even if the
+            # ingest planner hits an unanticipated failure mode.
             logger.error("build_progress_report failed to create ingest plan", exc_info=True)
             report["ingest_plan"] = {
                 "available": False,
                 "reason": "unexpected_error",
-                "error_type": exc.__class__.__name__,
                 "error_type": exc.__class__.__name__,
             }
     return report

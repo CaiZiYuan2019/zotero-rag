@@ -26,6 +26,7 @@ class ProgressReportTests(unittest.TestCase):
                             modality="text",
                             enabled=True,
                             default_for_text=True,
+                            backend="sqlite-local",
                         )
                     ]
                 )

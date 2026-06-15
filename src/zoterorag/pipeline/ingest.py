@@ -10,6 +10,7 @@ from ..db import JobEvent, StateLedger
 from ..embeddings.profile import embedding_profile_hash
 from ..embeddings.indexer import index_normalized_document
 from ..normalize.markdown import normalize_markdown_document
+from ..search.results import RerankNotSupportedError
 
 
 IngestMode = Literal["incremental", "full"]
@@ -169,7 +170,7 @@ def start_ingest_job(
             )
             executed.append(result)
             _progress("  -> done\n")
-        except (FileNotFoundError, ValueError, RuntimeError, NotImplementedError) as exc:
+        except (FileNotFoundError, ValueError, RuntimeError, RerankNotSupportedError) as exc:
             failed.append({"document": document, "error": str(exc)})
             _progress(f"  -> FAILED: {exc}\n")
             ledger.add_event(
@@ -182,6 +183,7 @@ def start_ingest_job(
                 )
             )
         except Exception as exc:
+            # Catch-all: a single misbehaving document must not abort the job.
             error_text = traceback.format_exc()
             failed.append({"document": document, "error": str(exc), "traceback": error_text})
             _progress(f"  -> FAILED (unexpected): {exc}\n")

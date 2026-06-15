@@ -78,6 +78,7 @@ class LanceDBVectorStore:
         try:
             active_table = self._db.open_table(_table_name(active_version))
         except Exception as exc:
+            # Broad because LanceDB raises varying exception types for missing tables.
             if _is_table_missing(exc):
                 logger.warning(
                     "active table %s missing for profile %s, nothing to copy",
@@ -128,6 +129,7 @@ class LanceDBVectorStore:
             meta_table = self._db.open_table("vector_meta")
             rows = meta_table.to_pandas().to_dict("records")
         except Exception as exc:
+            # Broad because LanceDB raises varying exception types for missing tables.
             if _is_table_missing(exc):
                 logger.warning(
                     "vector_meta table missing for profile %s, assuming legacy",
@@ -159,6 +161,7 @@ class LanceDBVectorStore:
         try:
             table = self._db.open_table(table_name)
         except Exception as exc:
+            # Broad because LanceDB raises varying exception types for missing tables.
             if _is_table_missing(exc):
                 logger.warning(
                     "search table %s missing for profile %s",
@@ -200,6 +203,7 @@ class LanceDBVectorStore:
             table = self._db.open_table(_table_name(version))
             rows = table.to_pandas().to_dict("records")
         except Exception as exc:
+            # Broad because LanceDB raises varying exception types for missing tables.
             if _is_table_missing(exc):
                 logger.warning(
                     "counts table %s missing for profile %s",
@@ -223,6 +227,7 @@ class LanceDBVectorStore:
             table = self._db.open_table(_table_name(version))
             rows = table.to_pandas().to_dict("records")
         except Exception as exc:
+            # Broad because LanceDB raises varying exception types for missing tables.
             if _is_table_missing(exc):
                 logger.warning(
                     "document_counts table %s missing for profile %s",
@@ -253,6 +258,7 @@ class LanceDBVectorStore:
             table = self._db.open_table(_table_name(version))
             rows = table.to_pandas().to_dict("records")
         except Exception as exc:
+            # Broad because LanceDB raises varying exception types for missing tables.
             if _is_table_missing(exc):
                 logger.warning(
                     "document_metadata_values table %s missing for profile %s",
@@ -282,6 +288,7 @@ class LanceDBVectorStore:
         try:
             table = self._db.open_table(table_name)
         except Exception as exc:
+            # Broad because LanceDB raises varying exception types for missing tables.
             if not _is_table_missing(exc):
                 raise
             import pyarrow as pa
@@ -306,6 +313,7 @@ class LanceDBVectorStore:
         try:
             return self._db.open_table("vector_meta")
         except Exception as exc:
+            # Broad because LanceDB raises varying exception types for missing tables.
             if not _is_table_missing(exc):
                 raise
             import pyarrow as pa

@@ -64,7 +64,7 @@ def check_state_db(config: AppConfig, ledger: StateLedger) -> dict[str, Any]:
         summary = ledger.status_summary()
         journal_mode = ledger.conn.execute("PRAGMA journal_mode").fetchone()[0]
         busy_timeout = ledger.conn.execute("PRAGMA busy_timeout").fetchone()[0]
-    except Exception as exc:
+    except (sqlite3.Error, OSError, ValueError, TypeError) as exc:
         return {"ok": False, "path": str(state_db), "error": str(exc)}
     return {
         "ok": state_db.is_file() and str(journal_mode).casefold() == "wal",
@@ -102,7 +102,7 @@ def check_existing_shadow(config: AppConfig) -> dict[str, Any]:
             pdf_count = shadow.pdf_count()
         finally:
             shadow.close()
-    except Exception as exc:
+    except (sqlite3.Error, OSError) as exc:
         return {"ok": False, "path": str(shadow_db), "exists": True, "status": "unreadable", "error": str(exc)}
     return {"ok": True, "path": str(shadow_db), "exists": True, "status": "readable", "pdf_count": pdf_count}
 
@@ -232,6 +232,8 @@ def check_vector_staging_self_test(config: AppConfig) -> dict[str, Any]:
             },
         }
     except Exception as exc:
+        # Catch-all so a single misbehaving backend cannot break the whole
+        # diagnostics report; the error is surfaced as a failed check.
         return {"ok": False, "enabled": True, "status": "error", "error": str(exc)}
     finally:
         if store is not None:

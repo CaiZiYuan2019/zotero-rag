@@ -530,6 +530,7 @@ FastAPI：
 - `POST /search/fulltext`
 - `POST /backup/create`
 - `GET /backup/list`
+- `POST /backup/restore` — **deferred/not implemented**；恢复目前仅通过 CLI `zoterorag backup restore` 执行。
 
 CLI：
 

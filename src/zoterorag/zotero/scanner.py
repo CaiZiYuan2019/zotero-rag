@@ -77,6 +77,8 @@ def scan_shadow_to_ledger(
         ledger.set_job_status(job_id, "completed")
         return report
     except Exception as exc:
+        # Catch-all: record the scan failure in the job log and re-raise so the
+        # caller knows the scan did not succeed.
         ledger.add_event(
             JobEvent(
                 job_id=job_id,

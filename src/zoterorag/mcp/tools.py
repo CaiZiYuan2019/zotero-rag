@@ -11,7 +11,7 @@ from ..models import list_embedding_model_catalog
 from ..pipeline import build_progress_report
 from ..runtime import config_as_public_dict
 from ..search import fulltext_search, metadata_search, normalize_query_image
-from ..search.results import ensure_rerank_disabled
+from ..search.results import RerankNotSupportedError, ensure_rerank_disabled
 
 
 McpConsumer = Literal["llm_text", "llm_multimodal"]
@@ -48,7 +48,7 @@ def zotero_rag_metadata_search(
 ) -> dict[str, Any]:
     try:
         ensure_rerank_disabled(rerank)
-    except NotImplementedError as exc:
+    except RerankNotSupportedError as exc:
         return {"results": [], "warnings": [str(exc)]}
     return {
         "results": metadata_search(
@@ -84,7 +84,7 @@ def zotero_rag_search_text(
     warnings: list[str] = []
     try:
         ensure_rerank_disabled(rerank)
-    except NotImplementedError as exc:
+    except RerankNotSupportedError as exc:
         return {"results": [], "warnings": [str(exc)], "consumer": "llm_text", "image_return": "none"}
     results: list[dict[str, Any]] = []
     if include_metadata:

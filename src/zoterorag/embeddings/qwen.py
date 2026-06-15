@@ -138,7 +138,7 @@ class Qwen3VLEmbeddingProvider:
                     json=payload,
                     timeout=self.timeout_seconds,
                 )
-            except Exception as exc:
+            except OSError as exc:
                 last_exception = exc
                 if not self._is_retryable_exception(exc) or attempt == self.max_retries - 1:
                     raise

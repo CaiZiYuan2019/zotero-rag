@@ -12,7 +12,7 @@ Consumer = Literal["manual", "llm_text", "llm_multimodal"]
 ImageReturn = Literal["file_ref", "base64", "none"]
 
 
-class RerankNotSupportedError(NotImplementedError):
+class RerankNotSupportedError(RuntimeError):
     """Raised when rerank is requested but no RerankProvider is implemented."""
 
 
@@ -163,7 +163,8 @@ def base64_image_payload(image: dict[str, Any], *, max_image_bytes: int) -> dict
 def decoded_base64_size(value: str) -> int:
     try:
         return len(base64.b64decode(value, validate=True))
-    except Exception:
+    except (ValueError, TypeError):
+        # Not a valid base64 payload; fall back to encoded string length.
         return len(value.encode("utf-8"))
 
 
@@ -171,4 +172,6 @@ def ensure_rerank_disabled(rerank: bool) -> None:
     """Reject rerank requests until a real RerankProvider is implemented."""
 
     if rerank:
-        raise RerankNotSupportedError("rerank is reserved but not implemented; use rerank=false")
+        raise RerankNotSupportedError(
+            "rerank is reserved but not implemented; use rerank=false"
+        )

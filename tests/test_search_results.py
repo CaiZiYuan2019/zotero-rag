@@ -42,9 +42,12 @@ class RerankErrorTests(unittest.TestCase):
         with self.assertRaises(RerankNotSupportedError):
             ensure_rerank_disabled(True)
 
-        # Existing callers that catch NotImplementedError still work.
-        with self.assertRaises(NotImplementedError):
+        # RerankNotSupportedError is a RuntimeError, not a NotImplementedError.
+        with self.assertRaises(RuntimeError):
             ensure_rerank_disabled(True)
+        self.assertNotIsInstance(
+            RerankNotSupportedError("test"), NotImplementedError
+        )
 
 
 if __name__ == "__main__":
