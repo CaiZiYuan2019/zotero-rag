@@ -44,7 +44,7 @@ def emit(data: object) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="zoterorag")
-    parser.add_argument("--config", default="config/config.example.toml")
+    parser.add_argument("--config", default="config/config.toml")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init-state", help="Create runtime directories and initialize state.sqlite.")

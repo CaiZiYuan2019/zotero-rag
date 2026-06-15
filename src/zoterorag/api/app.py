@@ -88,7 +88,7 @@ def _resolve_backup_out_dir(out_dir: str | Path, allowed_root: Path) -> Path:
     return resolved
 
 
-def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
+def create_app(config_path: str | Path = "config/config.toml") -> Any:
     try:
         from fastapi import Depends, FastAPI, Header, HTTPException, Request
     except ImportError as exc:  # pragma: no cover - depends on optional package
