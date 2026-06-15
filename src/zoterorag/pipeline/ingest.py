@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from pathlib import Path
 import sys
+import traceback
 from typing import Any, Literal
 
 from ..db import JobEvent, StateLedger
@@ -13,7 +14,7 @@ from ..normalize.markdown import normalize_markdown_document
 
 IngestMode = Literal["incremental", "full"]
 BUILDABLE_CLASSIFICATIONS = {"included_auto", "included_manual"}
-DONE_EXTRACT_STATES = {"downloaded", "normalized", "completed"}
+DONE_EXTRACT_STATES = {"downloaded", "normalized"}
 
 
 def create_ingest_plan(
@@ -167,8 +168,8 @@ def start_ingest_job(
                 vector_store_dir=vector_store_dir,
             )
             executed.append(result)
-            _progress(f"  -> done\n")
-        except Exception as exc:
+            _progress("  -> done\n")
+        except (FileNotFoundError, ValueError, RuntimeError, NotImplementedError) as exc:
             failed.append({"document": document, "error": str(exc)})
             _progress(f"  -> FAILED: {exc}\n")
             ledger.add_event(
@@ -178,6 +179,19 @@ def start_ingest_job(
                     status="failed",
                     message=f"{document['document_id']}: {exc}",
                     payload={"document": document, "error": str(exc)},
+                )
+            )
+        except Exception as exc:
+            error_text = traceback.format_exc()
+            failed.append({"document": document, "error": str(exc), "traceback": error_text})
+            _progress(f"  -> FAILED (unexpected): {exc}\n")
+            ledger.add_event(
+                JobEvent(
+                    job_id=job_id,
+                    stage="document_error",
+                    status="failed",
+                    message=f"{document['document_id']}: unexpected {exc.__class__.__name__}: {exc}",
+                    payload={"document": document, "error": str(exc), "traceback": error_text},
                 )
             )
 
@@ -312,6 +326,17 @@ def stage_for_extract(
     done = next((job for job in extract_jobs if job["state"] in DONE_EXTRACT_STATES), None)
     if done is not None and not force:
         return {"stage": "extract", "status": "done", "job_id": done["job_id"], "state": done["state"]}
+    completed_job = next((job for job in extract_jobs if job["state"] == "completed"), None)
+    if completed_job is not None and not force:
+        # ``completed`` means MinerU finished remotely, but the local artifact may
+        # not have been downloaded yet. The execution path will resume the download
+        # unless the caller explicitly requested a full rebuild.
+        return {
+            "stage": "extract",
+            "status": "pending",
+            "reason": "completed_artifact_not_downloaded",
+            "job_id": completed_job["job_id"],
+        }
     if artifact is not None and not force:
         return {"stage": "extract", "status": "done", "reason": "normalized_artifact_exists"}
     return {"stage": "extract", "status": "pending", "reason": "full_rebuild" if force and done else "no_cached_extract"}
@@ -533,13 +558,40 @@ def _execute_extract_stage(
     if not file_path or not Path(file_path).is_file():
         raise FileNotFoundError(f"attachment file not found: {file_path}")
 
-    _progress(f"  extract: submitting...")
+    ledger.checkpoint(
+        attachment_key,
+        "extract",
+        "running",
+        {"job_id": job_id, "input_file": str(file_path)},
+    )
+
+    _progress("  extract: submitting...")
     request = ExtractionRequest(
         input_file=Path(file_path),
         attachment_key=attachment_key,
     )
     result = extract_manager.ensure_extraction(request)
+
+    # ``completed`` means the remote batch finished but the local artifact has
+    # not been downloaded yet. Resume the download instead of leaving downstream
+    # normalize with no artifact on disk.
+    if result.job["state"] == "completed" and result.job.get("local_stage") != "downloaded":
+        _progress(f"  extract: resuming download for completed job {result.job['job_id']}")
+        result = extract_manager.resume_extraction(result.job["job_id"])
+
     _progress(f"  extract: {result.job['state']} (cache_hit={result.cache_hit})")
+
+    ledger.checkpoint(
+        attachment_key,
+        "extract",
+        "done",
+        {
+            "job_id": job_id,
+            "extract_job_id": result.job["job_id"],
+            "state": result.job["state"],
+            "cache_hit": result.cache_hit,
+        },
+    )
 
     ledger.add_event(
         JobEvent(
@@ -581,6 +633,13 @@ def _execute_normalize_stage(
     if source_md is None:
         raise FileNotFoundError(f"no markdown file found in extract artifact: {artifact_path}")
 
+    ledger.checkpoint(
+        document_id,
+        "normalize",
+        "running",
+        {"job_id": job_id, "extract_job_id": extract_job["job_id"]},
+    )
+
     ledger.add_event(
         JobEvent(
             job_id=job_id,
@@ -600,9 +659,12 @@ def _execute_normalize_stage(
     )
     _progress(f"  normalize: {normalize_result.ledger_artifact()['chunk_count']} chunks, {normalize_result.ledger_artifact()['image_count']} images")
 
-    # Persist the normalized artifact
-    ledger.upsert_normalized_artifact(normalize_result.ledger_artifact())
-    ledger.replace_document_chunks(document_id, normalize_result.chunks)
+    # Persist the normalized artifact and its chunks in a single transaction so
+    # an interruption cannot leave an artifact without chunks or vice versa.
+    ledger.upsert_artifact_and_chunks(
+        normalize_result.ledger_artifact(),
+        normalize_result.chunks,
+    )
     ledger.checkpoint(
         document_id,
         "normalize",
@@ -632,6 +694,12 @@ def _execute_embed_stage(
     """Run embedding for one document under one profile."""
 
     _progress(f"  embed:{profile_name}: {document_id}...")
+    ledger.checkpoint(
+        document_id,
+        f"embed:{profile_name}",
+        "running",
+        {"job_id": job_id},
+    )
     ledger.add_event(
         JobEvent(
             job_id=job_id,

@@ -242,3 +242,62 @@ class StateLedgerTests(unittest.TestCase):
                 self.assertEqual(100, summary["checkpoints"])
             finally:
                 ledger.close()
+
+    def test_close_performs_wal_checkpoint(self) -> None:
+        with workspace_tmpdir("state-ledger-close-") as tmpdir:
+            db_path = tmpdir / "state.sqlite"
+            ledger = StateLedger(db_path)
+            try:
+                ledger.create_job("test", payload={})
+            finally:
+                ledger.close()
+
+            # After close, a -wal file should not exist because we asked for
+            # TRUNCATE. (If checkpoint failed silently the WAL could remain.)
+            self.assertTrue(db_path.exists())
+            self.assertFalse((db_path.parent / f"{db_path.name}-wal").exists())
+
+    def test_upsert_artifact_and_chunks_is_atomic(self) -> None:
+        with workspace_tmpdir("state-ledger-artifact-chunks-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                artifact = {
+                    "document_id": "DOC_ATOMIC",
+                    "attachment_key": "ATT_ATOMIC",
+                    "extract_job_id": "extract-1",
+                    "artifact_dir": str(tmpdir / "artifact"),
+                    "document_md": str(tmpdir / "artifact" / "document.md"),
+                    "image_manifest": str(tmpdir / "artifact" / "images" / "manifest.json"),
+                    "chunks_path": str(tmpdir / "artifact" / "chunks.jsonl"),
+                    "manifest_path": str(tmpdir / "artifact" / "document_manifest.json"),
+                    "source_markdown": str(tmpdir / "source.md"),
+                    "status": "normalized",
+                    "document_hash": "hash",
+                    "chunk_count": 2,
+                    "image_count": 0,
+                    "payload": {},
+                }
+                chunks = [
+                    {
+                        "chunk_id": "c1",
+                        "chunk_type": "text",
+                        "chunk_index": 0,
+                        "text": "first",
+                        "heading_path": [],
+                        "metadata": {},
+                    },
+                    {
+                        "chunk_id": "c2",
+                        "chunk_type": "text",
+                        "chunk_index": 1,
+                        "text": "second",
+                        "heading_path": [],
+                        "metadata": {},
+                    },
+                ]
+                persisted = ledger.upsert_artifact_and_chunks(artifact, chunks)
+                self.assertEqual("DOC_ATOMIC", persisted["document_id"])
+                self.assertEqual(2, persisted["chunk_count"])
+                self.assertEqual(2, len(ledger.list_chunks("DOC_ATOMIC", chunk_type="text")))
+            finally:
+                ledger.close()

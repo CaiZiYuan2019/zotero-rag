@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from pathlib import Path
+import traceback
 from typing import Any
 
 from ..db import JobEvent, StateLedger
@@ -147,7 +148,7 @@ def start_reembed_job(
                     payload=result_payload,
                 )
             )
-        except Exception as exc:
+        except (FileNotFoundError, KeyError, ValueError, RuntimeError, NotImplementedError) as exc:
             failed.append({"document": document, "error": str(exc)})
             ledger.add_event(
                 JobEvent(
@@ -156,6 +157,18 @@ def start_reembed_job(
                     status="failed",
                     message=f"{document['document_id']}: {exc}",
                     payload={"document": document, "error": str(exc)},
+                )
+            )
+        except Exception as exc:
+            error_text = traceback.format_exc()
+            failed.append({"document": document, "error": str(exc), "traceback": error_text})
+            ledger.add_event(
+                JobEvent(
+                    job_id=job_id,
+                    stage=f"embed:{profile_name}",
+                    status="failed",
+                    message=f"{document['document_id']}: unexpected {exc.__class__.__name__}: {exc}",
+                    payload={"document": document, "error": str(exc), "traceback": error_text},
                 )
             )
 

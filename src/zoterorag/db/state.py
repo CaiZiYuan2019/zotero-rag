@@ -4,11 +4,16 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 from pathlib import Path
 import sqlite3
 import threading
-from typing import Any, Callable, Iterable
+import time
+from typing import Any, Iterable
 import uuid
+
+
+logger = logging.getLogger(__name__)
 
 
 SCHEMA_VERSION = 1
@@ -93,7 +98,36 @@ class StateLedger:
         self.migrate()
 
     def close(self) -> None:
-        self.conn.close()
+        # Try to checkpoint any pending WAL frames before closing so that later
+        # readers and backup tools see a consistent state without needing to
+        # reopen the WAL. Failures are logged rather than swallowed.
+        try:
+            self._checkpoint_with_retry(retries=3, delay_seconds=0.5)
+        except sqlite3.Error as exc:
+            logger.error("state ledger checkpoint failed before close: %s", exc)
+        try:
+            self.conn.close()
+        except sqlite3.Error as exc:
+            logger.error("state ledger connection close failed: %s", exc)
+
+    def _checkpoint_with_retry(self, retries: int, delay_seconds: float) -> None:
+        last_exc: sqlite3.Error | None = None
+        for attempt in range(retries):
+            try:
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                return
+            except sqlite3.Error as exc:
+                last_exc = exc
+                logger.warning(
+                    "state ledger checkpoint attempt %d/%d failed: %s",
+                    attempt + 1,
+                    retries,
+                    exc,
+                )
+                if attempt < retries - 1:
+                    time.sleep(delay_seconds)
+        if last_exc is not None:
+            raise last_exc
 
     def _configure(self) -> None:
         # Set the busy timeout before switching WAL mode. Startup code may have
@@ -563,6 +597,9 @@ class StateLedger:
         with self.conn:
             for profile in profiles:
                 data = profile.__dict__ if hasattr(profile, "__dict__") else dict(profile)
+                # Read existing defaults inside the same transaction so that a
+                # concurrent activation cannot change the flags between read and
+                # write. The whole batch is committed atomically.
                 existing = self.conn.execute(
                     """
                     SELECT default_for_text, default_for_multimodal
@@ -642,22 +679,23 @@ class StateLedger:
             raise ValueError("mode must be 'text' or 'multimodal'")
         expected_modality = "text" if mode == "text" else "multimodal"
         flag_column = "default_for_text" if mode == "text" else "default_for_multimodal"
-        row = self.conn.execute(
-            """
-            SELECT name, modality, enabled
-            FROM embedding_profiles
-            WHERE name = ?
-            """,
-            (profile_name,),
-        ).fetchone()
-        if row is None:
-            raise KeyError(f"embedding profile not found: {profile_name}")
-        if row["modality"] != expected_modality:
-            raise ValueError(f"profile {profile_name} has modality {row['modality']}, expected {expected_modality}")
-        if not bool(row["enabled"]):
-            raise ValueError(f"profile {profile_name} is disabled")
 
         with self.conn:
+            row = self.conn.execute(
+                """
+                SELECT name, modality, enabled
+                FROM embedding_profiles
+                WHERE name = ?
+                """,
+                (profile_name,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"embedding profile not found: {profile_name}")
+            if row["modality"] != expected_modality:
+                raise ValueError(f"profile {profile_name} has modality {row['modality']}, expected {expected_modality}")
+            if not bool(row["enabled"]):
+                raise ValueError(f"profile {profile_name} is disabled")
+
             # Exactly one default profile per query mode keeps search scoring
             # unambiguous. Cross-model score merging is intentionally avoided.
             self.conn.execute(
@@ -668,6 +706,7 @@ class StateLedger:
                 f"UPDATE embedding_profiles SET {flag_column} = 1 WHERE name = ?",
                 (profile_name,),
             )
+
         for profile in self.list_embedding_profiles():
             if profile["name"] == profile_name:
                 return profile
@@ -751,16 +790,16 @@ class StateLedger:
 
         now = utc_now()
         payload_json = json.dumps(payload or {}, ensure_ascii=False, sort_keys=True, default=str)
-        existing = self.conn.execute(
-            """
-            SELECT created_at
-            FROM embedding_batches
-            WHERE batch_hash = ?
-            """,
-            (batch_hash,),
-        ).fetchone()
-        created_at = existing["created_at"] if existing is not None else now
         with self.conn:
+            existing = self.conn.execute(
+                """
+                SELECT created_at
+                FROM embedding_batches
+                WHERE batch_hash = ?
+                """,
+                (batch_hash,),
+            ).fetchone()
+            created_at = existing["created_at"] if existing is not None else now
             self.conn.execute(
                 """
                 INSERT INTO embedding_batches(
@@ -1228,16 +1267,16 @@ class StateLedger:
         last_poll_at: str | None = None,
         payload: dict[str, Any] | None = None,
     ) -> None:
-        existing = self.get_extract_job(job_id=job_id)
-        if existing is None:
-            raise KeyError(f"extract job not found: {job_id}")
-        payload_json = json.dumps(
-            payload if payload is not None else existing.get("payload", {}),
-            ensure_ascii=False,
-            sort_keys=True,
-            default=str,
-        )
         with self.conn:
+            existing = self.get_extract_job(job_id=job_id)
+            if existing is None:
+                raise KeyError(f"extract job not found: {job_id}")
+            payload_json = json.dumps(
+                payload if payload is not None else existing.get("payload", {}),
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
             self.conn.execute(
                 """
                 UPDATE extract_jobs
@@ -1381,6 +1420,91 @@ class StateLedger:
                 )
                 count += 1
         return count
+
+    def upsert_artifact_and_chunks(
+        self,
+        artifact: dict[str, Any],
+        chunks: Iterable[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Persist a normalized artifact and its chunks in one transaction.
+
+        An interrupted normalize stage cannot leave the state DB with an
+        artifact but no chunks (or chunks pointing to a missing artifact). The
+        caller is responsible for the on-disk normalized files; this method
+        makes the ledger update atomic.
+        """
+
+        now = utc_now()
+        payload_json = json.dumps(artifact.get("payload", {}), ensure_ascii=False, sort_keys=True, default=str)
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO normalized_artifacts(
+                    document_id, attachment_key, extract_job_id, artifact_dir,
+                    document_md, image_manifest, chunks_path, manifest_path,
+                    source_markdown, status, document_hash, chunk_count,
+                    image_count, updated_at, payload_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(document_id) DO UPDATE SET
+                    attachment_key = excluded.attachment_key,
+                    extract_job_id = excluded.extract_job_id,
+                    artifact_dir = excluded.artifact_dir,
+                    document_md = excluded.document_md,
+                    image_manifest = excluded.image_manifest,
+                    chunks_path = excluded.chunks_path,
+                    manifest_path = excluded.manifest_path,
+                    source_markdown = excluded.source_markdown,
+                    status = excluded.status,
+                    document_hash = excluded.document_hash,
+                    chunk_count = excluded.chunk_count,
+                    image_count = excluded.image_count,
+                    updated_at = excluded.updated_at,
+                    payload_json = excluded.payload_json
+                """,
+                (
+                    artifact["document_id"],
+                    artifact.get("attachment_key"),
+                    artifact.get("extract_job_id"),
+                    str(artifact["artifact_dir"]),
+                    str(artifact["document_md"]),
+                    str(artifact["image_manifest"]),
+                    str(artifact["chunks_path"]),
+                    str(artifact["manifest_path"]),
+                    str(artifact["source_markdown"]),
+                    artifact["status"],
+                    artifact["document_hash"],
+                    int(artifact.get("chunk_count", 0)),
+                    int(artifact.get("image_count", 0)),
+                    now,
+                    payload_json,
+                ),
+            )
+            self.conn.execute("DELETE FROM chunks WHERE document_id = ?", (artifact["document_id"],))
+            for chunk in chunks:
+                self.conn.execute(
+                    """
+                    INSERT INTO chunks(
+                        chunk_id, document_id, chunk_type, chunk_index, text,
+                        heading_path_json, prev_chunk_id, next_chunk_id,
+                        metadata_json, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        chunk["chunk_id"],
+                        artifact["document_id"],
+                        chunk["chunk_type"],
+                        int(chunk["chunk_index"]),
+                        chunk.get("text", ""),
+                        json.dumps(chunk.get("heading_path", []), ensure_ascii=False, sort_keys=True),
+                        chunk.get("prev_chunk_id"),
+                        chunk.get("next_chunk_id"),
+                        json.dumps(chunk.get("metadata", {}), ensure_ascii=False, sort_keys=True, default=str),
+                        now,
+                    ),
+                )
+        return self.get_normalized_artifact(artifact["document_id"])  # type: ignore[return-value]
 
     def list_chunks(
         self,

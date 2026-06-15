@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 import unittest
 
 from tests._support import workspace_tmpdir
 from zoterorag.config import EmbeddingProfile
 from zoterorag.db import StateLedger
 from zoterorag.embeddings.profile import embedding_profile_hash
+from zoterorag.extractors.base import ExtractArtifact, StubExtractorProvider
+from zoterorag.extractors.manager import ExtractionManager, ExtractionRequest
 from zoterorag.normalize import normalize_markdown_document
 from zoterorag.pipeline import (
     cancel_ingest_job,
@@ -119,6 +123,135 @@ class IngestPipelineTests(unittest.TestCase):
             finally:
                 ledger.close()
 
+    def test_execute_ingest_end_to_end_with_stub(self) -> None:
+        with workspace_tmpdir("ingest-execute-e2e-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                seed_profiles(ledger)
+                attachment = build_attachment_with_file(tmpdir, "ATT_E2E", title="End-to-End Paper")
+                ledger.upsert_attachments([attachment])
+
+                extract_manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=MarkdownStubExtractorProvider(),
+                )
+                result = start_ingest_job(
+                    ledger,
+                    zotero_key="ATT_E2E",
+                    include_multimodal=False,
+                    execute=True,
+                    extract_manager=extract_manager,
+                    extract_cache_dir=tmpdir / "extract_cache",
+                    normalized_dir=tmpdir / "normalized",
+                    vector_store_dir=tmpdir / "vectors",
+                )
+
+                self.assertEqual("completed", result["job"]["status"])
+                self.assertEqual(1, len(result["executed"]))
+                self.assertEqual(0, len(result["failed"]))
+
+                # Checkpoints record stage progress.
+                self.assertEqual("done", ledger.get_checkpoint("ATT_E2E", "extract")["status"])
+                self.assertEqual("normalized", ledger.get_checkpoint("ATT_E2E", "normalize")["status"])
+                self.assertEqual("indexed", ledger.get_checkpoint("ATT_E2E", "embed:text-profile")["status"])
+
+                # Normalized artifact and chunks were persisted.
+                self.assertIsNotNone(ledger.get_normalized_artifact("ATT_E2E"))
+                self.assertGreater(len(ledger.list_chunks("ATT_E2E", chunk_type="text")), 0)
+            finally:
+                ledger.close()
+
+    def test_completed_extract_state_triggers_download_recovery(self) -> None:
+        with workspace_tmpdir("ingest-completed-recovery-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                seed_profiles(ledger)
+                attachment = build_attachment_with_file(tmpdir, "ATT_RECOV", title="Recovery Paper")
+                ledger.upsert_attachments([attachment])
+
+                extract_manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=MarkdownStubExtractorProvider(),
+                )
+                # First, get to a downloaded state.
+                request = ExtractionRequest(
+                    input_file=Path(attachment["file_path"]),
+                    attachment_key="ATT_RECOV",
+                )
+                first = extract_manager.ensure_extraction(request)
+                self.assertEqual("downloaded", first.job["state"])
+
+                # Simulate the artifact going missing while the ledger still says
+                # ``completed`` (remote done, local artifact not downloaded).
+                artifact_dir = first.job.get("artifact_dir")
+                self.assertIsNotNone(artifact_dir)
+                import shutil
+
+                shutil.rmtree(artifact_dir)
+                ledger.set_extract_job_state(
+                    first.job["job_id"],
+                    state="completed",
+                    local_stage="download",
+                    artifact_dir=None,
+                    extract_dir=None,
+                    manifest_path=None,
+                )
+
+                plan = create_ingest_plan(ledger, include_multimodal=False)
+                self.assertEqual("extract:pending", plan["documents"][0]["next_stage"])
+                self.assertEqual("completed_artifact_not_downloaded", plan["documents"][0]["stages"][0]["reason"])
+
+                result = start_ingest_job(
+                    ledger,
+                    zotero_key="ATT_RECOV",
+                    include_multimodal=False,
+                    execute=True,
+                    extract_manager=extract_manager,
+                    extract_cache_dir=tmpdir / "extract_cache",
+                    normalized_dir=tmpdir / "normalized",
+                    vector_store_dir=tmpdir / "vectors",
+                )
+
+                self.assertEqual("completed", result["job"]["status"])
+                self.assertEqual(1, len(result["executed"]))
+                self.assertEqual("downloaded", ledger.get_extract_job(job_id=first.job["job_id"])["state"])
+                self.assertIsNotNone(ledger.get_normalized_artifact("ATT_RECOV"))
+            finally:
+                ledger.close()
+
+    def test_resume_ingest_job_skips_already_done_documents(self) -> None:
+        with workspace_tmpdir("ingest-resume-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                seed_profiles(ledger)
+                attachment = build_attachment_with_file(tmpdir, "ATT_RESUME", title="Resume Paper")
+                ledger.upsert_attachments([attachment])
+
+                extract_manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=MarkdownStubExtractorProvider(),
+                )
+                first = start_ingest_job(
+                    ledger,
+                    zotero_key="ATT_RESUME",
+                    include_multimodal=False,
+                    execute=True,
+                    extract_manager=extract_manager,
+                    extract_cache_dir=tmpdir / "extract_cache",
+                    normalized_dir=tmpdir / "normalized",
+                    vector_store_dir=tmpdir / "vectors",
+                )
+                self.assertEqual("completed", first["job"]["status"])
+
+                resumed = resume_ingest_job(ledger, first["job"]["job_id"])
+                self.assertEqual("planned", resumed["job"]["status"])
+                self.assertEqual("complete", resumed["plan"]["documents"][0]["next_stage"])
+            finally:
+                ledger.close()
+
 
 def seed_profiles(ledger: StateLedger) -> None:
     ledger.upsert_embedding_profiles(
@@ -204,6 +337,68 @@ def build_attachment(
         "file_mtime": 1.0 if file_exists else None,
         "metadata": {},
     }
+
+
+def build_attachment_with_file(
+    tmpdir: Path,
+    attachment_key: str,
+    *,
+    title: str,
+    classification: str = "included_auto",
+) -> dict[str, object]:
+    """Build an attachment dict whose file_path points to an existing file."""
+
+    file_path = tmpdir / "attachments" / f"{attachment_key}.pdf"
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_bytes(b"fake pdf content")
+    attachment = build_attachment(
+        attachment_key,
+        title=title,
+        classification=classification,
+        file_exists=True,
+    )
+    attachment["file_path"] = str(file_path)
+    return attachment
+
+
+class MarkdownStubExtractorProvider(StubExtractorProvider):
+    """Stub extractor that produces a markdown file suitable for normalization."""
+
+    def download(
+        self,
+        external_job_id: str,
+        output_dir: Path,
+        *,
+        api_key: str | None = None,
+        source_pdf: str | Path | None = None,
+        options: dict[str, object] | None = None,
+    ) -> ExtractArtifact:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        markdown = output_dir / "full.md"
+        markdown.write_text("# Demo Paper\n\nalpha beta gamma.\n", encoding="utf-8")
+        manifest = output_dir / "manifest.json"
+        source_pdf_path = Path(source_pdf) if source_pdf is not None else Path(external_job_id)
+        manifest.write_text(
+            json.dumps(
+                {
+                    "provider": self.name,
+                    "provider_version": self.version,
+                    "external_job_id": external_job_id,
+                    "state": "downloaded",
+                    "source_pdf": str(source_pdf_path),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return ExtractArtifact(
+            source_pdf=source_pdf_path,
+            artifact_dir=output_dir,
+            manifest_path=manifest,
+        )
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from tests._support import workspace_tmpdir
 from zoterorag.config import EmbeddingProfile
@@ -119,6 +120,30 @@ class ProgressReportTests(unittest.TestCase):
                 self.assertEqual(1, report["ingest_plan"]["document_count"])
                 self.assertIn("complete", report["ingest_plan"]["next_stages"])
                 self.assertFalse(report["eta"]["available"])
+            finally:
+                ledger.close()
+
+
+    def test_progress_report_surfaces_unexpected_plan_errors_without_details(self) -> None:
+        with workspace_tmpdir("progress-report-error-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                # Force an unexpected planning failure by corrupting the
+                # embedding profile table so that list_embedding_profiles raises.
+                ledger.conn.execute(
+                    "INSERT INTO embedding_profiles(name, provider, model, dimension, modality, enabled, "
+                    "default_for_text, default_for_multimodal, profile_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("bad", "stub", "stub", 8, "text", 1, 1, 0, "not-json"),
+                )
+
+                report = build_progress_report(ledger)
+
+                ingest_plan = report["ingest_plan"]
+                self.assertFalse(ingest_plan["available"])
+                self.assertEqual("unexpected_error", ingest_plan["reason"])
+                self.assertEqual("JSONDecodeError", ingest_plan["error_type"])
+                # No raw exception message or traceback should leak.
+                self.assertNotIn("error", ingest_plan)
             finally:
                 ledger.close()
 

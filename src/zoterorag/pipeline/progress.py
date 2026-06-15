@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 from collections import Counter
+import json
+import logging
 from typing import Any
 
 from ..db import StateLedger
 from ..extractors import build_extract_recovery_plan
 from .ingest import create_ingest_plan
+
+
+logger = logging.getLogger(__name__)
 
 
 def build_progress_report(
@@ -39,8 +44,26 @@ def build_progress_report(
     if include_ingest_plan:
         try:
             report["ingest_plan"] = create_ingest_plan(ledger)["summary"]
+        except json.JSONDecodeError as exc:
+            # Data corruption is unexpected and should be investigated.
+            logger.error("build_progress_report failed to parse persisted JSON", exc_info=True)
+            report["ingest_plan"] = {
+                "available": False,
+                "reason": "unexpected_error",
+                "error_type": exc.__class__.__name__,
+            }
+        except (ValueError, KeyError, TypeError) as exc:
+            # Known configuration/planning errors are recoverable; surface a
+            # short reason without leaking internal details.
+            report["ingest_plan"] = {"available": False, "reason": str(exc)}
         except Exception as exc:
-            report["ingest_plan"] = {"available": False, "error": str(exc)}
+            logger.error("build_progress_report failed to create ingest plan", exc_info=True)
+            report["ingest_plan"] = {
+                "available": False,
+                "reason": "unexpected_error",
+                "error_type": exc.__class__.__name__,
+                "error_type": exc.__class__.__name__,
+            }
     return report
 
 
