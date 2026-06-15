@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -30,13 +31,18 @@ class LanceDBVectorStore:
         self._table_cache.clear()
         # LanceDB handles cleanup automatically; no explicit close needed.
 
+    def _delete_records(self, table: Any, record_ids: list[str]) -> None:
+        """Delete records by record_id using a literal-safe predicate."""
+        predicate = _build_record_id_in_predicate(record_ids)
+        table.delete(predicate)
+
     # ------------------------------------------------------------------
     # Write path
     # ------------------------------------------------------------------
 
     def upsert(self, records: Iterable[VectorRecord], *, index_version: str = "legacy") -> int:
         table_name = _table_name(index_version)
-        rows = [_record_to_row(record, index_version) for record in records]
+        rows = [_record_to_row(record, index_version, self.profile_name) for record in records]
         if not rows:
             return 0
         for record in records:
@@ -50,16 +56,7 @@ class LanceDBVectorStore:
         # the schema declares it. For simplicity we delete-then-add within
         # the same version table.
         record_ids = [r["record_id"] for r in rows]
-        try:
-            table.delete(f"record_id IN ({', '.join(repr(rid) for rid in record_ids)})")
-        except Exception:
-            # Table may be empty or the delete predicate format may differ
-            # across LanceDB versions; fall back to per-row delete.
-            for rid in record_ids:
-                try:
-                    table.delete(f"record_id = {repr(rid)}")
-                except Exception:
-                    pass
+        self._delete_records(table, record_ids)
         table.add(rows)
         self._table_cache[table_name] = table
         return len(rows)
@@ -74,15 +71,9 @@ class LanceDBVectorStore:
         active_version = self.active_version()
         if not active_version:
             return 0
-        try:
-            active_table = self._db.open_table(_table_name(active_version))
-        except Exception:
-            return 0
+        active_table = self._db.open_table(_table_name(active_version))
         excluded = set(exclude_document_ids)
-        try:
-            all_rows = active_table.to_pandas().to_dict("records")
-        except Exception:
-            return 0
+        all_rows = active_table.to_pandas().to_dict("records")
         rows_to_copy = [
             _record_to_row(
                 VectorRecord(
@@ -97,6 +88,7 @@ class LanceDBVectorStore:
                     metadata=_parse_metadata_json(row.get("metadata_json", "{}")),
                 ),
                 index_version,
+                self.profile_name,
             )
             for row in all_rows
             if row.get("document_id") not in excluded
@@ -113,10 +105,8 @@ class LanceDBVectorStore:
         self._ensure_meta_table()
         meta_table = self._db.open_table("vector_meta")
         # Delete old row for this profile, then add the new one.
-        try:
-            meta_table.delete(f"profile_name = {repr(self.profile_name)}")
-        except Exception:
-            pass
+        predicate = _build_profile_name_predicate(self.profile_name)
+        meta_table.delete(predicate)
         meta_table.add([{"profile_name": self.profile_name, "active_version": index_version}])
 
     def active_version(self) -> str:
@@ -292,7 +282,7 @@ def _table_name(index_version: str) -> str:
     return f"vectors_{safe}" if safe else "vectors_legacy"
 
 
-def _record_to_row(record: VectorRecord, index_version: str) -> dict[str, Any]:
+def _record_to_row(record: VectorRecord, index_version: str, profile_name: str) -> dict[str, Any]:
     stored_record_id = (
         record.record_id
         if index_version == "legacy"
@@ -300,7 +290,7 @@ def _record_to_row(record: VectorRecord, index_version: str) -> dict[str, Any]:
     )
     return {
         "record_id": stored_record_id,
-        "profile_name": "",  # populated by the store at write time
+        "profile_name": profile_name,
         "document_id": record.document_id,
         "chunk_id": record.chunk_id,
         "modality": record.modality,
@@ -347,3 +337,32 @@ def _import_lancedb():
             "lancedb is required for LanceDBVectorStore; install with: pip install lancedb"
         ) from exc
     return lancedb
+
+
+# ---------------------------------------------------------------------------
+# Safe predicate builders
+# ---------------------------------------------------------------------------
+
+# Only allow characters that cannot break a LanceDB SQL literal or identifier.
+# record_ids are of the form "<profile_name>:<chunk_id>" and may contain
+# letters, digits, hyphens, underscores, colons, and dots.
+_SAFE_LITERAL_RE = re.compile(r"^[A-Za-z0-9_.:\-]+$")
+
+
+def _validate_predicate_literal(value: str, name: str) -> str:
+    if not _SAFE_LITERAL_RE.match(value):
+        raise ValueError(f"unsafe characters in {name}: {value!r}")
+    return value
+
+
+def _build_record_id_in_predicate(record_ids: list[str]) -> str:
+    if not record_ids:
+        raise ValueError("record_ids must not be empty")
+    safe_ids = [_validate_predicate_literal(rid, "record_id") for rid in record_ids]
+    literals = ", ".join(f"'{rid}'" for rid in safe_ids)
+    return f"record_id IN ({literals})"
+
+
+def _build_profile_name_predicate(profile_name: str) -> str:
+    safe = _validate_predicate_literal(profile_name, "profile_name")
+    return f"profile_name = '{safe}'"
