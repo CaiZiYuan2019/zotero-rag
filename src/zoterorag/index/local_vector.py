@@ -5,6 +5,7 @@ import json
 import math
 from pathlib import Path
 import sqlite3
+import threading
 from typing import Any, Iterable
 
 
@@ -57,6 +58,43 @@ def open_vector_store(
     return LocalVectorStore(path, profile_name=profile_name, dimension=dimension)
 
 
+class _ThreadSafeConnection:
+    """Thread-safe proxy for a sqlite3 connection.
+
+    LocalVectorStore may be accessed from FastAPI worker threads and background
+    indexing workers. This wrapper serializes every method call and context
+    manager entry/exit through an RLock.
+    """
+
+    def __init__(self, conn: sqlite3.Connection, lock: threading.RLock) -> None:
+        self._conn = conn
+        self._lock = lock
+
+    def __enter__(self) -> sqlite3.Connection:
+        self._lock.acquire()
+        return self._conn.__enter__()
+
+    def __exit__(self, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return self._conn.__exit__(*args, **kwargs)
+        finally:
+            self._lock.release()
+
+    def __getattribute__(self, name: str) -> Any:
+        if name in ("_conn", "_lock", "__enter__", "__exit__"):
+            return object.__getattribute__(self, name)
+        attr = getattr(object.__getattribute__(self, "_conn"), name)
+        if callable(attr):
+            lock = object.__getattribute__(self, "_lock")
+
+            def wrapper(*args: Any, **kwargs: Any) -> Any:
+                with lock:
+                    return attr(*args, **kwargs)
+
+            return wrapper
+        return attr
+
+
 class LocalVectorStore:
     """Small SQLite vector store used for local tests and bootstrap.
 
@@ -70,8 +108,10 @@ class LocalVectorStore:
         self.profile_name = profile_name
         self.dimension = dimension
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.path)
-        self.conn.row_factory = sqlite3.Row
+        self._lock = threading.RLock()
+        raw_conn = sqlite3.connect(self.path, check_same_thread=False)
+        raw_conn.row_factory = sqlite3.Row
+        self.conn: sqlite3.Connection = _ThreadSafeConnection(raw_conn, self._lock)
         self._migrate()
 
     def close(self) -> None:
@@ -120,50 +160,51 @@ class LocalVectorStore:
             )
 
     def upsert(self, records: Iterable[VectorRecord], *, index_version: str = "legacy") -> int:
-        count = 0
-        with self.conn:
-            for record in records:
-                if len(record.vector) != self.dimension:
-                    raise ValueError(
-                        f"record {record.record_id} has dimension {len(record.vector)}, expected {self.dimension}"
+        with self._lock:
+            count = 0
+            with self.conn:
+                for record in records:
+                    if len(record.vector) != self.dimension:
+                        raise ValueError(
+                            f"record {record.record_id} has dimension {len(record.vector)}, expected {self.dimension}"
+                        )
+                    # Older local stores use record_id as the primary key. Prefix
+                    # non-legacy staged versions so rebuilding the same chunk cannot
+                    # overwrite the currently published version before commit.
+                    stored_record_id = (
+                        record.record_id if index_version == "legacy" else f"{index_version}:{record.record_id}"
                     )
-                # Older local stores use record_id as the primary key. Prefix
-                # non-legacy staged versions so rebuilding the same chunk cannot
-                # overwrite the currently published version before commit.
-                stored_record_id = (
-                    record.record_id if index_version == "legacy" else f"{index_version}:{record.record_id}"
-                )
-                self.conn.execute(
-                    """
-                    INSERT INTO vectors(
-                        record_id, profile_name, document_id, chunk_id, modality,
-                        index_version, vector_json, text, metadata_json
+                    self.conn.execute(
+                        """
+                        INSERT INTO vectors(
+                            record_id, profile_name, document_id, chunk_id, modality,
+                            index_version, vector_json, text, metadata_json
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(record_id) DO UPDATE SET
+                            profile_name = excluded.profile_name,
+                            document_id = excluded.document_id,
+                            chunk_id = excluded.chunk_id,
+                            modality = excluded.modality,
+                            index_version = excluded.index_version,
+                            vector_json = excluded.vector_json,
+                            text = excluded.text,
+                            metadata_json = excluded.metadata_json
+                        """,
+                        (
+                            stored_record_id,
+                            self.profile_name,
+                            record.document_id,
+                            record.chunk_id,
+                            record.modality,
+                            index_version,
+                            json.dumps(record.vector),
+                            record.text,
+                            json.dumps(record.metadata or {}, ensure_ascii=False, sort_keys=True),
+                        ),
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(record_id) DO UPDATE SET
-                        profile_name = excluded.profile_name,
-                        document_id = excluded.document_id,
-                        chunk_id = excluded.chunk_id,
-                        modality = excluded.modality,
-                        index_version = excluded.index_version,
-                        vector_json = excluded.vector_json,
-                        text = excluded.text,
-                        metadata_json = excluded.metadata_json
-                    """,
-                    (
-                        stored_record_id,
-                        self.profile_name,
-                        record.document_id,
-                        record.chunk_id,
-                        record.modality,
-                        index_version,
-                        json.dumps(record.vector),
-                        record.text,
-                        json.dumps(record.metadata or {}, ensure_ascii=False, sort_keys=True),
-                    ),
-                )
-                count += 1
-        return count
+                    count += 1
+            return count
 
     def copy_active_records_to_version(
         self,
@@ -177,64 +218,69 @@ class LocalVectorStore:
         adding changed records for one document, copy all other active records
         into the new staged version so publishing does not hide previously
         indexed documents.
+
+        This method is serialized with :attr:`_lock` so that concurrent writers
+        do not read the same active version and then overwrite each other's
+        staged records when they publish.
         """
 
-        active_version = self.active_version()
-        excluded = set(exclude_document_ids)
-        rows = self.conn.execute(
-            """
-            SELECT record_id, document_id, chunk_id, modality, index_version,
-                   vector_json, text, metadata_json
-            FROM vectors
-            WHERE profile_name = ? AND index_version = ?
-            """,
-            (self.profile_name, active_version),
-        ).fetchall()
-        count = 0
-        with self.conn:
-            for row in rows:
-                if row["document_id"] in excluded:
-                    continue
-                logical_record_id = strip_stored_version_prefix(
-                    stored_record_id=str(row["record_id"]),
-                    index_version=str(row["index_version"]),
-                )
-                stored_record_id = (
-                    logical_record_id
-                    if index_version == "legacy"
-                    else f"{index_version}:{logical_record_id}"
-                )
-                self.conn.execute(
-                    """
-                    INSERT INTO vectors(
-                        record_id, profile_name, document_id, chunk_id, modality,
-                        index_version, vector_json, text, metadata_json
+        with self._lock:
+            active_version = self.active_version()
+            excluded = set(exclude_document_ids)
+            rows = self.conn.execute(
+                """
+                SELECT record_id, document_id, chunk_id, modality, index_version,
+                       vector_json, text, metadata_json
+                FROM vectors
+                WHERE profile_name = ? AND index_version = ?
+                """,
+                (self.profile_name, active_version),
+            ).fetchall()
+            count = 0
+            with self.conn:
+                for row in rows:
+                    if row["document_id"] in excluded:
+                        continue
+                    logical_record_id = strip_stored_version_prefix(
+                        stored_record_id=str(row["record_id"]),
+                        index_version=str(row["index_version"]),
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(record_id) DO UPDATE SET
-                        profile_name = excluded.profile_name,
-                        document_id = excluded.document_id,
-                        chunk_id = excluded.chunk_id,
-                        modality = excluded.modality,
-                        index_version = excluded.index_version,
-                        vector_json = excluded.vector_json,
-                        text = excluded.text,
-                        metadata_json = excluded.metadata_json
-                    """,
-                    (
-                        stored_record_id,
-                        self.profile_name,
-                        row["document_id"],
-                        row["chunk_id"],
-                        row["modality"],
-                        index_version,
-                        row["vector_json"],
-                        row["text"],
-                        row["metadata_json"],
-                    ),
-                )
-                count += 1
-        return count
+                    stored_record_id = (
+                        logical_record_id
+                        if index_version == "legacy"
+                        else f"{index_version}:{logical_record_id}"
+                    )
+                    self.conn.execute(
+                        """
+                        INSERT INTO vectors(
+                            record_id, profile_name, document_id, chunk_id, modality,
+                            index_version, vector_json, text, metadata_json
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(record_id) DO UPDATE SET
+                            profile_name = excluded.profile_name,
+                            document_id = excluded.document_id,
+                            chunk_id = excluded.chunk_id,
+                            modality = excluded.modality,
+                            index_version = excluded.index_version,
+                            vector_json = excluded.vector_json,
+                            text = excluded.text,
+                            metadata_json = excluded.metadata_json
+                        """,
+                        (
+                            stored_record_id,
+                            self.profile_name,
+                            row["document_id"],
+                            row["chunk_id"],
+                            row["modality"],
+                            index_version,
+                            row["vector_json"],
+                            row["text"],
+                            row["metadata_json"],
+                        ),
+                    )
+                    count += 1
+            return count
 
     def publish_version(self, index_version: str) -> None:
         """Atomically switch searches for this profile to a completed version.
@@ -243,17 +289,18 @@ class LocalVectorStore:
         keep using the previous version until this metadata row is committed.
         """
 
-        with self.conn:
-            self.conn.execute(
-                """
-                INSERT INTO vector_meta(profile_name, active_version, updated_at)
-                VALUES (?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(profile_name) DO UPDATE SET
-                    active_version = excluded.active_version,
-                    updated_at = excluded.updated_at
-                """,
-                (self.profile_name, index_version),
-            )
+        with self._lock:
+            with self.conn:
+                self.conn.execute(
+                    """
+                    INSERT INTO vector_meta(profile_name, active_version, updated_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(profile_name) DO UPDATE SET
+                        active_version = excluded.active_version,
+                        updated_at = excluded.updated_at
+                    """,
+                    (self.profile_name, index_version),
+                )
 
     def active_version(self) -> str:
         row = self.conn.execute(

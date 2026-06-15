@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
+import unittest
 
 from tests._support import OptionalModuleTestCase, call_with_known_kwargs, workspace_tmpdir
+from zoterorag.index.local_vector import LocalVectorStore, VectorRecord
 
 
 class LocalVectorStoreTests(OptionalModuleTestCase):
@@ -175,3 +178,43 @@ class LocalVectorStoreTests(OptionalModuleTestCase):
                 close_method = getattr(store, "close", None)
                 if callable(close_method):
                     close_method()
+
+
+class LocalVectorStoreConcurrencyTests(unittest.TestCase):
+    def test_concurrent_index_publish_does_not_lose_documents(self) -> None:
+        with workspace_tmpdir("vector-store-concurrent-") as tmpdir:
+            store = LocalVectorStore(tmpdir / "vectors.sqlite", "test-profile", 3)
+            try:
+                # Seed with two documents in the legacy version.
+                store.upsert([
+                    VectorRecord(record_id="r1", document_id="doc-a", chunk_id="c1", vector=[1.0, 0.0, 0.0], text="a", modality="text", metadata={}),
+                    VectorRecord(record_id="r2", document_id="doc-b", chunk_id="c2", vector=[0.0, 1.0, 0.0], text="b", modality="text", metadata={}),
+                ])
+
+                errors: list[Exception] = []
+
+                def worker(doc_id: str, version: str, vector: list[float]) -> None:
+                    try:
+                        store.copy_active_records_to_version(index_version=version, exclude_document_ids=[doc_id])
+                        store.upsert([
+                            VectorRecord(record_id=f"r-{doc_id}", document_id=doc_id, chunk_id=f"c-{doc_id}", vector=vector, text=doc_id, modality="text", metadata={}),
+                        ], index_version=version)
+                        store.publish_version(version)
+                    except Exception as exc:  # pragma: no cover
+                        errors.append(exc)
+
+                threads = [
+                    threading.Thread(target=worker, args=("doc-a", "batch-a", [0.5, 0.0, 0.0])),
+                    threading.Thread(target=worker, args=("doc-b", "batch-b", [0.0, 0.5, 0.0])),
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+
+                self.assertEqual([], errors)
+                counts = store.counts()
+                self.assertEqual(2, counts["documents"])
+                self.assertEqual(2, counts["chunks"])
+            finally:
+                store.close()
