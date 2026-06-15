@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from pathlib import Path
+import sys
 from typing import Any, Literal
 
 from ..db import JobEvent, StateLedger
@@ -145,12 +146,17 @@ def start_ingest_job(
     skipped: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
 
-    for document in plan["documents"]:
+    total = len(plan["documents"])
+    _progress(f"\n=== ingest {total} documents ===\n")
+
+    for idx, document in enumerate(plan["documents"], start=1):
         if document["next_stage"] == "complete":
             skipped.append(document)
             continue
 
+        title = str(document.get("title") or document["document_id"])[:80]
         try:
+            _progress(f"[{idx}/{total}] {title}")
             result = _execute_document_stages(
                 ledger=ledger,
                 job_id=job_id,
@@ -161,8 +167,10 @@ def start_ingest_job(
                 vector_store_dir=vector_store_dir,
             )
             executed.append(result)
+            _progress(f"  -> done\n")
         except Exception as exc:
             failed.append({"document": document, "error": str(exc)})
+            _progress(f"  -> FAILED: {exc}\n")
             ledger.add_event(
                 JobEvent(
                     job_id=job_id,
@@ -174,6 +182,7 @@ def start_ingest_job(
             )
 
     final_status = "completed" if not failed else "completed_with_errors"
+    _progress(f"\n=== {final_status}: {len(executed)} ok, {len(skipped)} skipped, {len(failed)} failed ===\n")
     ledger.add_event(
         JobEvent(
             job_id=job_id,
@@ -443,6 +452,11 @@ def require_ingest_job(ledger: StateLedger, job_id: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _progress(msg: str) -> None:
+    """Write a human-readable progress line to stderr."""
+    print(msg, file=sys.stderr, flush=True)
+
+
 def _execute_document_stages(
     *,
     ledger: StateLedger,
@@ -519,20 +533,13 @@ def _execute_extract_stage(
     if not file_path or not Path(file_path).is_file():
         raise FileNotFoundError(f"attachment file not found: {file_path}")
 
-    ledger.add_event(
-        JobEvent(
-            job_id=job_id,
-            stage="extract",
-            status="running",
-            message=f"submitting {attachment_key} to extractor",
-        )
-    )
-
+    _progress(f"  extract: submitting...")
     request = ExtractionRequest(
         input_file=Path(file_path),
         attachment_key=attachment_key,
     )
     result = extract_manager.ensure_extraction(request)
+    _progress(f"  extract: {result.job['state']} (cache_hit={result.cache_hit})")
 
     ledger.add_event(
         JobEvent(
@@ -583,6 +590,7 @@ def _execute_normalize_stage(
         )
     )
 
+    _progress(f"  normalize: {document_id}...")
     normalize_result = normalize_markdown_document(
         source_markdown=source_md,
         output_root=normalized_dir,
@@ -590,6 +598,7 @@ def _execute_normalize_stage(
         attachment_key=attachment_key,
         extract_job_id=extract_job["job_id"],
     )
+    _progress(f"  normalize: {normalize_result.ledger_artifact()['chunk_count']} chunks, {normalize_result.ledger_artifact()['image_count']} images")
 
     # Persist the normalized artifact
     ledger.upsert_normalized_artifact(normalize_result.ledger_artifact())
@@ -622,6 +631,7 @@ def _execute_embed_stage(
 ) -> None:
     """Run embedding for one document under one profile."""
 
+    _progress(f"  embed:{profile_name}: {document_id}...")
     ledger.add_event(
         JobEvent(
             job_id=job_id,
@@ -638,6 +648,7 @@ def _execute_embed_stage(
         document_id=document_id,
         # Provider is auto-resolved from profile by _resolve_embedding_provider
     )
+    _progress(f"  embed:{profile_name}: {index_result.indexed_chunks} chunks (reused={index_result.reused_existing})")
 
     ledger.add_event(
         JobEvent(
