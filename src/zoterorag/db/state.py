@@ -362,7 +362,7 @@ class StateLedger:
     def create_job(self, kind: str, payload: dict[str, Any] | None = None) -> str:
         job_id = str(uuid.uuid4())
         now = utc_now()
-        payload_json = json.dumps(payload or {}, ensure_ascii=False, sort_keys=True)
+        payload_json = json.dumps(payload or {}, ensure_ascii=False, sort_keys=True, default=str)
         with self.conn:
             self.conn.execute(
                 """
@@ -426,7 +426,7 @@ class StateLedger:
 
     def add_event(self, event: JobEvent) -> None:
         created_at = event.created_at or utc_now()
-        payload_json = json.dumps(event.payload or {}, ensure_ascii=False, sort_keys=True)
+        payload_json = json.dumps(event.payload or {}, ensure_ascii=False, sort_keys=True, default=str)
         with self.conn:
             self.conn.execute(
                 """
@@ -461,7 +461,7 @@ class StateLedger:
         status: str,
         payload: dict[str, Any] | None = None,
     ) -> None:
-        payload_json = json.dumps(payload or {}, ensure_ascii=False, sort_keys=True)
+        payload_json = json.dumps(payload or {}, ensure_ascii=False, sort_keys=True, default=str)
         with self.conn:
             self.conn.execute(
                 """
