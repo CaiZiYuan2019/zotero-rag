@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import logging
 import math
 from pathlib import Path
 import sqlite3
 import threading
 from typing import Any, Iterable
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -115,10 +119,22 @@ class LocalVectorStore:
         self._migrate()
 
     def close(self) -> None:
-        try:
-            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except sqlite3.Error:
-            pass
+        # Checkpoint before closing. A busy/interrupted checkpoint is retried so
+        # that write-ahead log data is not silently left behind.
+        for attempt in range(3):
+            try:
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                break
+            except sqlite3.Error as exc:
+                if attempt < 2:
+                    logger.warning(
+                        "vector store checkpoint failed (attempt %d/%d): %s",
+                        attempt + 1,
+                        3,
+                        exc,
+                    )
+                else:
+                    logger.error("vector store checkpoint failed after retries: %s", exc)
         self.conn.close()
 
     def _migrate(self) -> None:
@@ -333,16 +349,37 @@ class LocalVectorStore:
 
         scored = []
         for row in rows:
-            vector = json.loads(row["vector_json"])
-            score = cosine_similarity(query_vector, vector)
+            record_id = row["record_id"]
+            try:
+                vector = json.loads(row["vector_json"])
+            except json.JSONDecodeError as exc:
+                logger.warning(
+                    "skipping corrupt vector record %s: invalid vector_json: %s",
+                    record_id,
+                    exc,
+                )
+                continue
+            try:
+                score = cosine_similarity(query_vector, vector)
+            except ValueError as exc:
+                logger.warning(
+                    "skipping corrupt vector record %s: dimension mismatch: %s",
+                    record_id,
+                    exc,
+                )
+                continue
+            try:
+                metadata = json.loads(row["metadata_json"])
+            except json.JSONDecodeError:
+                metadata = {}
             scored.append(
                 {
-                    "record_id": row["record_id"],
+                    "record_id": record_id,
                     "document_id": row["document_id"],
                     "chunk_id": row["chunk_id"],
                     "modality": row["modality"],
                     "text": row["text"],
-                    "metadata": json.loads(row["metadata_json"]),
+                    "metadata": metadata,
                     "score": score,
                 }
             )

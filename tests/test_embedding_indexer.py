@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from pathlib import Path
 import unittest
 
 from tests._support import workspace_tmpdir
@@ -252,7 +253,17 @@ class EmbeddingIndexerTests(unittest.TestCase):
                 batch = ledger.list_embedding_batches(profile_name="qwen_text", document_id="DOC1")[0]
                 self.assertEqual("stub", batch["provider"])
 
-                # Same behavior for search: auto-resolve fails without API keys.
+                # Search now defaults to stub-safe resolution (matches API/CLI
+                # default embedding_provider="stub"). Explicitly disable stub to
+                # verify real-provider auto-resolution still fails without keys.
+                hits = search_vector_index(
+                    ledger=ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="qwen_text",
+                    query="alpha beta",
+                    mode="text",
+                )
+                self.assertTrue(hits)
                 with self.assertRaises((RuntimeError, ValueError)):
                     search_vector_index(
                         ledger=ledger,
@@ -260,6 +271,7 @@ class EmbeddingIndexerTests(unittest.TestCase):
                         profile_name="qwen_text",
                         query="alpha beta",
                         mode="text",
+                        allow_stub_provider=False,
                     )
 
                 # Passing an explicit stub provider works.
@@ -406,6 +418,118 @@ class EmbeddingIndexerTests(unittest.TestCase):
                 self.assertEqual(first.embedding_batch_hash, second.embedding_batch_hash)
             finally:
                 ledger.close()
+
+
+    def test_resolve_registered_vector_store_uses_registry(self) -> None:
+        with workspace_tmpdir("embedding-indexer-backend-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                ledger.upsert_embedding_profiles(
+                    [
+                        EmbeddingProfile(
+                            name="stub_text",
+                            provider="stub",
+                            model="stub",
+                            dimension=8,
+                            modality="text",
+                            enabled=True,
+                            default_for_text=True,
+                        )
+                    ]
+                )
+                from zoterorag.embeddings.indexer import _resolve_registered_vector_store
+
+                # Before registration, the helper falls back to the caller
+                # supplied backend and path.
+                backend, path = _resolve_registered_vector_store(
+                    ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="stub_text",
+                    fallback_backend="sqlite-local",
+                )
+                self.assertEqual("sqlite-local", backend)
+                self.assertEqual(
+                    tmpdir / "vectors" / "stub_text" / "vectors.sqlite", path
+                )
+
+                # After registration, the stored backend/path take precedence.
+                ledger.register_vector_index(
+                    profile_name="stub_text",
+                    backend="lancedb",
+                    path=tmpdir / "vectors" / "stub_text",
+                    document_count=0,
+                    chunk_count=0,
+                    active=True,
+                    active_version="legacy",
+                )
+                backend, path = _resolve_registered_vector_store(
+                    ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="stub_text",
+                    fallback_backend="sqlite-local",
+                )
+                self.assertEqual("lancedb", backend)
+                self.assertEqual(tmpdir / "vectors" / "stub_text", path)
+            finally:
+                ledger.close()
+
+    def test_api_stub_selection_uses_stub_for_non_stub_profile(self) -> None:
+        with workspace_tmpdir("embedding-indexer-api-stub-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                ledger.upsert_embedding_profiles(
+                    [
+                        EmbeddingProfile(
+                            name="qwen_text",
+                            provider="dashscope",
+                            model="qwen3-vl-embedding",
+                            dimension=8,
+                            modality="text",
+                            enabled=True,
+                            default_for_text=True,
+                        )
+                    ]
+                )
+                seed_markdown_document(tmpdir, ledger, document_id="DOC1", text="api stub evidence")
+                index_normalized_document(
+                    ledger=ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="qwen_text",
+                    document_id="DOC1",
+                    allow_stub_provider=True,
+                )
+
+                # Default search resolution is stub-safe, matching API behavior
+                # when embedding_provider="stub" is selected.
+                hits = search_vector_index(
+                    ledger=ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="qwen_text",
+                    query="api stub evidence",
+                    mode="text",
+                )
+                self.assertTrue(hits)
+
+                # Explicitly disallowing stub forces real-provider resolution.
+                with self.assertRaises((RuntimeError, ValueError)):
+                    search_vector_index(
+                        ledger=ledger,
+                        vector_store_dir=tmpdir / "vectors",
+                        profile_name="qwen_text",
+                        query="api stub evidence",
+                        mode="text",
+                        allow_stub_provider=False,
+                    )
+            finally:
+                ledger.close()
+
+    def test_vector_path_for_profile_respects_backend(self) -> None:
+        from zoterorag.embeddings.indexer import vector_path_for_profile
+
+        sqlite_path = vector_path_for_profile("/store", "p1", backend="sqlite-local")
+        lancedb_path = vector_path_for_profile("/store", "p1", backend="lancedb")
+        self.assertEqual(sqlite_path, Path("/store") / "p1" / "vectors.sqlite")
+        self.assertEqual(lancedb_path, Path("/store") / "p1")
 
 
 def seed_markdown_document(tmpdir, ledger: StateLedger, *, document_id: str, text: str):

@@ -42,7 +42,6 @@ class VectorIndexVerification:
 def verify_vector_index(ledger: StateLedger, profile_name: str) -> VectorIndexVerification:
     profiles = {profile["name"]: profile for profile in ledger.list_embedding_profiles()}
     indexes = {index["profile_name"]: index for index in ledger.list_vector_indexes()}
-    errors: list[str] = []
     profile = profiles.get(profile_name)
     index = indexes.get(profile_name)
     if profile is None:
@@ -67,17 +66,54 @@ def verify_vector_index(ledger: StateLedger, profile_name: str) -> VectorIndexVe
     registered_documents = int(index["document_count"])
     registered_chunks = int(index["chunk_count"])
     active_version = str(index.get("active_version") or "legacy")
-    if not path.is_file():
-        return VectorIndexVerification(
-            profile_name=profile_name,
-            ok=False,
+    backend = str(index.get("backend") or "sqlite-local")
+
+    if backend == "lancedb":
+        actual_documents, actual_chunks, dimension_errors, errors = _verify_lancedb_store(
             path=path,
+            profile_name=profile_name,
             expected_dimension=expected_dimension,
+            active_version=active_version,
             registered_documents=registered_documents,
             registered_chunks=registered_chunks,
-            active_version=active_version,
-            errors=[f"missing_vector_store:{path}"],
         )
+    else:
+        actual_documents, actual_chunks, dimension_errors, errors = _verify_sqlite_store(
+            path=path,
+            profile_name=profile_name,
+            expected_dimension=expected_dimension,
+            active_version=active_version,
+            registered_documents=registered_documents,
+            registered_chunks=registered_chunks,
+        )
+
+    return VectorIndexVerification(
+        profile_name=profile_name,
+        ok=not errors,
+        path=path,
+        expected_dimension=expected_dimension,
+        registered_documents=registered_documents,
+        registered_chunks=registered_chunks,
+        active_version=active_version,
+        actual_documents=actual_documents,
+        actual_chunks=actual_chunks,
+        dimension_errors=dimension_errors,
+        errors=errors,
+    )
+
+
+def _verify_sqlite_store(
+    *,
+    path: Path,
+    profile_name: str,
+    expected_dimension: int,
+    active_version: str,
+    registered_documents: int,
+    registered_chunks: int,
+) -> tuple[int, int, int, list[str]]:
+    errors: list[str] = []
+    if not path.is_file():
+        return 0, 0, 0, [f"missing_vector_store:{path}"]
 
     actual_documents = 0
     actual_chunks = 0
@@ -129,16 +165,63 @@ def verify_vector_index(ledger: StateLedger, profile_name: str) -> VectorIndexVe
     finally:
         conn.close()
 
-    return VectorIndexVerification(
-        profile_name=profile_name,
-        ok=not errors,
-        path=path,
-        expected_dimension=expected_dimension,
-        registered_documents=registered_documents,
-        registered_chunks=registered_chunks,
-        active_version=active_version,
-        actual_documents=actual_documents,
-        actual_chunks=actual_chunks,
-        dimension_errors=dimension_errors,
-        errors=errors,
-    )
+    return actual_documents, actual_chunks, dimension_errors, errors
+
+
+def _verify_lancedb_store(
+    *,
+    path: Path,
+    profile_name: str,
+    expected_dimension: int,
+    active_version: str,
+    registered_documents: int,
+    registered_chunks: int,
+) -> tuple[int, int, int, list[str]]:
+    errors: list[str] = []
+    if not path.is_dir():
+        return 0, 0, 0, [f"missing_vector_store:{path}"]
+
+    try:
+        import lancedb
+    except ImportError:
+        return 0, 0, 0, ["lancedb_not_installed"]
+
+    actual_documents = 0
+    actual_chunks = 0
+    dimension_errors = 0
+    try:
+        db = lancedb.connect(str(path))
+        from .lancedb_vector import _table_name
+
+        table_name = _table_name(active_version)
+        try:
+            table = db.open_table(table_name)
+        except Exception as exc:
+            return 0, 0, 0, [f"missing_active_table:{table_name}:{exc}"]
+
+        rows = table.to_pandas().to_dict("records")
+        rows = [r for r in rows if r.get("profile_name") == profile_name]
+        actual_chunks = len(rows)
+        actual_documents = len({r.get("document_id") for r in rows})
+
+        for row in rows:
+            record_id = row.get("record_id", "unknown")
+            try:
+                vector = json.loads(row.get("vector_json", "[]"))
+            except json.JSONDecodeError:
+                errors.append(f"invalid_vector_json:{record_id}")
+                dimension_errors += 1
+                continue
+            if not isinstance(vector, list) or len(vector) != expected_dimension:
+                dimension_errors += 1
+
+        if registered_documents != actual_documents:
+            errors.append(f"document_count_mismatch:{registered_documents}!={actual_documents}")
+        if registered_chunks != actual_chunks:
+            errors.append(f"chunk_count_mismatch:{registered_chunks}!={actual_chunks}")
+        if dimension_errors:
+            errors.append(f"dimension_errors:{dimension_errors}")
+    except Exception as exc:
+        errors.append(f"lancedb_verification_error:{exc}")
+
+    return actual_documents, actual_chunks, dimension_errors, errors

@@ -12,6 +12,10 @@ Consumer = Literal["manual", "llm_text", "llm_multimodal"]
 ImageReturn = Literal["file_ref", "base64", "none"]
 
 
+class RerankNotSupportedError(NotImplementedError):
+    """Raised when rerank is requested but no RerankProvider is implemented."""
+
+
 @dataclass(frozen=True)
 class SearchResult:
     document_id: str
@@ -109,6 +113,8 @@ def strip_image_payload_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
 
     blocked_keys = {
         "image_path",
+        "image_embedding_path",
+        "embedding_relative_path",
         "image_return",
         "file_ref",
         "thumbnail_ref",
@@ -165,4 +171,4 @@ def ensure_rerank_disabled(rerank: bool) -> None:
     """Reject rerank requests until a real RerankProvider is implemented."""
 
     if rerank:
-        raise NotImplementedError("rerank is reserved but not implemented; use rerank=false")
+        raise RerankNotSupportedError("rerank is reserved but not implemented; use rerank=false")

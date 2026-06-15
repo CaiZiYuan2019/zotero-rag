@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Any, Iterable
 
 from .local_vector import VectorRecord, cosine_similarity
+
+
+logger = logging.getLogger(__name__)
 
 
 class LanceDBVectorStore:
@@ -71,7 +75,17 @@ class LanceDBVectorStore:
         active_version = self.active_version()
         if not active_version:
             return 0
-        active_table = self._db.open_table(_table_name(active_version))
+        try:
+            active_table = self._db.open_table(_table_name(active_version))
+        except Exception as exc:
+            if _is_table_missing(exc):
+                logger.warning(
+                    "active table %s missing for profile %s, nothing to copy",
+                    active_version,
+                    self.profile_name,
+                )
+                return 0
+            raise
         excluded = set(exclude_document_ids)
         all_rows = active_table.to_pandas().to_dict("records")
         rows_to_copy = [
@@ -113,8 +127,14 @@ class LanceDBVectorStore:
         try:
             meta_table = self._db.open_table("vector_meta")
             rows = meta_table.to_pandas().to_dict("records")
-        except Exception:
-            return "legacy"
+        except Exception as exc:
+            if _is_table_missing(exc):
+                logger.warning(
+                    "vector_meta table missing for profile %s, assuming legacy",
+                    self.profile_name,
+                )
+                return "legacy"
+            raise
         for row in rows:
             if row.get("profile_name") == self.profile_name:
                 return str(row.get("active_version", "legacy"))
@@ -138,15 +158,19 @@ class LanceDBVectorStore:
         table_name = _table_name(active_version)
         try:
             table = self._db.open_table(table_name)
-        except Exception:
-            return []
+        except Exception as exc:
+            if _is_table_missing(exc):
+                logger.warning(
+                    "search table %s missing for profile %s",
+                    table_name,
+                    self.profile_name,
+                )
+                return []
+            raise
 
         # LanceDB native vector search when a vector column is configured.
         # We fall back to brute-force cosine similarity for portability.
-        try:
-            all_rows = table.to_pandas().to_dict("records")
-        except Exception:
-            return []
+        all_rows = table.to_pandas().to_dict("records")
 
         scored = []
         for row in all_rows:
@@ -175,8 +199,15 @@ class LanceDBVectorStore:
         try:
             table = self._db.open_table(_table_name(version))
             rows = table.to_pandas().to_dict("records")
-        except Exception:
-            return {"documents": 0, "chunks": 0}
+        except Exception as exc:
+            if _is_table_missing(exc):
+                logger.warning(
+                    "counts table %s missing for profile %s",
+                    _table_name(version),
+                    self.profile_name,
+                )
+                return {"documents": 0, "chunks": 0}
+            raise
         doc_ids = {r.get("document_id") for r in rows}
         return {"documents": len(doc_ids), "chunks": len(rows)}
 
@@ -191,8 +222,15 @@ class LanceDBVectorStore:
         try:
             table = self._db.open_table(_table_name(version))
             rows = table.to_pandas().to_dict("records")
-        except Exception:
-            return {"chunks": 0}
+        except Exception as exc:
+            if _is_table_missing(exc):
+                logger.warning(
+                    "document_counts table %s missing for profile %s",
+                    _table_name(version),
+                    self.profile_name,
+                )
+                return {"chunks": 0}
+            raise
         count = 0
         for row in rows:
             if row.get("document_id") != document_id:
@@ -214,8 +252,15 @@ class LanceDBVectorStore:
         try:
             table = self._db.open_table(_table_name(version))
             rows = table.to_pandas().to_dict("records")
-        except Exception:
-            return set()
+        except Exception as exc:
+            if _is_table_missing(exc):
+                logger.warning(
+                    "document_metadata_values table %s missing for profile %s",
+                    _table_name(version),
+                    self.profile_name,
+                )
+                return set()
+            raise
         values: set[Any] = set()
         for row in rows:
             if row.get("document_id") != document_id:
@@ -236,7 +281,9 @@ class LanceDBVectorStore:
             return self._table_cache[table_name]
         try:
             table = self._db.open_table(table_name)
-        except Exception:
+        except Exception as exc:
+            if not _is_table_missing(exc):
+                raise
             import pyarrow as pa
 
             schema = pa.schema([
@@ -258,7 +305,9 @@ class LanceDBVectorStore:
     def _ensure_meta_table(self) -> Any:
         try:
             return self._db.open_table("vector_meta")
-        except Exception:
+        except Exception as exc:
+            if not _is_table_missing(exc):
+                raise
             import pyarrow as pa
 
             schema = pa.schema([
@@ -337,6 +386,26 @@ def _import_lancedb():
             "lancedb is required for LanceDBVectorStore; install with: pip install lancedb"
         ) from exc
     return lancedb
+
+
+def _is_table_missing(exc: BaseException) -> bool:
+    """Heuristic to detect "table does not exist" without importing lancedb."""
+    if isinstance(exc, FileNotFoundError):
+        return True
+    name = type(exc).__name__.lower()
+    if "notfound" in name or "missing" in name:
+        return True
+    msg = str(exc).lower()
+    indicators = (
+        "not found",
+        "does not exist",
+        "doesn't exist",
+        "table not found",
+        "no such table",
+        "no table named",
+        "table was not found",
+    )
+    return any(indicator in msg for indicator in indicators)
 
 
 # ---------------------------------------------------------------------------
