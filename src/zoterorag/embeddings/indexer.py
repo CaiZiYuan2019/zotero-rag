@@ -348,8 +348,14 @@ def search_vector_index(
 def embedding_input_for_chunk(chunk: dict[str, Any], artifact: dict[str, Any], role: str) -> EmbeddingInput:
     metadata = chunk.get("metadata", {})
     image_path = None
-    if chunk["chunk_type"] == "image" and metadata.get("image_path"):
-        image_path = str(Path(artifact["artifact_dir"]) / metadata["image_path"])
+    if chunk["chunk_type"] == "image":
+        image_path = metadata.get("image_embedding_path")
+        if not image_path:
+            status = metadata.get("image_embedding_status") or "missing"
+            raise ValueError(
+                f"image chunk {chunk['chunk_id']} is not ready for embedding: {status}"
+            )
+        image_path = str(Path(artifact["artifact_dir"]) / image_path)
     return EmbeddingInput(
         input_id=chunk["chunk_id"],
         text=chunk.get("text", ""),

@@ -19,6 +19,7 @@ HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 class ImagePolicy:
     ordered_prefix: str = "img"
     ordered_digits: int = 3
+    embedding_dir_name: str = "embedding_images"
     embedding_max_long_edge: int = 1600
     embedding_max_bytes: int = 5 * 1024 * 1024
 
@@ -75,12 +76,14 @@ def normalize_markdown_document(
     markdown_text = source_path.read_text(encoding="utf-8")
     artifact_dir = Path(output_root) / sanitize_id(document_id)
     images_dir = artifact_dir / "images"
+    embedding_images_dir = artifact_dir / policy.embedding_dir_name
     images_dir.mkdir(parents=True, exist_ok=True)
+    embedding_images_dir.mkdir(parents=True, exist_ok=True)
 
     refs = collect_image_references(markdown_text, source_path.parent)
     mapping = build_ordered_image_mapping(refs, images_dir, policy)
     normalized_text = rewrite_image_references(markdown_text, mapping)
-    images = copy_images(mapping, images_dir, policy)
+    images = copy_images(mapping, images_dir, embedding_images_dir, policy)
     images = assign_image_runs(images, markdown_text)
     chunks = build_chunks(document_id=document_id, markdown_text=normalized_text, images=images)
 
@@ -210,7 +213,12 @@ def rewrite_image_references(markdown_text: str, mapping: dict[Path, dict[str, A
     return HTML_IMAGE_RE.sub(replace_html, markdown_text)
 
 
-def copy_images(mapping: dict[Path, dict[str, Any]], images_dir: Path, policy: ImagePolicy) -> list[dict[str, Any]]:
+def copy_images(
+    mapping: dict[Path, dict[str, Any]],
+    images_dir: Path,
+    embedding_images_dir: Path,
+    policy: ImagePolicy,
+) -> list[dict[str, Any]]:
     images = []
     for source, item in sorted(mapping.items(), key=lambda pair: pair[1]["image_index"]):
         if not source.is_file():
@@ -220,6 +228,13 @@ def copy_images(mapping: dict[Path, dict[str, Any]], images_dir: Path, policy: I
         stat = target.stat()
         dimensions = read_image_dimensions(target)
         quality_flags = image_quality_flags(dimensions, stat.st_size, policy)
+        embedding_image = prepare_embedding_image(
+            source=target,
+            embedding_images_dir=embedding_images_dir,
+            ordered_name=item["ordered_name"],
+            quality_flags=quality_flags,
+            policy=policy,
+        )
         images.append(
             {
                 "image_index": item["image_index"],
@@ -237,9 +252,7 @@ def copy_images(mapping: dict[Path, dict[str, Any]], images_dir: Path, policy: I
                 "embedding_policy": {
                     "max_long_edge": policy.embedding_max_long_edge,
                     "max_bytes": policy.embedding_max_bytes,
-                    "status": "needs_resize"
-                    if "exceeds_embedding_limits" in quality_flags
-                    else "ready_original",
+                    **embedding_image,
                 },
                 "alt_text": item["alt_text"],
                 "position": item["position"],
@@ -247,6 +260,41 @@ def copy_images(mapping: dict[Path, dict[str, Any]], images_dir: Path, policy: I
             }
         )
     return images
+
+
+def prepare_embedding_image(
+    *,
+    source: Path,
+    embedding_images_dir: Path,
+    ordered_name: str,
+    quality_flags: list[str],
+    policy: ImagePolicy,
+) -> dict[str, Any]:
+    """Create or defer the image derivative used for multimodal embedding.
+
+    Images already within the provider limits are copied to a separate
+    `embedding_images/` tree so future resizing/compression can change only the
+    embedding derivative without mutating the original evidence image.
+    Oversized images are explicitly marked pending instead of silently falling
+    back to the original, which could exceed qwen request limits.
+    """
+
+    if "exceeds_embedding_limits" in quality_flags:
+        return {
+            "status": "pending_resize",
+            "embedding_relative_path": None,
+            "reason": "image exceeds embedding limits; install/enable Pillow resizing before API use",
+        }
+
+    embedding_target = embedding_images_dir / ordered_name
+    shutil.copy2(source, embedding_target)
+    stat = embedding_target.stat()
+    return {
+        "status": "ready_embedding_copy",
+        "embedding_relative_path": str(PurePosixPath(embedding_images_dir.name) / ordered_name),
+        "embedding_sha256": sha256_file(embedding_target),
+        "embedding_size": stat.st_size,
+    }
 
 
 def assign_image_runs(images: list[dict[str, Any]], markdown_text: str) -> list[dict[str, Any]]:
@@ -331,6 +379,8 @@ def build_chunks(document_id: str, markdown_text: str, images: list[dict[str, An
                 "metadata": {
                     "image_index": image["image_index"],
                     "image_path": image["ordered_relative_path"],
+                    "image_embedding_path": image.get("embedding_policy", {}).get("embedding_relative_path"),
+                    "image_embedding_status": image.get("embedding_policy", {}).get("status"),
                     "image_run_id": f"{document_id}:{image['image_run_id']}",
                     "image_run_position": image["image_run_position"],
                     "image_run_count": image["image_run_count"],

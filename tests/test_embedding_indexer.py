@@ -70,11 +70,13 @@ class EmbeddingIndexerTests(unittest.TestCase):
                     profile_name="stub_text",
                     document_id="DOC1",
                 )
+                mm_provider = CountingProvider(dimension=8)
                 mm_result = index_normalized_document(
                     ledger=ledger,
                     vector_store_dir=tmpdir / "vectors",
                     profile_name="stub_mm",
                     document_id="DOC1",
+                    provider=mm_provider,
                 )
                 text_hits = search_vector_index(
                     ledger=ledger,
@@ -136,6 +138,8 @@ class EmbeddingIndexerTests(unittest.TestCase):
 
                 self.assertEqual(1, text_result.indexed_chunks)
                 self.assertEqual(1, mm_result.indexed_chunks)
+                self.assertEqual(1, mm_provider.calls)
+                self.assertTrue(mm_provider.last_inputs[0].image_path.endswith("embedding_images\\img001.png"))
                 self.assertEqual(64, len(text_result.embedding_batch_hash))
                 self.assertEqual(
                     embedding_profile_hash(
@@ -418,10 +422,12 @@ class CountingProvider:
         self.model = "counting"
         self.dimension = dimension
         self.calls = 0
+        self.last_inputs: list[EmbeddingInput] = []
         self._stub = StubEmbeddingProvider(dimension=dimension)
 
     def embed(self, inputs: list[EmbeddingInput]) -> list[EmbeddingVector]:
         self.calls += 1
+        self.last_inputs = list(inputs)
         return self._stub.embed(inputs)
 
 

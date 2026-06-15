@@ -51,12 +51,23 @@ class NormalizeMarkdownTests(unittest.TestCase):
                 self.assertEqual("img001.png", image_manifest[0]["ordered_name"])
                 self.assertEqual("Figure A", image_manifest[0]["alt_text"])
                 self.assertTrue((result.artifact_dir / "images" / "img001.png").is_file())
+                self.assertTrue((result.artifact_dir / "embedding_images" / "img001.png").is_file())
+                self.assertEqual(
+                    "embedding_images/img001.png",
+                    image_manifest[0]["embedding_policy"]["embedding_relative_path"],
+                )
                 self.assertTrue((result.artifact_dir / "chunks.jsonl").is_file())
                 self.assertGreaterEqual(len(chunks), 3)
                 text_chunks = [chunk for chunk in chunks if chunk["chunk_type"] == "text"]
+                image_chunks = [chunk for chunk in chunks if chunk["chunk_type"] == "image"]
                 self.assertNotIn("images/hash-b.png", text_chunks[0]["text"])
                 self.assertNotIn("images/img001.png", text_chunks[0]["text"])
                 self.assertIn("[Image: Figure A]", text_chunks[0]["text"])
+                self.assertEqual("images/img001.png", image_chunks[0]["metadata"]["image_path"])
+                self.assertEqual(
+                    "embedding_images/img001.png",
+                    image_chunks[0]["metadata"]["image_embedding_path"],
+                )
                 self.assertEqual({"image": 2, "text": len(chunks) - 2}, ledger.status_summary()["chunks"])
             finally:
                 ledger.close()
@@ -91,8 +102,13 @@ class NormalizeMarkdownTests(unittest.TestCase):
             self.assertEqual(2000, image_manifest[0]["width"])
             self.assertEqual(1000, image_manifest[0]["height"])
             self.assertIn("exceeds_embedding_long_edge", image_manifest[0]["image_quality_flags"])
-            self.assertEqual("needs_resize", image_manifest[0]["embedding_policy"]["status"])
-            self.assertEqual("ready_original", image_manifest[1]["embedding_policy"]["status"])
+            self.assertEqual("pending_resize", image_manifest[0]["embedding_policy"]["status"])
+            self.assertIsNone(image_manifest[0]["embedding_policy"]["embedding_relative_path"])
+            self.assertEqual("ready_embedding_copy", image_manifest[1]["embedding_policy"]["status"])
+            self.assertEqual(
+                "embedding_images/img002.png",
+                image_manifest[1]["embedding_policy"]["embedding_relative_path"],
+            )
             self.assertIn("tiny_image", image_manifest[2]["image_quality_flags"])
 
             self.assertEqual("run:00001", image_manifest[0]["image_run_id"])
@@ -103,6 +119,8 @@ class NormalizeMarkdownTests(unittest.TestCase):
             self.assertEqual(2, image_manifest[1]["image_run_position"])
             self.assertEqual("DOC_RUN:run:00001", image_chunks[0]["metadata"]["image_run_id"])
             self.assertEqual(2, image_chunks[0]["metadata"]["image_run_count"])
+            self.assertEqual("pending_resize", image_chunks[0]["metadata"]["image_embedding_status"])
+            self.assertIsNone(image_chunks[0]["metadata"]["image_embedding_path"])
 
 def png_header(*, width: int, height: int) -> bytes:
     return (
