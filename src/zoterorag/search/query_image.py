@@ -62,13 +62,16 @@ def validate_query_image_file(
     *,
     allowed_roots: list[str | Path] | None = None,
 ) -> Path:
-    resolved = Path(path).expanduser().resolve()
+    original = Path(path).expanduser()
+    resolved = original.resolve()
     if not resolved.is_file():
         raise FileNotFoundError(f"query image file not found: {path}")
     if allowed_roots:
         roots = [Path(root).expanduser().resolve() for root in allowed_roots]
-        if not any(is_relative_to(resolved, root) for root in roots):
+        if not any(is_relative_to(original, root) for root in roots):
             raise ValueError("query image file is outside the allowed runtime roots")
+        if not any(is_relative_to(resolved, root) for root in roots):
+            raise ValueError("query image file resolves outside the allowed runtime roots")
     return resolved
 
 

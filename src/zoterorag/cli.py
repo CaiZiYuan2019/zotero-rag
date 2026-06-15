@@ -712,7 +712,8 @@ def main(argv: list[str] | None = None) -> int:
                             "type": "file_path" if args.query_image_file else "base64",
                             "value": args.query_image_file or args.query_image_base64,
                             "mime_type": args.query_image_mime_type,
-                        }
+                        },
+                        allowed_roots=[config.paths.data_dir],
                     )
                 except (FileNotFoundError, ValueError) as exc:
                     emit({"ok": False, "error": str(exc)})

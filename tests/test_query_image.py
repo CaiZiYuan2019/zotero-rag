@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import os
 import unittest
 
 from tests._support import workspace_tmpdir
@@ -47,6 +48,27 @@ class QueryImageTests(unittest.TestCase):
     def test_invalid_base64_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
             normalize_query_image({"type": "base64", "value": "not valid base64"})
+
+    def test_symlink_escape_outside_allowed_roots_is_rejected(self) -> None:
+        with workspace_tmpdir("query-image-symlink-") as tmpdir:
+            allowed = tmpdir / "data"
+            outside = tmpdir / "outside"
+            allowed.mkdir()
+            outside.mkdir()
+            real_image = outside / "secret.png"
+            real_image.write_bytes(b"image")
+            symlink_image = allowed / "link.png"
+            try:
+                os.symlink(real_image, symlink_image)
+            except OSError:  # pragma: no cover - symlinks may require privileges on Windows
+                self.skipTest("unable to create symlink in test environment")
+
+            with self.assertRaises(ValueError) as ctx:
+                normalize_query_image(
+                    {"type": "file_path", "value": str(symlink_image)},
+                    allowed_roots=[allowed],
+                )
+            self.assertIn("resolves outside", str(ctx.exception))
 
 
 if __name__ == "__main__":
