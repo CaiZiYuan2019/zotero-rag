@@ -34,7 +34,39 @@ from .providers import build_qwen_embedding_provider, provider_readiness
 from .review import explain_attachment_review
 from .runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime, scan_zotero_shadow
 from .search import fulltext_search, metadata_search, normalize_query_image
+from .search.results import RerankNotSupportedError
 from .zotero import ZoteroShadow
+
+
+_ENV_BASENAME_ALLOWLIST = frozenset({".env"})
+
+
+def _resolve_env_path(env_value: str, allowed_root: Path) -> Path:
+    """Resolve an env file path relative to the project root.
+
+    Rejects empty values, parent-directory traversal, paths that escape the
+    allowed root, non-existent files, and filenames other than ``.env`` or
+    ``.env.*``.
+    """
+    if not env_value:
+        raise ValueError("env path is required")
+    parsed = Path(env_value)
+    if ".." in parsed.parts:
+        raise ValueError(f"env path must not contain '..': {env_value}")
+    if parsed.is_absolute():
+        resolved = parsed.resolve()
+    else:
+        resolved = (allowed_root / parsed).resolve()
+    try:
+        resolved.relative_to(allowed_root.resolve())
+    except ValueError as exc:
+        raise ValueError(f"env path must be inside project root: {env_value}") from exc
+    if not resolved.is_file():
+        raise FileNotFoundError(f"env file not found: {env_value}")
+    basename = resolved.name
+    if basename not in _ENV_BASENAME_ALLOWLIST and not basename.startswith(".env."):
+        raise ValueError(f"env filename must be '.env' or '.env.*': {env_value}")
+    return resolved
 
 
 def emit(data: object) -> None:
@@ -291,6 +323,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     config, ledger = initialize_runtime(args.config)
+    project_root = _find_project_root_for_env(Path(args.config))
     try:
         if args.command == "init-state":
             emit({"ok": True, "state": ledger.status_summary(), "runtime": config_as_public_dict(config)})
@@ -359,8 +392,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "providers" and args.providers_command == "status":
-            emit(provider_readiness(args.env))
-            return 0
+            try:
+                emit(provider_readiness(_resolve_env_path(args.env, project_root)))
+                return 0
+            except (FileNotFoundError, ValueError) as exc:
+                emit({"ok": False, "error": str(exc)})
+                return 1
 
         if args.command == "models" and args.models_command == "list":
             emit(list_embedding_model_catalog(ledger))
@@ -400,8 +437,9 @@ def main(argv: list[str] | None = None) -> int:
                         from .providers import build_mineru_provider
                         from .extractors import ExtractorKeyPool, ExtractionManager
 
-                        key_pool = ExtractorKeyPool.from_env_file(args.env)
-                        provider = build_mineru_provider(args.env)
+                        resolved_env = _resolve_env_path(args.env, project_root)
+                        key_pool = ExtractorKeyPool.from_env_file(resolved_env)
+                        provider = build_mineru_provider(resolved_env)
                         kwargs["extract_manager"] = ExtractionManager(
                             ledger=ledger,
                             cache_dir=config.paths.extract_cache_dir,
@@ -413,7 +451,7 @@ def main(argv: list[str] | None = None) -> int:
                         kwargs["vector_store_dir"] = config.paths.vector_store_dir
                     emit(start_ingest_job(ledger, **kwargs))
                     return 0
-                except NotImplementedError as exc:
+                except RerankNotSupportedError as exc:
                     emit({"ok": False, "error": str(exc)})
                     return 1
                 except (FileNotFoundError, ValueError, RuntimeError) as exc:
@@ -511,7 +549,7 @@ def main(argv: list[str] | None = None) -> int:
                     consumer=args.consumer,
                     rerank=args.rerank,
                 )
-            except NotImplementedError as exc:
+            except RerankNotSupportedError as exc:
                 emit({"ok": False, "error": str(exc)})
                 return 1
             emit({"results": results})
@@ -528,7 +566,7 @@ def main(argv: list[str] | None = None) -> int:
                     image_return=args.image_return,
                     rerank=args.rerank,
                 )
-            except NotImplementedError as exc:
+            except RerankNotSupportedError as exc:
                 emit({"ok": False, "error": str(exc)})
                 return 1
             emit({"results": results})
@@ -554,9 +592,10 @@ def main(argv: list[str] | None = None) -> int:
                 emit({"ok": not errors, "errors": errors})
                 return 0 if not errors else 1
             if args.backup_command == "restore":
-                manifest_path = resolve_backup_manifest(ledger, args.backup)
+                backup_root = config.paths.data_dir / "backups"
+                manifest_path = resolve_backup_manifest(ledger, args.backup, backup_root=backup_root)
                 if not args.confirm:
-                    emit(plan_restore_backup(config, manifest_path).to_dict())
+                    emit(plan_restore_backup(config, manifest_path, backup_root=backup_root).to_dict())
                     return 0
                 emit(
                     restore_backup(
@@ -575,10 +614,14 @@ def main(argv: list[str] | None = None) -> int:
             if args.extract_command == "dry-run":
                 try:
                     options = json.loads(args.options_json)
+                    resolved_env = _resolve_env_path(args.env, project_root)
                 except json.JSONDecodeError as exc:
                     emit({"ok": False, "error": f"invalid --options-json: {exc}"})
                     return 1
-                key_pool = ExtractorKeyPool.from_env_file(args.env)
+                except (FileNotFoundError, ValueError) as exc:
+                    emit({"ok": False, "error": str(exc)})
+                    return 1
+                key_pool = ExtractorKeyPool.from_env_file(resolved_env)
                 manager = ExtractionManager(
                     ledger=ledger,
                     cache_dir=config.paths.extract_cache_dir,
@@ -651,7 +694,8 @@ def main(argv: list[str] | None = None) -> int:
                     provider = None
                     if args.embedding_provider == "qwen3vl":
                         profile = require_embedding_profile(ledger, args.profile)
-                        provider = build_qwen_embedding_provider(profile, args.env)
+                        resolved_env = _resolve_env_path(args.env, project_root)
+                        provider = build_qwen_embedding_provider(profile, resolved_env)
                     result = index_normalized_document(
                         ledger=ledger,
                         vector_store_dir=config.paths.vector_store_dir,
@@ -660,7 +704,7 @@ def main(argv: list[str] | None = None) -> int:
                         provider=provider,
                         allow_stub_provider=args.allow_stub_provider,
                     )
-                except (KeyError, NotImplementedError, RuntimeError, ValueError) as exc:
+                except (KeyError, RuntimeError, ValueError, RerankNotSupportedError) as exc:
                     emit({"ok": False, "error": str(exc)})
                     return 1
                 emit(result.to_dict())
@@ -711,7 +755,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
                 return 0
-            except (KeyError, NotImplementedError, ValueError) as exc:
+            except (KeyError, ValueError, RerankNotSupportedError) as exc:
                 emit({"ok": False, "error": str(exc)})
                 return 1
 
@@ -737,7 +781,8 @@ def main(argv: list[str] | None = None) -> int:
                 provider = None
                 profile = select_profile(ledger, profile_name=args.profile, mode=args.mode)
                 if args.embedding_provider == "qwen3vl":
-                    provider = build_qwen_embedding_provider(profile, args.env)
+                    resolved_env = _resolve_env_path(args.env, project_root)
+                    provider = build_qwen_embedding_provider(profile, resolved_env)
                 elif args.embedding_provider == "stub":
                     from .embeddings import StubEmbeddingProvider
                     provider = StubEmbeddingProvider(dimension=int(profile["dimension"]))
@@ -758,7 +803,7 @@ def main(argv: list[str] | None = None) -> int:
                     query_image_mime_type=query_image.mime_type if query_image else None,
                     provider=provider,
                 )
-            except (FileNotFoundError, KeyError, NotImplementedError, RuntimeError, ValueError) as exc:
+            except (FileNotFoundError, KeyError, RuntimeError, ValueError, RerankNotSupportedError) as exc:
                 emit({"ok": False, "error": str(exc)})
                 return 1
             emit({"results": results})
@@ -783,6 +828,17 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"Unhandled command: {args.command}", file=sys.stderr)
     return 2
+
+
+def _find_project_root_for_env(start: Path) -> Path:
+    """Locate the project root used to resolve relative --env paths."""
+    path = start.resolve()
+    if path.is_file():
+        path = path.parent
+    for parent in [path, *path.parents]:
+        if (parent / "pyproject.toml").is_file() or (parent / ".git").is_dir():
+            return parent
+    return path
 
 
 if __name__ == "__main__":

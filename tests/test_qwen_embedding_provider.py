@@ -6,6 +6,44 @@ import unittest
 
 from tests._support import workspace_tmpdir
 from zoterorag.embeddings import EmbeddingInput, Qwen3VLEmbeddingProvider, QwenEmbeddingError
+from zoterorag.providers import _validate_endpoint_url, build_qwen_embedding_provider
+
+
+class EndpointValidationTests(unittest.TestCase):
+    def test_accepts_allowed_dashscope_https_url(self) -> None:
+        self.assertEqual(
+            "https://dashscope.aliyuncs.com/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding",
+            _validate_endpoint_url(
+                "https://dashscope.aliyuncs.com/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding",
+                ("dashscope.aliyuncs.com",),
+            ),
+        )
+
+    def test_rejects_http_url(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            _validate_endpoint_url("http://dashscope.aliyuncs.com/api", ("dashscope.aliyuncs.com",))
+        self.assertIn("https", str(ctx.exception))
+
+    def test_rejects_private_ip(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            _validate_endpoint_url("https://192.168.1.1/api", ("dashscope.aliyuncs.com",))
+        self.assertIn("IP address", str(ctx.exception))
+
+    def test_rejects_wrong_hostname(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            _validate_endpoint_url("https://evil.example.test/api", ("dashscope.aliyuncs.com",))
+        self.assertIn("hostname", str(ctx.exception))
+
+    def test_build_qwen_provider_rejects_bad_env_url(self) -> None:
+        with workspace_tmpdir("qwen-build-") as tmpdir:
+            env_path = tmpdir / ".env"
+            env_path.write_text(
+                "DASHSCOPE_API_KEY=sk-test\nDASHSCOPE_MULTIMODAL_EMBEDDING_URL=https://evil.example.test\n",
+                encoding="utf-8",
+            )
+            profile = {"model": "qwen3-vl-embedding", "dimension": 2560}
+            with self.assertRaises(ValueError):
+                build_qwen_embedding_provider(profile, env_path)
 
 
 class QwenEmbeddingProviderTests(unittest.TestCase):

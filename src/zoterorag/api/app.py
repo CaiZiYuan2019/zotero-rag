@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -62,17 +63,28 @@ def _find_project_root(start: Path) -> Path:
     return path
 
 
+_ENV_BASENAME_ALLOWLIST = frozenset({".env"})
+
+
 def _resolve_env_path(env_value: str, allowed_root: Path) -> Path:
     if not env_value:
         raise ValueError("env path is required")
     parsed = Path(env_value)
     if ".." in parsed.parts:
         raise ValueError(f"env path must not contain '..': {env_value}")
-    resolved = (allowed_root / parsed).resolve()
+    if parsed.is_absolute():
+        resolved = parsed.resolve()
+    else:
+        resolved = (allowed_root / parsed).resolve()
     try:
         resolved.relative_to(allowed_root.resolve())
     except ValueError as exc:
         raise ValueError(f"env path must be inside project root: {env_value}") from exc
+    if not resolved.is_file():
+        raise FileNotFoundError(f"env file not found: {env_value}")
+    basename = resolved.name
+    if basename not in _ENV_BASENAME_ALLOWLIST and not basename.startswith(".env."):
+        raise ValueError(f"env filename must be '.env' or '.env.*': {env_value}")
     return resolved
 
 
@@ -101,7 +113,42 @@ def create_app(config_path: str | Path = "config/config.toml") -> Any:
 
     config, ledger = initialize_runtime(config_path)
     project_root = _find_project_root(Path(config_path))
-    app = FastAPI(title="ZoteroRAG", version="0.1.0")
+    # Disable interactive docs and OpenAPI schema when API token enforcement is
+    # enabled so the specification does not leak endpoint details publicly.
+    docs_disabled = config.server.require_api_token
+    app = FastAPI(
+        title="ZoteroRAG",
+        version="0.1.0",
+        docs_url=None if docs_disabled else "/docs",
+        redoc_url=None if docs_disabled else "/redoc",
+        openapi_url=None if docs_disabled else "/openapi.json",
+    )
+
+    def _resolve_profile(profile_name: str | None, mode: str | None = None) -> dict[str, Any]:
+        """Resolve an embedding profile from config, raising on missing input."""
+        if profile_name:
+            for profile in config.embedding_profiles:
+                if profile.name == profile_name:
+                    return asdict(profile)
+            raise HTTPException(
+                status_code=404, detail=f"embedding profile not found: {profile_name}"
+            )
+        if mode is None:
+            raise HTTPException(
+                status_code=400, detail="profile_name is required when no search mode is given"
+            )
+        expected_modality = "text" if mode == "text" else "multimodal"
+        default_flag = "default_for_text" if mode == "text" else "default_for_multimodal"
+        for profile in config.embedding_profiles:
+            if (
+                profile.enabled
+                and profile.modality == expected_modality
+                and getattr(profile, default_flag)
+            ):
+                return asdict(profile)
+        raise HTTPException(
+            status_code=404, detail=f"no default {mode} embedding profile is configured"
+        )
 
     def require_access(
         request: Request,
@@ -172,6 +219,7 @@ def create_app(config_path: str | Path = "config/config.toml") -> Any:
 
     @app.get("/vectors/{profile_name}/verify", dependencies=[Depends(require_access)])
     def verify_vectors(profile_name: str) -> dict[str, Any]:
+        _resolve_profile(profile_name, mode=None)
         return verify_vector_index(ledger, profile_name).to_dict()
 
     @app.get("/jobs", dependencies=[Depends(require_access)])
@@ -375,7 +423,7 @@ def create_app(config_path: str | Path = "config/config.toml") -> Any:
         if payload.get("query_image") is not None:
             raise HTTPException(status_code=400, detail="text search does not accept query_image")
         try:
-            profile = selected_embedding_profile(ledger, payload.get("profile_name"), mode="text")
+            profile = _resolve_profile(payload.get("profile_name"), mode="text")
             provider = explicit_embedding_provider(payload, profile, project_root)
             return {
                 "results": search_vector_index(
@@ -389,6 +437,7 @@ def create_app(config_path: str | Path = "config/config.toml") -> Any:
                     image_return="none",
                     rerank=bool(payload.get("rerank", False)),
                     provider=provider,
+                    vector_backend=profile["backend"],
                 )
             }
         except NotImplementedError as exc:
@@ -406,7 +455,7 @@ def create_app(config_path: str | Path = "config/config.toml") -> Any:
         except (FileNotFoundError, ValueError):
             raise _client_error(400) from None
         try:
-            profile = selected_embedding_profile(ledger, payload.get("profile_name"), mode="multimodal")
+            profile = _resolve_profile(payload.get("profile_name"), mode="multimodal")
             provider = explicit_embedding_provider(payload, profile, project_root)
             return {
                 "results": search_vector_index(
@@ -425,6 +474,7 @@ def create_app(config_path: str | Path = "config/config.toml") -> Any:
                     query_image_base64=query_image.base64_data if query_image else None,
                     query_image_mime_type=query_image.mime_type if query_image else None,
                     provider=provider,
+                    vector_backend=profile["backend"],
                 )
             }
         except NotImplementedError as exc:
@@ -458,8 +508,9 @@ def create_app(config_path: str | Path = "config/config.toml") -> Any:
     @app.post("/backup/restore-plan", dependencies=[Depends(require_access)])
     def backup_restore_plan(payload: dict[str, Any]) -> dict[str, Any]:
         try:
-            manifest_path = resolve_backup_manifest(ledger, str(payload["backup"]))
-            return plan_restore_backup(config, manifest_path).to_dict()
+            backup_root = config.paths.data_dir / "backups"
+            manifest_path = resolve_backup_manifest(ledger, str(payload["backup"]), backup_root=backup_root)
+            return plan_restore_backup(config, manifest_path, backup_root=backup_root).to_dict()
         except KeyError:
             raise _client_error(400) from None
         except (FileNotFoundError, ValueError):
@@ -504,7 +555,7 @@ def create_app(config_path: str | Path = "config/config.toml") -> Any:
     @app.post("/embed/index-normalized", dependencies=[Depends(require_access)])
     def embed_index_normalized(payload: dict[str, Any]) -> dict[str, Any]:
         try:
-            profile = selected_embedding_profile(ledger, str(payload["profile_name"]), mode=None)
+            profile = _resolve_profile(str(payload["profile_name"]), mode=None)
             provider = explicit_embedding_provider(payload, profile, project_root)
             return index_normalized_document(
                 ledger=ledger,
@@ -513,6 +564,7 @@ def create_app(config_path: str | Path = "config/config.toml") -> Any:
                 document_id=str(payload["document_id"]),
                 provider=provider,
                 allow_stub_provider=bool(payload.get("allow_stub_provider", False)),
+                vector_backend=profile["backend"],
             ).to_dict()
         except NotImplementedError as exc:
             raise HTTPException(status_code=501, detail=str(exc)) from exc
@@ -524,23 +576,27 @@ def create_app(config_path: str | Path = "config/config.toml") -> Any:
         try:
             # This endpoint is intentionally read-only. It lets operators audit
             # long rebuild recovery state without creating a job or calling qwen.
+            profile = _resolve_profile(str(payload["profile_name"]), mode=None)
             return create_reembed_plan(
                 ledger,
                 vector_store_dir=config.paths.vector_store_dir,
-                profile_name=str(payload["profile_name"]),
+                profile_name=profile["name"],
                 document_id=payload.get("document_id"),
                 force=bool(payload.get("force", False)),
             )
-        except (KeyError, ValueError):
+        except NotImplementedError as exc:
+            raise HTTPException(status_code=501, detail=str(exc)) from exc
+        except (KeyError, RuntimeError, ValueError):
             raise _client_error(400) from None
 
     @app.post("/reembed/from-normalized", dependencies=[Depends(require_access)])
     def reembed_from_normalized(payload: dict[str, Any]) -> dict[str, Any]:
         try:
+            profile = _resolve_profile(str(payload["profile_name"]), mode=None)
             return start_reembed_job(
                 ledger,
                 vector_store_dir=config.paths.vector_store_dir,
-                profile_name=str(payload["profile_name"]),
+                profile_name=profile["name"],
                 document_id=payload.get("document_id"),
                 force=bool(payload.get("force", False)),
                 execute=bool(payload.get("execute", False)),
@@ -548,7 +604,7 @@ def create_app(config_path: str | Path = "config/config.toml") -> Any:
             )
         except NotImplementedError as exc:
             raise HTTPException(status_code=501, detail=str(exc)) from exc
-        except (KeyError, ValueError):
+        except (KeyError, RuntimeError, ValueError):
             raise _client_error(400) from None
 
     return app
@@ -578,20 +634,3 @@ def explicit_embedding_provider(payload: dict[str, Any], profile: dict[str, Any]
         resolved_env_path = _resolve_env_path(str(payload.get("env", ".env")), project_root)
         return build_qwen_embedding_provider(profile, resolved_env_path)
     raise ValueError(f"unsupported embedding_provider: {provider_name}")
-
-
-def selected_embedding_profile(ledger: Any, profile_name: str | None, *, mode: str | None) -> dict[str, Any]:
-    profiles = ledger.list_embedding_profiles()
-    if profile_name:
-        for profile in profiles:
-            if profile["name"] == profile_name:
-                return profile
-        raise KeyError(f"embedding profile not found: {profile_name}")
-    if mode is None:
-        raise ValueError("profile_name is required")
-    expected_modality = "text" if mode == "text" else "multimodal"
-    default_flag = "default_for_text" if mode == "text" else "default_for_multimodal"
-    for profile in profiles:
-        if profile["enabled"] and profile["modality"] == expected_modality and profile[default_flag]:
-            return profile
-    raise KeyError(f"no default {mode} embedding profile is configured")

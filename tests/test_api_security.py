@@ -158,6 +158,32 @@ require_api_token = true
             self.assertEqual(200, allowed.status_code)
             self.assertEqual({"status": "ok"}, allowed.json())
 
+    def test_docs_and_openapi_disabled_when_token_required(self) -> None:
+        fastapi_testclient = self.import_first_available(["fastapi.testclient"])
+        from zoterorag.api.app import create_app
+
+        with workspace_tmpdir("api-docs-") as tmpdir:
+            config_path = tmpdir / "config.toml"
+            config_path.write_text(
+                f"""
+[paths]
+zotero_db = "{(tmpdir / 'zotero.sqlite').as_posix()}"
+zotero_storage = "{(tmpdir / 'storage').as_posix()}"
+data_dir = "{(tmpdir / 'data').as_posix()}"
+
+[server]
+require_api_token = true
+""",
+                encoding="utf-8",
+            )
+            os.environ["ZOTERORAG_API_TOKEN"] = "expected-token"
+            app = create_app(config_path)
+            client = fastapi_testclient.TestClient(app)
+
+            for path in ("/docs", "/redoc", "/openapi.json"):
+                response = client.get(path, headers={"X-API-Token": "expected-token"})
+                self.assertEqual(404, response.status_code, path)
+
     def test_list_limits_are_capped(self) -> None:
         fastapi_testclient = self.import_first_available(["fastapi.testclient"])
         from zoterorag.api.app import create_app

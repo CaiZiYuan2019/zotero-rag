@@ -42,7 +42,7 @@ class ProviderRuntimeTests(unittest.TestCase):
             env_path = tmpdir / ".env"
             env_path.write_text(
                 "BAILIAN_KEY=qwen-secret\n"
-                "DASHSCOPE_MULTIMODAL_EMBEDDING_URL=https://dashscope.example.test/embed\n",
+                "DASHSCOPE_MULTIMODAL_EMBEDDING_URL=https://dashscope.aliyuncs.com/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding\n",
                 encoding="utf-8",
             )
 
@@ -62,7 +62,10 @@ class ProviderRuntimeTests(unittest.TestCase):
 
             self.assertEqual("qwen3-vl-embedding", provider.model)
             self.assertEqual(2560, provider.dimension)
-            self.assertEqual("https://dashscope.example.test/embed", provider.endpoint)
+            self.assertEqual(
+                "https://dashscope.aliyuncs.com/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding",
+                provider.endpoint,
+            )
             self.assertEqual("query instruction", provider.query_instruction)
             self.assertEqual("document instruction", provider.document_instruction)
 
@@ -83,13 +86,13 @@ class ProviderRuntimeTests(unittest.TestCase):
     def test_build_mineru_provider_uses_env_endpoints_without_key_value(self) -> None:
         with workspace_tmpdir("providers-") as tmpdir:
             env_path = tmpdir / ".env"
-            env_path.write_text("MINERU_URL=https://mineru.example.test/api/v4\n", encoding="utf-8")
+            env_path.write_text("MINERU_URL=https://mineru.net/api/v4\n", encoding="utf-8")
 
             provider = build_mineru_provider(env_path, client=NoopClient())
 
-            self.assertEqual("https://mineru.example.test/api/v4/file-urls/batch", provider.apply_upload_url)
+            self.assertEqual("https://mineru.net/api/v4/file-urls/batch", provider.apply_upload_url)
             self.assertEqual(
-                "https://mineru.example.test/api/v4/extract-results/batch/{batch_id}",
+                "https://mineru.net/api/v4/extract-results/batch/{batch_id}",
                 provider.batch_result_url,
             )
 

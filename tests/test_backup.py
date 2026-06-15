@@ -11,6 +11,7 @@ from tests._support import workspace_tmpdir
 from zoterorag.backup import (
     create_backup,
     plan_restore_backup,
+    resolve_backup_manifest,
     restore_backup,
     restore_file,
     verify_manifest_files,
@@ -37,6 +38,7 @@ def build_config(root: Path) -> AppConfig:
                 dimension=3,
                 modality="text",
                 default_for_text=True,
+                backend="sqlite-local",
             ),
         ),
     )
@@ -283,6 +285,38 @@ class BackupTests(unittest.TestCase):
             finally:
                 ledger.close()
 
+    def test_resolve_backup_manifest_rejects_outside_backup_root(self) -> None:
+        with workspace_tmpdir("backup-resolve-") as root:
+            config = build_config(root)
+            config.ensure_runtime_dirs()
+            ledger = StateLedger(config.paths.state_db)
+            outside = root / "outside_manifest.json"
+            outside.write_text("{}", encoding="utf-8")
+            try:
+                with self.assertRaises(ValueError):
+                    resolve_backup_manifest(
+                        ledger,
+                        str(outside),
+                        backup_root=backup_root_for(config),
+                    )
+            finally:
+                ledger.close()
+
+    def test_plan_restore_backup_rejects_manifest_with_dotdot(self) -> None:
+        with workspace_tmpdir("backup-dotdot-") as root:
+            config = build_config(root)
+            config.ensure_runtime_dirs()
+            ledger = StateLedger(config.paths.state_db)
+            try:
+                with self.assertRaises(ValueError):
+                    plan_restore_backup(
+                        config,
+                        "../escape/backups/backup_manifest.json",
+                        backup_root=backup_root_for(config),
+                    )
+            finally:
+                ledger.close()
+
     def test_verify_manifest_files_detects_tampered_file(self) -> None:
         with workspace_tmpdir("backup-tamper-") as root:
             config = build_config(root)
@@ -362,6 +396,26 @@ class BackupTests(unittest.TestCase):
             finally:
                 with suppress(Exception):
                     ledger.close()
+
+    def test_create_backup_defaults_to_runtime_config_path(self) -> None:
+        with workspace_tmpdir("backup-default-config-") as root:
+            config = build_config(root)
+            config.ensure_runtime_dirs()
+            ledger = StateLedger(config.paths.state_db)
+            try:
+                (root / "config").mkdir(parents=True, exist_ok=True)
+                (root / "config" / "config.toml").write_text("[paths]\n", encoding="utf-8")
+                result = create_backup(
+                    config,
+                    ledger,
+                    mode="snapshot",
+                    out_dir=backup_root_for(config),
+                )
+                self.assertTrue(
+                    (result.backup_dir / "config" / "config.toml").is_file()
+                )
+            finally:
+                ledger.close()
 
     def test_create_backup_calls_checkpoint_helpers(self) -> None:
         with workspace_tmpdir("backup-checkpoint-") as root:

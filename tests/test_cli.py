@@ -7,7 +7,7 @@ from pathlib import Path
 import unittest
 
 from tests._support import workspace_tmpdir
-from zoterorag.cli import build_parser, main
+from zoterorag.cli import build_parser, main, _resolve_env_path
 
 
 def run_main(argv: list[str]) -> tuple[int, dict[str, object] | list[object] | str]:
@@ -74,6 +74,62 @@ class CliParserTests(unittest.TestCase):
         self.assertIn("reembed", sub)
         self.assertIn("extract", sub)
         self.assertIn("backup", sub)
+
+
+class CliEnvPathValidationTests(unittest.TestCase):
+    def test_resolves_relative_dotenv_inside_project_root(self) -> None:
+        with workspace_tmpdir("cli-env-valid-") as tmpdir:
+            env_file = tmpdir / ".env"
+            env_file.write_text("X=1", encoding="utf-8")
+            resolved = _resolve_env_path(".env", tmpdir)
+            self.assertEqual(env_file.resolve(), resolved)
+
+    def test_rejects_dotdot_in_env_path(self) -> None:
+        with workspace_tmpdir("cli-env-dotdot-") as tmpdir:
+            with self.assertRaises(ValueError) as ctx:
+                _resolve_env_path("../secret.env", tmpdir)
+            self.assertIn("..", str(ctx.exception))
+
+    def test_rejects_path_outside_project_root(self) -> None:
+        with workspace_tmpdir("cli-env-outside-") as tmpdir:
+            outside = tmpdir.parent / "secret.env"
+            outside.write_text("X=1", encoding="utf-8")
+            with self.assertRaises(ValueError) as ctx:
+                _resolve_env_path(str(outside), tmpdir)
+            self.assertIn("inside project root", str(ctx.exception))
+
+    def test_rejects_nonexistent_env_file(self) -> None:
+        with workspace_tmpdir("cli-env-missing-") as tmpdir:
+            with self.assertRaises(FileNotFoundError) as ctx:
+                _resolve_env_path(".env", tmpdir)
+            self.assertIn(".env", str(ctx.exception))
+
+    def test_rejects_non_env_filename(self) -> None:
+        with workspace_tmpdir("cli-env-basename-") as tmpdir:
+            bad = tmpdir / "config.toml"
+            bad.write_text("x", encoding="utf-8")
+            with self.assertRaises(ValueError) as ctx:
+                _resolve_env_path("config.toml", tmpdir)
+            self.assertIn(".env", str(ctx.exception))
+
+    def test_accepts_dotenv_suffix(self) -> None:
+        with workspace_tmpdir("cli-env-suffix-") as tmpdir:
+            env_file = tmpdir / ".env.prod"
+            env_file.write_text("X=1", encoding="utf-8")
+            resolved = _resolve_env_path(".env.prod", tmpdir)
+            self.assertEqual(env_file.resolve(), resolved)
+
+    def test_main_rejects_arbitrary_env_path(self) -> None:
+        with workspace_tmpdir("cli-env-main-") as tmpdir:
+            config_path = write_config(tmpdir)
+            bad = tmpdir / "secret.env"
+            bad.write_text("X=1", encoding="utf-8")
+            outside = tmpdir.parent / "outside.env"
+            outside.write_text("X=1", encoding="utf-8")
+
+            rc, data = run_main(["--config", str(config_path), "providers", "status", "--env", str(outside)])
+            self.assertEqual(1, rc)
+            self.assertFalse(data["ok"])
 
 
 class CliMainTests(unittest.TestCase):

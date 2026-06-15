@@ -146,7 +146,7 @@ def create_backup(
     *,
     mode: str,
     out_dir: str | Path,
-    config_path: str | Path = "config/config.example.toml",
+    config_path: str | Path = "config/config.toml",
 ) -> BackupResult:
     if mode not in {"snapshot", "full"}:
         raise ValueError("mode must be 'snapshot' or 'full'")
@@ -230,7 +230,12 @@ def create_backup(
     return result
 
 
-def plan_restore_backup(config: AppConfig, manifest_path: str | Path) -> RestoreResult:
+def plan_restore_backup(
+    config: AppConfig,
+    manifest_path: str | Path,
+    *,
+    backup_root: Path | None = None,
+) -> RestoreResult:
     """Validate a backup manifest and map restorable files to runtime targets.
 
     This function is read-only. It never mutates the current runtime and never
@@ -239,7 +244,8 @@ def plan_restore_backup(config: AppConfig, manifest_path: str | Path) -> Restore
     application at an unexpected Zotero library.
     """
 
-    manifest_file = Path(manifest_path).expanduser().resolve()
+    root = backup_root or _resolve_backup_root(config)
+    manifest_file = _validate_manifest_path(manifest_path, root)
     manifest = read_manifest(manifest_file)
     errors = verify_manifest_files(manifest_file)
     files = build_restore_file_plan(config, manifest_file, manifest)
@@ -258,7 +264,7 @@ def restore_backup(
     *,
     manifest_path: str | Path,
     pre_restore_out_dir: str | Path,
-    config_path: str | Path = "config/config.example.toml",
+    config_path: str | Path = "config/config.toml",
     confirm: bool = False,
     close_ledger_before_apply: bool = False,
 ) -> RestoreResult:
@@ -319,18 +325,59 @@ def restore_backup(
     )
 
 
-def resolve_backup_manifest(ledger: StateLedger, backup_ref: str | Path) -> Path:
+def _validate_manifest_path(manifest_path: str | Path, backup_root: Path) -> Path:
+    parsed = Path(manifest_path)
+    if ".." in parsed.parts:
+        raise ValueError(f"backup manifest path must not contain '..': {manifest_path}")
+    if parsed.is_absolute():
+        resolved = parsed.resolve()
+    else:
+        resolved = (backup_root / parsed).resolve()
+    root_resolved = backup_root.resolve()
+    if resolved != root_resolved and not resolved.is_relative_to(root_resolved):
+        raise ValueError(
+            f"backup manifest path must resolve under the configured backup root: {root_resolved}"
+        )
+    if not resolved.is_file():
+        raise FileNotFoundError(f"backup manifest not found: {manifest_path}")
+    return resolved
+
+
+def resolve_backup_manifest(
+    ledger: StateLedger,
+    backup_ref: str | Path,
+    *,
+    backup_root: Path | None = None,
+) -> Path:
+    root = backup_root.resolve() if backup_root else None
     ref_path = Path(backup_ref)
     if ref_path.is_file():
-        return ref_path
+        if root is None:
+            root = _resolve_backup_root_from_path(ref_path)
+        return _validate_manifest_path(ref_path, root)
+    if root is None:
+        raise ValueError("backup_root is required when resolving by backup_id")
     for backup in ledger.list_backups():
         if backup["backup_id"] == str(backup_ref):
             manifest_path = Path(
                 backup["manifest"].get("manifest_path")
                 or Path(backup["path"]) / BACKUP_MANIFEST
             )
-            return manifest_path
+            return _validate_manifest_path(manifest_path, root)
     raise KeyError(f"backup not found: {backup_ref}")
+
+
+def _resolve_backup_root_from_path(path: Path) -> Path:
+    """Infer a likely backup root from an existing manifest path.
+
+    Walks up the tree looking for a directory named ``backups``; otherwise
+    returns the manifest's parent directory so callers can still validate.
+    """
+    resolved = path.resolve()
+    for parent in resolved.parents:
+        if parent.name == "backups":
+            return parent
+    return resolved.parent
 
 
 def copy_sqlite_database(source: str | Path, target: str | Path) -> None:

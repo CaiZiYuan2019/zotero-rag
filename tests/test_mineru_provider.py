@@ -8,7 +8,38 @@ import zipfile
 from tests._support import workspace_tmpdir
 from zoterorag.extractors import ApiKeyRef, ExtractionManager, ExtractionRequest, ExtractorKeyPool, MinerUAPIError, MinerUProvider
 from zoterorag.extractors.mineru import safe_extract_zip
+from zoterorag.providers import _validate_endpoint_url, build_mineru_provider
 from zoterorag.db import StateLedger
+
+
+class EndpointValidationTests(unittest.TestCase):
+    def test_accepts_allowed_mineru_https_url(self) -> None:
+        self.assertEqual(
+            "https://mineru.net/api/v4/file-urls/batch",
+            _validate_endpoint_url("https://mineru.net/api/v4/file-urls/batch", ("mineru.net",)),
+        )
+
+    def test_rejects_http_url(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            _validate_endpoint_url("http://mineru.net/api/v4/file-urls/batch", ("mineru.net",))
+        self.assertIn("https", str(ctx.exception))
+
+    def test_rejects_wrong_hostname(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            _validate_endpoint_url("https://evil.example.test/api", ("mineru.net",))
+        self.assertIn("hostname", str(ctx.exception))
+
+    def test_rejects_loopback_ip(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            _validate_endpoint_url("https://127.0.0.1/api", ("mineru.net",))
+        self.assertIn("IP address", str(ctx.exception))
+
+    def test_build_mineru_provider_rejects_bad_env_url(self) -> None:
+        with workspace_tmpdir("mineru-build-") as tmpdir:
+            env_path = tmpdir / ".env"
+            env_path.write_text("MINERU_URL=https://evil.example.test\n", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                build_mineru_provider(env_path)
 
 
 class MinerUProviderTests(unittest.TestCase):

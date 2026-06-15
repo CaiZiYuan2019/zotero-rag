@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import ipaddress
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from .embeddings import Qwen3VLEmbeddingProvider
 from .embeddings.qwen import DASHSCOPE_MULTIMODAL_EMBEDDING_URL, DEFAULT_DOCUMENT_INSTRUCTION, DEFAULT_QUERY_INSTRUCTION
@@ -25,6 +27,9 @@ DASHSCOPE_ENDPOINT_NAMES = (
     "DASHSCOPE_MULTIMODAL_EMBEDDING_URL",
     "QWEN_EMBEDDING_URL",
 )
+
+MINERU_ALLOWED_HOSTS = ("mineru.net",)
+DASHSCOPE_ALLOWED_HOSTS = ("dashscope.aliyuncs.com",)
 
 
 @dataclass(frozen=True)
@@ -72,15 +77,41 @@ def provider_readiness(env_path: str | Path = ".env") -> dict[str, Any]:
     }
 
 
+def _validate_endpoint_url(url: str, allowed_hosts: tuple[str, ...]) -> str:
+    """Require HTTPS and an allowed, non-private host for provider endpoints."""
+    if not url:
+        raise ValueError("endpoint URL is required")
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        raise ValueError(f"endpoint URL must use https scheme: {url}")
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError(f"endpoint URL has no hostname: {url}")
+    try:
+        addr = ipaddress.ip_address(hostname)
+    except ValueError:
+        addr = None
+    if addr is not None:
+        if addr.is_loopback or addr.is_private or addr.is_reserved or addr.is_multicast:
+            raise ValueError(f"endpoint URL must not use an IP address: {url}")
+    if hostname.lower() not in {h.lower() for h in allowed_hosts}:
+        raise ValueError(f"endpoint URL hostname not allowed: {hostname}")
+    return url
+
+
 def build_mineru_provider(env_path: str | Path = ".env", *, client: Any = None) -> MinerUProvider:
     """Build a MinerU provider; API keys are still supplied by ExtractorKeyPool."""
 
     env = ProviderEnvironment.load(env_path)
     urls = mineru_urls_from_env(env.values)
+    apply_upload_url = urls["apply_upload_url"] or APPLY_UPLOAD_URL
+    batch_result_url = urls["batch_result_url"] or BATCH_RESULT_URL
+    _validate_endpoint_url(apply_upload_url, MINERU_ALLOWED_HOSTS)
+    _validate_endpoint_url(batch_result_url, MINERU_ALLOWED_HOSTS)
     return MinerUProvider(
         client=client,
-        apply_upload_url=urls["apply_upload_url"] or APPLY_UPLOAD_URL,
-        batch_result_url=urls["batch_result_url"] or BATCH_RESULT_URL,
+        apply_upload_url=apply_upload_url,
+        batch_result_url=batch_result_url,
     )
 
 
@@ -97,13 +128,15 @@ def build_qwen_embedding_provider(
             "qwen3-vl embedding key is not configured; set BAILIAN_KEY or DASHSCOPE_API_KEY in the env file"
         )
     endpoint = env.first_present(DASHSCOPE_ENDPOINT_NAMES)
+    endpoint_url = endpoint[1] if endpoint else DASHSCOPE_MULTIMODAL_EMBEDDING_URL
+    _validate_endpoint_url(endpoint_url, DASHSCOPE_ALLOWED_HOSTS)
     embedded_profile = dict(profile.get("profile") or {})
     instruction = profile.get("instruction_template") or embedded_profile.get("instruction_template") or ""
     return Qwen3VLEmbeddingProvider(
         api_key=key[1],
         model=str(profile["model"]),
         dimension=int(profile["dimension"]),
-        endpoint=endpoint[1] if endpoint else DASHSCOPE_MULTIMODAL_EMBEDDING_URL,
+        endpoint=endpoint_url,
         client=client,
         query_instruction=instruction or DEFAULT_QUERY_INSTRUCTION,
         document_instruction=embedded_profile.get("document_instruction", DEFAULT_DOCUMENT_INSTRUCTION),
