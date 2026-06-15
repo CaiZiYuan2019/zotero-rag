@@ -34,6 +34,7 @@ def extractor_cache_key(
     extractor_name: str,
     extractor_version: str,
     options_hash: str,
+    endpoint_url: str | None = None,
 ) -> str:
     payload = {
         "pdf_sha256": pdf_sha256,
@@ -41,6 +42,7 @@ def extractor_cache_key(
         "extractor_name": extractor_name,
         "extractor_version": extractor_version,
         "options_hash": options_hash,
+        "endpoint_url": endpoint_url or "",
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import unittest
 
 from tests._support import workspace_tmpdir
@@ -10,10 +11,12 @@ from zoterorag.extractors import (
     ExtractionManager,
     ExtractionRequest,
     ExtractorKeyPool,
+    MinerUProvider,
     recommended_mineru_timeout_seconds,
 )
 from zoterorag.extractors.base import ExtractArtifact, ExtractJobState
 from zoterorag.extractors.cache import extractor_cache_key, stable_options_hash
+from tests.test_mineru_provider import FakeMinerUClient, FlakyFakeMinerUClient, build_zip
 
 
 class ExtractionManagerTests(unittest.TestCase):
@@ -193,6 +196,178 @@ class ExtractionManagerTests(unittest.TestCase):
                 pool.release_key("mineru_a")
                 ledger.close()
 
+    def test_cache_key_includes_provider_endpoint(self) -> None:
+        options_hash = stable_options_hash({"model_version": "vlm"})
+        base = extractor_cache_key(
+            pdf_sha256="a" * 64,
+            selected_pages="1-3",
+            extractor_name="mineru",
+            extractor_version="v4",
+            options_hash=options_hash,
+        )
+        with_endpoint = extractor_cache_key(
+            pdf_sha256="a" * 64,
+            selected_pages="1-3",
+            extractor_name="mineru",
+            extractor_version="v4",
+            options_hash=options_hash,
+            endpoint_url="https://mineru.example.test/api",
+        )
+        self.assertNotEqual(base, with_endpoint)
+
+    def test_resume_download_uses_persisted_source_pdf_after_restart(self) -> None:
+        with workspace_tmpdir("extract-resume-") as tmpdir:
+            source = tmpdir / "original.pdf"
+            source.write_bytes(b"%PDF-1.4 fake test body")
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                # First manager processes up to the completed/download stage.
+                manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=RecordingProvider(),
+                )
+                first = manager.ensure_extraction(
+                    ExtractionRequest(
+                        input_file=source,
+                        attachment_key="ATTACH1",
+                        selected_pages="1",
+                        selected_page_count=1,
+                    )
+                )
+                job_id = first.job["job_id"]
+
+                # Simulate a process restart: the in-memory provider is replaced
+                # and the job is reset to the remote-completed state.
+                ledger.set_extract_job_state(
+                    job_id,
+                    state="completed",
+                    local_stage="download",
+                    payload=first.job.get("payload") or {},
+                )
+                new_manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=RecordingProvider(),
+                )
+                result = new_manager.resume_extraction(job_id)
+
+                self.assertEqual("downloaded", result.job["state"])
+                self.assertEqual(str(source), result.job["payload"]["source_pdf"])
+            finally:
+                ledger.close()
+
+    def test_recommended_timeout_is_passed_to_mineru_provider(self) -> None:
+        with workspace_tmpdir("extract-timeout-") as tmpdir:
+            source = tmpdir / "paper.pdf"
+            source.write_bytes(b"%PDF-1.4 fake body")
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            client = FakeMinerUClient(zip_bytes=build_zip({"full.md": "# Done\n"}))
+            try:
+                manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=MinerUProvider(
+                        client=client,
+                        request_timeout_seconds=30,
+                        transfer_timeout_seconds=30,
+                    ),
+                    key_pool=ExtractorKeyPool([ApiKeyRef(alias="mineru_a", secret="secret-a")]),
+                )
+                manager.ensure_extraction(
+                    ExtractionRequest(
+                        input_file=source,
+                        attachment_key="ATTACH1",
+                        selected_pages="1-2",
+                        selected_page_count=2,
+                    )
+                )
+                expected_timeout = 2 * 6 + 30  # recommended_mineru_timeout_seconds(2)
+                self.assertEqual(expected_timeout, client.posts[0]["timeout"])
+                self.assertEqual(expected_timeout, client.puts[0]["timeout"])
+            finally:
+                ledger.close()
+
+    def test_manager_persists_desensitized_error_messages(self) -> None:
+        with workspace_tmpdir("extract-error-") as tmpdir:
+            source = tmpdir / "paper.pdf"
+            source.write_bytes(b"%PDF-1.4 fake body")
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            client = FlakyFakeMinerUClient(zip_bytes=b"", post_failures=1, post_status=400)
+            try:
+                manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=MinerUProvider(client=client, retry_initial_seconds=0.0, retry_jitter=0.0),
+                    key_pool=ExtractorKeyPool([ApiKeyRef(alias="mineru_a", secret="secret-a")]),
+                )
+                with self.assertRaises(RuntimeError):
+                    manager.ensure_extraction(ExtractionRequest(input_file=source, attachment_key="ATTACH1"))
+
+                job = ledger.list_extract_jobs()[0]
+                error_message = job["error_message"]
+                self.assertIn("MinerU API request failed", error_message)
+                self.assertNotIn("https://", error_message)
+                self.assertNotIn("transient failure", error_message)
+            finally:
+                ledger.close()
+
+    def test_dotenv_parser_handles_inline_comments_and_escaped_quotes(self) -> None:
+        with workspace_tmpdir("dotenv-parser-") as tmpdir:
+            env_path = tmpdir / ".env"
+            env_path.write_text(
+                'MINERU_KEY=sk-test-secret  # inline comment\n'
+                'MINERU_API_KEY_SECOND="sk-second with spaces"\n'
+                'MINERU_API_KEY_THIRD="say \\"hi\\""\n'
+                'BAILIAN_KEY=plain#notcomment\n'
+                '# full line comment\n'
+                'EMPTY_VAR=\n',
+                encoding="utf-8",
+            )
+            pool = ExtractorKeyPool.from_env_file(env_path)
+            aliases = {key.alias: key.secret for key in pool._keys}
+            self.assertEqual("sk-test-secret", aliases["mineru_1"])
+            self.assertEqual("sk-second with spaces", aliases["mineru_second"])
+            self.assertEqual('say "hi"', aliases["mineru_third"])
+            # BAILIAN_KEY is not a MinerU key, but the parser must still preserve
+            # the inline # character in the value.
+            from zoterorag.extractors.key_pool import load_dotenv_values
+            self.assertEqual("plain#notcomment", load_dotenv_values(env_path)["BAILIAN_KEY"])
+
+class RecordingProvider:
+    name = "recording"
+    version = "1"
+
+    def __init__(self) -> None:
+        self.download_calls: list[dict[str, Any]] = []
+
+    def fingerprint(self, input_file, options_hash: str) -> str:
+        return "recording"
+
+    def submit(self, input_file, options_hash: str, *, options=None, api_key=None) -> ExtractJobState:
+        return ExtractJobState(external_job_id="batch-1", state="running")
+
+    def poll(self, external_job_id: str, *, api_key=None, options=None) -> ExtractJobState:
+        return ExtractJobState(external_job_id=external_job_id, state="completed")
+
+    def download(
+        self,
+        external_job_id: str,
+        output_dir,
+        *,
+        api_key=None,
+        source_pdf=None,
+        options=None,
+    ) -> ExtractArtifact:
+        self.download_calls.append({"external_job_id": external_job_id, "source_pdf": source_pdf, "options": options})
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        manifest = output_dir / "manifest.json"
+        source = Path(source_pdf) if source_pdf is not None else Path(external_job_id)
+        manifest.write_text(json.dumps({"source_pdf": str(source)}, ensure_ascii=False), encoding="utf-8")
+        return ExtractArtifact(source_pdf=source, artifact_dir=output_dir, manifest_path=manifest)
+
+
 class FakeClock:
     def __init__(self) -> None:
         self.value = 0.0
@@ -214,10 +389,10 @@ class FailingSubmitProvider:
     def submit(self, input_file, options_hash: str, *, options=None, api_key=None) -> ExtractJobState:
         raise RuntimeError("submit failed")
 
-    def poll(self, external_job_id: str, *, api_key=None) -> ExtractJobState:
+    def poll(self, external_job_id: str, *, api_key=None, options=None) -> ExtractJobState:
         raise AssertionError("poll should not be called")
 
-    def download(self, external_job_id: str, output_dir, *, api_key=None) -> ExtractArtifact:
+    def download(self, external_job_id: str, output_dir, *, api_key=None, source_pdf=None, options=None) -> ExtractArtifact:
         raise AssertionError("download should not be called")
 
 

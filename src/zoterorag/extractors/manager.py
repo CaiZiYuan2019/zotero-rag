@@ -77,12 +77,14 @@ class ExtractionManager:
         provider_options = dict(options)
         provider_options.setdefault("page_ranges", selected_pages)
         options_hash = stable_options_hash(options)
+        endpoint_url = getattr(self.provider, "apply_upload_url", "") or getattr(self.provider, "endpoint", "")
         cache_key = extractor_cache_key(
             pdf_sha256=pdf_sha256,
             selected_pages=selected_pages,
             extractor_name=self.provider.name,
             extractor_version=self.provider.version,
             options_hash=options_hash,
+            endpoint_url=endpoint_url,
         )
 
         existing = self.ledger.get_extract_job_by_cache_key(cache_key)
@@ -140,6 +142,7 @@ class ExtractionManager:
             polled = self.provider.poll(
                 submitted.external_job_id,
                 api_key=api_key.secret if api_key is not None else None,
+                options=options,
             )
             while polled.state not in ("completed", "failed"):
                 if time.monotonic() >= poll_deadline:
@@ -153,6 +156,7 @@ class ExtractionManager:
                 polled = self.provider.poll(
                     submitted.external_job_id,
                     api_key=api_key.secret if api_key is not None else None,
+                    options=options,
                 )
                 self.ledger.set_extract_job_state(
                     job["job_id"],
@@ -190,6 +194,8 @@ class ExtractionManager:
                 polled.external_job_id,
                 artifact_dir,
                 api_key=api_key.secret if api_key is not None else None,
+                source_pdf=input_file,
+                options=options,
             )
             self.ledger.set_extract_job_state(
                 job["job_id"],
@@ -304,7 +310,8 @@ class ExtractionManager:
         external_job_id = job.get("external_job_id")
         if not external_job_id:
             raise RuntimeError("cannot poll extract job without external_job_id")
-        polled = self.provider.poll(str(external_job_id), api_key=api_key_secret)
+        options = (job.get("payload") or {}).get("options") or {}
+        polled = self.provider.poll(str(external_job_id), api_key=api_key_secret, options=options)
         self.ledger.set_extract_job_state(
             job["job_id"],
             state=polled.state,
@@ -322,9 +329,19 @@ class ExtractionManager:
         if not external_job_id:
             raise RuntimeError("cannot download extract job without external_job_id")
         artifact_dir = self.cache_dir / str(job["cache_key"])
-        artifact = self.provider.download(str(external_job_id), artifact_dir, api_key=api_key_secret)
+        payload = job.get("payload") or {}
+        source_pdf_text = payload.get("source_pdf") or payload.get("input_file")
+        source_pdf = Path(source_pdf_text) if source_pdf_text else None
+        options = payload.get("options") or {}
+        artifact = self.provider.download(
+            str(external_job_id),
+            artifact_dir,
+            api_key=api_key_secret,
+            source_pdf=source_pdf,
+            options=options,
+        )
         payload = {
-            **(job.get("payload") or {}),
+            **payload,
             "source_pdf": str(artifact.source_pdf),
         }
         self.ledger.set_extract_job_state(

@@ -90,6 +90,76 @@ class MinerUProviderTests(unittest.TestCase):
                 safe_extract_zip(zip_path, tmpdir / "out")
             self.assertIn("symlink", str(ctx.exception))
 
+    def test_submit_retries_on_transient_http_status(self) -> None:
+        with workspace_tmpdir("mineru-retry-") as tmpdir:
+            pdf_path = tmpdir / "paper.pdf"
+            pdf_path.write_bytes(b"%PDF-1.4 fake body")
+            client = FlakyFakeMinerUClient(zip_bytes=build_zip({"full.md": "# Done\n"}), post_failures=2)
+            provider = MinerUProvider(api_key="sk-test-secret", client=client, retry_initial_seconds=0.0, retry_jitter=0.0)
+
+            submitted = provider.submit(pdf_path, "options-hash")
+
+            self.assertEqual("batch-001", submitted.external_job_id)
+            self.assertEqual(3, len(client.posts))
+
+    def test_download_validates_zip_integrity(self) -> None:
+        with workspace_tmpdir("mineru-integrity-") as tmpdir:
+            pdf_path = tmpdir / "paper.pdf"
+            pdf_path.write_bytes(b"%PDF-1.4 fake body")
+            zip_bytes = build_zip({"full.md": "# Done\n"})
+
+            # Content-Length mismatch
+            client = FlakyFakeMinerUClient(zip_bytes=zip_bytes, content_length=str(len(zip_bytes) + 1))
+            provider = MinerUProvider(api_key="sk-test-secret", client=client)
+            submitted = provider.submit(pdf_path, "options-hash")
+            with self.assertRaises(MinerUAPIError) as ctx:
+                provider.download(submitted.external_job_id, tmpdir / "artifact")
+            self.assertIn("size mismatch", str(ctx.exception).lower())
+
+            # Not a valid zip file
+            client2 = FlakyFakeMinerUClient(zip_bytes=b"not-a-zip", content_length="9")
+            provider2 = MinerUProvider(api_key="sk-test-secret", client=client2)
+            submitted2 = provider2.submit(pdf_path, "options-hash")
+            with self.assertRaises(MinerUAPIError) as ctx2:
+                provider2.download(submitted2.external_job_id, tmpdir / "artifact2")
+            self.assertIn("valid zip file", str(ctx2.exception).lower())
+
+    def test_download_uses_source_pdf_parameter(self) -> None:
+        with workspace_tmpdir("mineru-source-pdf-") as tmpdir:
+            pdf_path = tmpdir / "original.pdf"
+            pdf_path.write_bytes(b"%PDF-1.4 fake body")
+            client = FakeMinerUClient(zip_bytes=build_zip({"full.md": "# Done\n"}))
+            provider = MinerUProvider(api_key="sk-test-secret", client=client)
+            submitted = provider.submit(pdf_path, "options-hash")
+            source_pdf = tmpdir / "renamed" / "original.pdf"
+            source_pdf.parent.mkdir(parents=True, exist_ok=True)
+            source_pdf.write_bytes(b"%PDF-1.4 fake body")
+
+            artifact = provider.download(
+                submitted.external_job_id,
+                tmpdir / "artifact",
+                source_pdf=source_pdf,
+            )
+
+            self.assertEqual(source_pdf.resolve(), artifact.source_pdf.resolve())
+            manifest = json.loads(artifact.manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(str(source_pdf), manifest["source_pdf"])
+
+    def test_error_messages_do_not_include_url_or_response_body(self) -> None:
+        with workspace_tmpdir("mineru-error-") as tmpdir:
+            pdf_path = tmpdir / "paper.pdf"
+            pdf_path.write_bytes(b"%PDF-1.4 fake body")
+            client = FlakyFakeMinerUClient(zip_bytes=b"", post_failures=1, post_status=400)
+            provider = MinerUProvider(api_key="sk-test-secret", client=client, retry_initial_seconds=0.0, retry_jitter=0.0)
+
+            with self.assertRaises(MinerUAPIError) as ctx:
+                provider.submit(pdf_path, "options-hash")
+
+            message = str(ctx.exception)
+            self.assertNotIn("https://", message)
+            self.assertNotIn("transient failure", message)
+            self.assertEqual(400, ctx.exception.status_code)
+
 
 class FakeResponse:
     def __init__(
@@ -144,6 +214,83 @@ class FakeMinerUClient:
         self.gets.append({"url": url, "headers": headers or {}, "stream": stream, "timeout": timeout})
         if url == "https://download.example.test/result.zip":
             return FakeResponse(status_code=200, content=self.zip_bytes)
+        return FakeResponse(
+            body={
+                "code": 0,
+                "data": {
+                    "extract_result": [
+                        {
+                            "state": "done",
+                            "full_zip_url": "https://download.example.test/result.zip",
+                            "extract_progress": {"extracted_pages": 2, "total_pages": 2},
+                        }
+                    ]
+                },
+            }
+        )
+
+
+class FlakyFakeMinerUClient:
+    """Fake MinerU client that can fail a configurable number of times."""
+
+    def __init__(
+        self,
+        *,
+        zip_bytes: bytes,
+        post_failures: int = 0,
+        post_status: int = 503,
+        raise_on_post: Exception | None = None,
+        get_failures: int = 0,
+        get_status: int = 503,
+        content_length: str | None = None,
+    ) -> None:
+        self.zip_bytes = zip_bytes
+        self.post_failures = post_failures
+        self.post_status = post_status
+        self.raise_on_post = raise_on_post
+        self.get_failures = get_failures
+        self.get_status = get_status
+        self.content_length = content_length
+        self.posts: list[dict] = []
+        self.gets: list[dict] = []
+        self.puts: list[dict] = []
+        self.uploaded_bytes = b""
+
+    def post(self, url, *, headers=None, json=None, timeout=None):
+        self.posts.append({"url": url, "headers": headers or {}, "json": json or {}, "timeout": timeout})
+        if self.raise_on_post is not None and self.post_failures > 0:
+            self.post_failures -= 1
+            raise self.raise_on_post
+        if self.post_failures > 0:
+            self.post_failures -= 1
+            return FakeResponse(status_code=self.post_status, text="transient failure")
+        return FakeResponse(
+            body={
+                "code": 0,
+                "data": {
+                    "batch_id": "batch-001",
+                    "file_urls": ["https://upload.example.test/put"],
+                },
+            }
+        )
+
+    def put(self, url, *, data=None, timeout=None):
+        self.puts.append({"url": url, "timeout": timeout})
+        self.uploaded_bytes = data.read() if data is not None else b""
+        return FakeResponse(status_code=200, body={"ok": True})
+
+    def get(self, url, *, headers=None, stream=False, timeout=None):
+        self.gets.append({"url": url, "headers": headers or {}, "stream": stream, "timeout": timeout})
+        if self.get_failures > 0:
+            self.get_failures -= 1
+            if stream:
+                return FakeResponse(status_code=self.get_status, text="transient failure")
+            return FakeResponse(status_code=self.get_status, body={"code": self.get_status})
+        if url == "https://download.example.test/result.zip":
+            headers = {}
+            if self.content_length is not None:
+                headers["Content-Length"] = self.content_length
+            return FakeResponse(status_code=200, content=self.zip_bytes, headers=headers)
         return FakeResponse(
             body={
                 "code": 0,

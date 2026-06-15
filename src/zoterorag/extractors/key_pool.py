@@ -7,7 +7,7 @@ import time
 from typing import Any, Callable
 
 
-ENV_KEY_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$")
+ENV_KEY_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 @dataclass(frozen=True)
@@ -147,16 +147,67 @@ def load_dotenv_values(env_path: str | Path) -> dict[str, str]:
     if not path.is_file():
         return {}
     values: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        match = ENV_KEY_RE.match(line)
-        if not match or line.lstrip().startswith("#"):
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
             continue
-        name, raw_value = match.groups()
-        value = raw_value.strip()
-        if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
-            value = value[1:-1]
+        parsed = _parse_env_line(line)
+        if parsed is None:
+            continue
+        name, value = parsed
         values[name] = value
     return values
+
+
+def _parse_env_line(line: str) -> tuple[str, str] | None:
+    """Parse a single KEY=VALUE line from a .env file.
+
+    Handles inline comments and escaped quotes inside single/double-quoted
+    values without depending on third-party libraries.
+    """
+
+    if "=" not in line:
+        return None
+    key, rest = line.split("=", 1)
+    key = key.strip()
+    if not ENV_KEY_NAME_RE.match(key):
+        return None
+    value, _ = _parse_env_value(rest.strip())
+    return key, value
+
+
+def _parse_env_value(rest: str) -> tuple[str, str]:
+    """Return (value, trailing_rest) respecting quotes and inline comments."""
+
+    if not rest:
+        return "", ""
+    quote = rest[0]
+    if quote in ('"', "'"):
+        parsed = []
+        i = 1
+        while i < len(rest):
+            char = rest[i]
+            if char == "\\" and i + 1 < len(rest):
+                next_char = rest[i + 1]
+                if next_char == quote or next_char == "\\":
+                    parsed.append(next_char)
+                    i += 2
+                    continue
+            elif char == quote:
+                trailing = rest[i + 1 :].strip()
+                if trailing.startswith("#"):
+                    trailing = ""
+                return "".join(parsed), trailing
+            parsed.append(char)
+            i += 1
+        # Unterminated quoted value: return everything up to the end.
+        return "".join(parsed), ""
+
+    # Unquoted value: inline comment starts at '#' preceded by whitespace.
+    for i, char in enumerate(rest):
+        if char == "#" and (i == 0 or rest[i - 1].isspace()):
+            return rest[:i].rstrip(), ""
+    return rest.rstrip(), ""
 
 
 def alias_from_env_name(name: str, fallback_index: int) -> str:

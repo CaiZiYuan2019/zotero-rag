@@ -37,10 +37,24 @@ class ExtractorProvider(Protocol):
     ) -> ExtractJobState:
         ...
 
-    def poll(self, external_job_id: str, *, api_key: str | None = None) -> ExtractJobState:
+    def poll(
+        self,
+        external_job_id: str,
+        *,
+        api_key: str | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> ExtractJobState:
         ...
 
-    def download(self, external_job_id: str, output_dir: Path, *, api_key: str | None = None) -> ExtractArtifact:
+    def download(
+        self,
+        external_job_id: str,
+        output_dir: Path,
+        *,
+        api_key: str | None = None,
+        source_pdf: Path | str | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> ExtractArtifact:
         ...
 
 
@@ -63,12 +77,27 @@ class StubExtractorProvider:
     ) -> ExtractJobState:
         return ExtractJobState(external_job_id=self.fingerprint(input_file, options_hash), state="completed")
 
-    def poll(self, external_job_id: str, *, api_key: str | None = None) -> ExtractJobState:
+    def poll(
+        self,
+        external_job_id: str,
+        *,
+        api_key: str | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> ExtractJobState:
         return ExtractJobState(external_job_id=external_job_id, state="completed")
 
-    def download(self, external_job_id: str, output_dir: Path, *, api_key: str | None = None) -> ExtractArtifact:
+    def download(
+        self,
+        external_job_id: str,
+        output_dir: Path,
+        *,
+        api_key: str | None = None,
+        source_pdf: Path | str | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> ExtractArtifact:
         output_dir.mkdir(parents=True, exist_ok=True)
         manifest = output_dir / "manifest.json"
+        source_pdf_path = Path(source_pdf) if source_pdf is not None else Path(external_job_id)
         manifest.write_text(
             json.dumps(
                 {
@@ -76,6 +105,7 @@ class StubExtractorProvider:
                     "provider_version": self.version,
                     "external_job_id": external_job_id,
                     "state": "completed",
+                    "source_pdf": str(source_pdf_path),
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -83,4 +113,4 @@ class StubExtractorProvider:
             + "\n",
             encoding="utf-8",
         )
-        return ExtractArtifact(source_pdf=Path(external_job_id), artifact_dir=output_dir, manifest_path=manifest)
+        return ExtractArtifact(source_pdf=source_pdf_path, artifact_dir=output_dir, manifest_path=manifest)
