@@ -120,10 +120,11 @@ def mineru_urls_from_env(values: dict[str, str]) -> dict[str, str | None]:
         elif "extract-results" in generic_url:
             batch_result_url = batch_result_url or generic_url
         else:
+            # Use MINERU_URL as the API base directly — it may already
+            # include a full path prefix like /api/v4/extract/task.
             root = generic_url.rstrip("/")
-            api_root = root if root.endswith("/api/v4") else f"{root}/api/v4"
-            apply_upload_url = apply_upload_url or f"{api_root}/file-urls/batch"
-            batch_result_url = batch_result_url or f"{api_root}/extract-results/batch/{{batch_id}}"
+            apply_upload_url = apply_upload_url or f"{root}/file-urls/batch"
+            batch_result_url = batch_result_url or f"{root}/extract-results/batch/{{batch_id}}"
     return {
         "apply_upload_url": apply_upload_url,
         "batch_result_url": batch_result_url,

@@ -66,12 +66,17 @@ class ProviderRuntimeTests(unittest.TestCase):
             self.assertEqual("query instruction", provider.query_instruction)
             self.assertEqual("document instruction", provider.document_instruction)
 
-    def test_mineru_url_base_is_expanded_for_v4_endpoints(self) -> None:
-        urls = mineru_urls_from_env({"MINERU_URL": "https://mineru.example.test"})
+    def test_mineru_url_base_is_used_as_prefix_directly(self) -> None:
+        # MINERU_URL is used as-is; caller is responsible for including
+        # any path prefix like /api/v4/extract/task in the env var.
+        urls = mineru_urls_from_env({"MINERU_URL": "https://mineru.example.test/api/v4/extract/task"})
 
-        self.assertEqual("https://mineru.example.test/api/v4/file-urls/batch", urls["apply_upload_url"])
         self.assertEqual(
-            "https://mineru.example.test/api/v4/extract-results/batch/{batch_id}",
+            "https://mineru.example.test/api/v4/extract/task/file-urls/batch",
+            urls["apply_upload_url"],
+        )
+        self.assertEqual(
+            "https://mineru.example.test/api/v4/extract/task/extract-results/batch/{batch_id}",
             urls["batch_result_url"],
         )
 

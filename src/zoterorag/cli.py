@@ -108,6 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Execute the ingest pipeline (extract -> normalize -> embed). Uses real MinerU and Qwen APIs when keys are configured.",
     )
+    ingest_start.add_argument("--env", default=".env", help="Env file for API keys when executing.")
     ingest_pause = ingest_sub.add_parser("pause")
     ingest_pause.add_argument("job_id")
     ingest_pause.add_argument("--reason", default="manual pause")
