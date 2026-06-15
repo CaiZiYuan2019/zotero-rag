@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import time
 from typing import Any
 import uuid
 
@@ -15,6 +16,7 @@ from .cache import (
     sha256_file,
     stable_options_hash,
 )
+from .mineru import MinerUAPIError
 from .recovery import classify_extract_job
 from .key_pool import ExtractorKeyPool
 
@@ -54,12 +56,16 @@ class ExtractionManager:
         provider: ExtractorProvider | None = None,
         key_pool: ExtractorKeyPool | None = None,
         failure_cooldown_seconds: float = 60.0,
+        poll_interval_seconds: float = 30.0,
+        poll_timeout_seconds: float = 1800.0,
     ) -> None:
         self.ledger = ledger
         self.cache_dir = Path(cache_dir)
         self.provider = provider or StubExtractorProvider()
         self.key_pool = key_pool or ExtractorKeyPool()
         self.failure_cooldown_seconds = failure_cooldown_seconds
+        self.poll_interval_seconds = poll_interval_seconds
+        self.poll_timeout_seconds = poll_timeout_seconds
 
     def ensure_extraction(self, request: ExtractionRequest) -> ExtractionResult:
         input_file = Path(request.input_file)
@@ -126,20 +132,58 @@ class ExtractionManager:
                 last_poll_at=utc_now(),
             )
 
+            # MinerU processing is async: submit returns immediately, and the
+            # batch runs remotely for minutes. Poll in a loop until the job
+            # completes, fails, or the timeout expires. The poll interval and
+            # timeout are configurable on the ExtractionManager.
+            poll_deadline = time.monotonic() + self.poll_timeout_seconds
             polled = self.provider.poll(
                 submitted.external_job_id,
                 api_key=api_key.secret if api_key is not None else None,
             )
+            while polled.state not in ("completed", "failed"):
+                if time.monotonic() >= poll_deadline:
+                    raise MinerUAPIError(
+                        f"MinerU batch {submitted.external_job_id} did not complete within "
+                        f"{self.poll_timeout_seconds:.0f}s",
+                        stage="poll-timeout",
+                        batch_id=submitted.external_job_id,
+                    )
+                time.sleep(self.poll_interval_seconds)
+                polled = self.provider.poll(
+                    submitted.external_job_id,
+                    api_key=api_key.secret if api_key is not None else None,
+                )
+                self.ledger.set_extract_job_state(
+                    job["job_id"],
+                    state=polled.state,
+                    local_stage="download" if polled.state == "completed" else "poll",
+                    external_job_id=polled.external_job_id,
+                    last_poll_at=utc_now(),
+                )
+
+            if polled.state == "failed":
+                self.ledger.set_extract_job_state(
+                    job["job_id"],
+                    state="failed_retryable",
+                    local_stage="error",
+                    error_code="MinerUAPIError",
+                    error_message=polled.message or "MinerU batch failed",
+                )
+                raise MinerUAPIError(
+                    polled.message or "MinerU batch failed",
+                    stage="extract",
+                    batch_id=submitted.external_job_id,
+                )
+
+            # polled.state == "completed"
             self.ledger.set_extract_job_state(
                 job["job_id"],
-                state=polled.state,
-                local_stage="download" if polled.state == "completed" else "poll",
+                state="completed",
+                local_stage="download",
                 external_job_id=polled.external_job_id,
                 last_poll_at=utc_now(),
             )
-
-            if polled.state != "completed":
-                return ExtractionResult(job=self.ledger.get_extract_job(job_id=job["job_id"]) or job, cache_hit=False)
 
             artifact_dir = self.cache_dir / cache_key
             artifact = self.provider.download(
