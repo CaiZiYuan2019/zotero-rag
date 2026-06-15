@@ -66,22 +66,22 @@ class ReembedPipelineTests(unittest.TestCase):
                 )
                 seed_normalized_document(tmpdir, ledger)
 
-                with self.assertRaises(NotImplementedError):
-                    start_reembed_job(
-                        ledger,
-                        vector_store_dir=tmpdir / "vectors",
-                        profile_name="qwen-text",
-                        execute=True,
-                    )
-
-                dry_run = start_reembed_job(
+                # Without allow_stub_provider, the resolver tries to build a
+                # real dashscope provider which fails (invalid dimension=8 or
+                # missing API keys). The error is captured per-document rather
+                # than aborting the whole job.
+                failed_result = start_reembed_job(
                     ledger,
                     vector_store_dir=tmpdir / "vectors",
                     profile_name="qwen-text",
-                    execute=False,
+                    execute=True,
                 )
-                self.assertEqual("planned", dry_run["job"]["status"])
+                self.assertEqual("completed_with_errors", failed_result["job"]["status"])
+                self.assertEqual(0, len(failed_result["indexed"]))
+                self.assertEqual(1, len(failed_result["failed"]))
+                self.assertIn("error", failed_result["failed"][0])
 
+                # allow_stub_provider=True enables stub fallback for testing.
                 executed = start_reembed_job(
                     ledger,
                     vector_store_dir=tmpdir / "vectors",
@@ -91,6 +91,16 @@ class ReembedPipelineTests(unittest.TestCase):
                 )
                 self.assertEqual("completed", executed["job"]["status"])
                 self.assertEqual(1, len(executed["indexed"]))
+
+                # Confirm a dry-run plan shows the document as done now.
+                dry_run = start_reembed_job(
+                    ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="qwen-text",
+                    execute=False,
+                )
+                self.assertEqual("planned", dry_run["job"]["status"])
+                self.assertEqual("done", dry_run["plan"]["documents"][0]["status"])
             finally:
                 ledger.close()
 

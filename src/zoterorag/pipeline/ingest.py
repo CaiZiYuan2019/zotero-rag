@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from collections import Counter
+from pathlib import Path
 from typing import Any, Literal
 
 from ..db import JobEvent, StateLedger
 from ..embeddings.profile import embedding_profile_hash
+from ..embeddings.indexer import index_normalized_document
+from ..normalize.markdown import normalize_markdown_document
 
 
 IngestMode = Literal["incremental", "full"]
@@ -70,16 +73,29 @@ def start_ingest_job(
     zotero_key: str | None = None,
     include_multimodal: bool = True,
     execute: bool = False,
+    # --- execution dependencies (required when execute=True) ---
+    extract_manager: Any = None,
+    extract_cache_dir: str | Path | None = None,
+    normalized_dir: str | Path | None = None,
+    vector_store_dir: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Create a persisted ingest job and checkpoint its document plan.
+    """Create a persisted ingest job and optionally execute it.
 
-    Execution is intentionally disabled until real MinerU and qwen workers are
-    added. This prevents accidental expensive API calls during control-plane
-    testing while still making progress/resume state durable.
+    When execute=False (the default), only the plan is created and persisted.
+    This is safe for control-plane testing and diagnostics.
+
+    When execute=True, the function processes documents stage by stage:
+    extract → normalize → embed(text) → embed(multimodal). Each stage
+    checks checkpoints before re-executing so interrupted runs can resume.
     """
 
     if execute:
-        raise NotImplementedError("ingest execution workers are not implemented; start with execute=false")
+        if extract_manager is None or extract_cache_dir is None or normalized_dir is None or vector_store_dir is None:
+            raise ValueError(
+                "extract_manager, extract_cache_dir, normalized_dir, and vector_store_dir "
+                "are required when execute=True"
+            )
+
     plan = create_ingest_plan(
         ledger,
         mode=mode,
@@ -92,7 +108,7 @@ def start_ingest_job(
             "mode": mode,
             "zotero_key": zotero_key,
             "include_multimodal": include_multimodal,
-            "execute": False,
+            "execute": execute,
             "summary": plan["summary"],
         },
     )
@@ -101,7 +117,9 @@ def start_ingest_job(
             job_id=job_id,
             stage="plan",
             status="completed",
-            message="ingest plan created without executing external providers",
+            message="ingest plan created"
+            if not execute
+            else "ingest plan created; executing stages",
             payload=plan["summary"],
         )
     )
@@ -112,8 +130,67 @@ def start_ingest_job(
             "planned",
             {"job_id": job_id, "document": document},
         )
-    ledger.set_job_status(job_id, "planned")
-    return {"job": ledger.get_job(job_id, include_events=True), "plan": plan}
+
+    if not execute:
+        ledger.set_job_status(job_id, "planned")
+        return {"job": ledger.get_job(job_id, include_events=True), "plan": plan}
+
+    # --- execution path ---
+    ledger.set_job_status(job_id, "running")
+    extract_cache_dir = Path(extract_cache_dir)
+    normalized_dir = Path(normalized_dir)
+    vector_store_dir = Path(vector_store_dir)
+
+    executed: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+
+    for document in plan["documents"]:
+        if document["next_stage"] == "complete":
+            skipped.append(document)
+            continue
+
+        try:
+            result = _execute_document_stages(
+                ledger=ledger,
+                job_id=job_id,
+                document=document,
+                extract_manager=extract_manager,
+                extract_cache_dir=extract_cache_dir,
+                normalized_dir=normalized_dir,
+                vector_store_dir=vector_store_dir,
+            )
+            executed.append(result)
+        except Exception as exc:
+            failed.append({"document": document, "error": str(exc)})
+            ledger.add_event(
+                JobEvent(
+                    job_id=job_id,
+                    stage="document_error",
+                    status="failed",
+                    message=f"{document['document_id']}: {exc}",
+                    payload={"document": document, "error": str(exc)},
+                )
+            )
+
+    final_status = "completed" if not failed else "completed_with_errors"
+    ledger.add_event(
+        JobEvent(
+            job_id=job_id,
+            stage="complete",
+            status=final_status,
+            message=f"indexed {len(executed)} documents; skipped {len(skipped)}; failed {len(failed)}",
+            payload={"indexed": len(executed), "skipped": len(skipped), "failed": len(failed)},
+        )
+    )
+    ledger.set_job_status(job_id, final_status)
+    return {
+        "job": ledger.get_job(job_id, include_events=True),
+        "plan": plan,
+        "executed": executed,
+        "skipped": skipped,
+        "failed": failed,
+    }
 
 
 def pause_ingest_job(ledger: StateLedger, job_id: str, *, reason: str = "manual pause") -> dict[str, Any]:
@@ -359,3 +436,236 @@ def require_ingest_job(ledger: StateLedger, job_id: str) -> dict[str, Any]:
     if job["kind"] != "ingest":
         raise ValueError(f"job {job_id} has kind {job['kind']}, expected ingest")
     return job
+
+
+# ---------------------------------------------------------------------------
+# Execution helpers — called by start_ingest_job when execute=True
+# ---------------------------------------------------------------------------
+
+
+def _execute_document_stages(
+    *,
+    ledger: StateLedger,
+    job_id: str,
+    document: dict[str, Any],
+    extract_manager: Any,
+    extract_cache_dir: Path,
+    normalized_dir: Path,
+    vector_store_dir: Path,
+) -> dict[str, Any]:
+    """Execute pending stages for a single document, resuming from checkpoints."""
+
+    attachment_key = document["attachment_key"]
+    document_id = document["document_id"]
+
+    for stage in document["stages"]:
+        stage_name = stage["stage"]
+        if stage["status"] not in {"pending", "blocked"}:
+            continue
+
+        if stage_name == "extract":
+            _execute_extract_stage(
+                ledger=ledger,
+                job_id=job_id,
+                attachment_key=attachment_key,
+                document=document,
+                extract_manager=extract_manager,
+                extract_cache_dir=extract_cache_dir,
+            )
+        elif stage_name == "normalize":
+            _execute_normalize_stage(
+                ledger=ledger,
+                job_id=job_id,
+                attachment_key=attachment_key,
+                document_id=document_id,
+                document=document,
+                normalized_dir=normalized_dir,
+            )
+        elif stage_name.startswith("embed:"):
+            profile_name = stage_name[len("embed:"):]
+            _execute_embed_stage(
+                ledger=ledger,
+                job_id=job_id,
+                document_id=document_id,
+                profile_name=profile_name,
+                vector_store_dir=vector_store_dir,
+            )
+
+    return {
+        "attachment_key": attachment_key,
+        "document_id": document_id,
+        "title": document.get("title"),
+    }
+
+
+def _execute_extract_stage(
+    *,
+    ledger: StateLedger,
+    job_id: str,
+    attachment_key: str,
+    document: dict[str, Any],
+    extract_manager: Any,
+    extract_cache_dir: Path,
+) -> None:
+    """Run MinerU extraction for one attachment."""
+
+    from ..extractors.manager import ExtractionRequest
+
+    attachment = ledger.get_attachment(attachment_key)
+    if attachment is None:
+        raise ValueError(f"attachment not found in ledger: {attachment_key}")
+
+    file_path = attachment.get("file_path")
+    if not file_path or not Path(file_path).is_file():
+        raise FileNotFoundError(f"attachment file not found: {file_path}")
+
+    ledger.add_event(
+        JobEvent(
+            job_id=job_id,
+            stage="extract",
+            status="running",
+            message=f"submitting {attachment_key} to extractor",
+        )
+    )
+
+    request = ExtractionRequest(
+        input_file=Path(file_path),
+        attachment_key=attachment_key,
+    )
+    result = extract_manager.ensure_extraction(request)
+
+    ledger.add_event(
+        JobEvent(
+            job_id=job_id,
+            stage="extract",
+            status="completed" if result.job["state"] in DONE_EXTRACT_STATES else result.job["state"],
+            message=f"extract job {result.job['job_id']} state={result.job['state']}",
+            payload={"job_id": result.job["job_id"], "state": result.job["state"], "cache_hit": result.cache_hit},
+        )
+    )
+
+
+def _execute_normalize_stage(
+    *,
+    ledger: StateLedger,
+    job_id: str,
+    attachment_key: str,
+    document_id: str,
+    document: dict[str, Any],
+    normalized_dir: Path,
+) -> None:
+    """Run offline markdown normalization for one document."""
+
+    # Find the extract job that has a downloaded artifact
+    extract_jobs = [
+        j for j in ledger.list_extract_jobs(limit=None)
+        if j.get("attachment_key") == attachment_key and j["state"] in DONE_EXTRACT_STATES
+    ]
+    if not extract_jobs:
+        raise ValueError(f"no completed extract job for {attachment_key}; run extraction first")
+
+    extract_job = extract_jobs[0]
+    artifact_dir = extract_job.get("artifact_dir") or extract_job.get("extract_dir")
+    if not artifact_dir:
+        raise ValueError(f"extract job {extract_job['job_id']} has no artifact_dir")
+
+    artifact_path = Path(artifact_dir)
+    source_md = _find_source_markdown(artifact_path)
+    if source_md is None:
+        raise FileNotFoundError(f"no markdown file found in extract artifact: {artifact_path}")
+
+    ledger.add_event(
+        JobEvent(
+            job_id=job_id,
+            stage="normalize",
+            status="running",
+            message=f"normalizing {document_id}",
+        )
+    )
+
+    normalize_result = normalize_markdown_document(
+        source_markdown=source_md,
+        output_root=normalized_dir,
+        document_id=document_id,
+        attachment_key=attachment_key,
+        extract_job_id=extract_job["job_id"],
+    )
+
+    # Persist the normalized artifact
+    ledger.upsert_normalized_artifact(normalize_result.ledger_artifact())
+    ledger.replace_document_chunks(document_id, normalize_result.chunks)
+    ledger.checkpoint(
+        document_id,
+        "normalize",
+        "normalized",
+        {"chunk_count": normalize_result.ledger_artifact()["chunk_count"]},
+    )
+
+    ledger.add_event(
+        JobEvent(
+            job_id=job_id,
+            stage="normalize",
+            status="completed",
+            message=f"normalized {document_id}: {normalize_result.ledger_artifact()['chunk_count']} chunks",
+            payload=normalize_result.ledger_artifact(),
+        )
+    )
+
+
+def _execute_embed_stage(
+    *,
+    ledger: StateLedger,
+    job_id: str,
+    document_id: str,
+    profile_name: str,
+    vector_store_dir: Path,
+) -> None:
+    """Run embedding for one document under one profile."""
+
+    ledger.add_event(
+        JobEvent(
+            job_id=job_id,
+            stage=f"embed:{profile_name}",
+            status="running",
+            message=f"embedding {document_id} with {profile_name}",
+        )
+    )
+
+    index_result = index_normalized_document(
+        ledger=ledger,
+        vector_store_dir=vector_store_dir,
+        profile_name=profile_name,
+        document_id=document_id,
+        # Provider is auto-resolved from profile by _resolve_embedding_provider
+    )
+
+    ledger.add_event(
+        JobEvent(
+            job_id=job_id,
+            stage=f"embed:{profile_name}",
+            status="completed",
+            message=f"indexed {index_result.indexed_chunks} chunks for {document_id}",
+            payload=index_result.to_dict(),
+        )
+    )
+
+
+def _find_source_markdown(artifact_dir: Path) -> Path | None:
+    """Find the main markdown file in a MinerU extraction artifact directory.
+
+    MinerU typically produces a file like ``full.md`` or ``<name>.md`` in the
+    top level of the extracted archive. This helper locates it.
+    """
+    candidates = list(artifact_dir.glob("*.md"))
+    if not candidates:
+        # Check one level deep (some archives have a root folder)
+        for child in artifact_dir.iterdir():
+            if child.is_dir():
+                candidates.extend(child.glob("*.md"))
+    if not candidates:
+        return None
+    # Prefer full.md, then the largest .md file
+    for candidate in candidates:
+        if candidate.name.lower() in ("full.md", "output.md"):
+            return candidate
+    return max(candidates, key=lambda p: p.stat().st_size)

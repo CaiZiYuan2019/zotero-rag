@@ -378,17 +378,33 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "ingest":
             if args.ingest_command == "start":
                 try:
-                    emit(
-                        start_ingest_job(
-                            ledger,
-                            mode=args.mode,
-                            zotero_key=args.zotero_key,
-                            include_multimodal=not args.text_only,
-                            execute=args.execute,
-                        )
+                    kwargs: dict[str, Any] = dict(
+                        mode=args.mode,
+                        zotero_key=args.zotero_key,
+                        include_multimodal=not args.text_only,
+                        execute=args.execute,
                     )
+                    if args.execute:
+                        from .providers import build_mineru_provider
+                        from .extractors import ExtractorKeyPool, ExtractionManager
+
+                        key_pool = ExtractorKeyPool.from_env_file(args.env)
+                        provider = build_mineru_provider(args.env)
+                        kwargs["extract_manager"] = ExtractionManager(
+                            ledger=ledger,
+                            cache_dir=config.paths.extract_cache_dir,
+                            provider=provider,
+                            key_pool=key_pool,
+                        )
+                        kwargs["extract_cache_dir"] = config.paths.extract_cache_dir
+                        kwargs["normalized_dir"] = config.paths.normalized_dir
+                        kwargs["vector_store_dir"] = config.paths.vector_store_dir
+                    emit(start_ingest_job(ledger, **kwargs))
                     return 0
                 except NotImplementedError as exc:
+                    emit({"ok": False, "error": str(exc)})
+                    return 1
+                except (FileNotFoundError, ValueError, RuntimeError) as exc:
                     emit({"ok": False, "error": str(exc)})
                     return 1
             if args.ingest_command == "pause":
@@ -705,6 +721,10 @@ def main(argv: list[str] | None = None) -> int:
                 if args.embedding_provider == "qwen3vl":
                     profile = selected_embedding_profile(ledger, args.profile, mode=args.mode)
                     provider = build_qwen_embedding_provider(profile, args.env)
+                elif args.embedding_provider == "stub":
+                    from .embeddings import StubEmbeddingProvider
+                    profile = selected_embedding_profile(ledger, args.profile, mode=args.mode)
+                    provider = StubEmbeddingProvider(dimension=int(profile["dimension"]))
                 results = search_vector_index(
                     ledger=ledger,
                     vector_store_dir=config.paths.vector_store_dir,

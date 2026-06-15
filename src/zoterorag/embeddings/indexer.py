@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from ..db import StateLedger
-from ..index.local_vector import LocalVectorStore, VectorRecord
+from ..index.local_vector import open_vector_store, VectorRecord
 from ..search.results import SearchResult, ensure_rerank_disabled, sanitize_results_for_consumer
 from .base import EmbeddingInput, EmbeddingProvider, StubEmbeddingProvider
 from .profile import embedding_profile_hash
@@ -41,6 +41,29 @@ class IndexResult:
         }
 
 
+def _resolve_embedding_provider(
+    *,
+    provider: EmbeddingProvider | None,
+    profile: dict[str, Any],
+    allow_stub_provider: bool,
+) -> EmbeddingProvider:
+    """Resolve an embedding provider, building real providers from env when needed.
+
+    Callers that already have a concrete provider (CLI, API) should pass it
+    directly. When no provider is given, this function tries to construct the
+    correct implementation for the configured profile so that control-plane
+    code (MCP tools, reembed workers) does not need to carry env-loading logic.
+    """
+    if provider is not None:
+        return provider
+    if profile["provider"] == "stub" or allow_stub_provider:
+        return StubEmbeddingProvider(dimension=int(profile["dimension"]))
+    # Lazy-import to avoid a circular dependency between embeddings and
+    # the top-level providers module (which imports from embeddings).
+    from ..providers import build_qwen_embedding_provider
+    return build_qwen_embedding_provider(profile)
+
+
 def index_normalized_document(
     *,
     ledger: StateLedger,
@@ -49,6 +72,7 @@ def index_normalized_document(
     document_id: str,
     provider: EmbeddingProvider | None = None,
     allow_stub_provider: bool = False,
+    vector_backend: str = "sqlite-local",
 ) -> IndexResult:
     profile = require_embedding_profile(ledger, profile_name)
     artifact = ledger.get_normalized_artifact(document_id)
@@ -83,12 +107,13 @@ def index_normalized_document(
             chunk_type=chunk_type,
             batch_hash=batch_hash,
             expected_chunks=len(inputs),
+            backend=vector_backend,
         )
     ):
-        counts = vector_index_counts(vector_path, profile_name=profile_name, dimension=int(profile["dimension"]))
+        counts = vector_index_counts(vector_path, profile_name=profile_name, dimension=int(profile["dimension"]), backend=vector_backend)
         ledger.register_vector_index(
             profile_name=profile_name,
-            backend="sqlite-local",
+            backend=vector_backend,
             path=vector_path,
             document_count=counts["documents"],
             chunk_count=counts["chunks"],
@@ -120,13 +145,11 @@ def index_normalized_document(
             reused_existing=True,
         )
 
-    if provider is None and profile["provider"] != "stub" and not allow_stub_provider:
-        raise NotImplementedError(
-            f"embedding provider {profile['provider']} is not implemented for direct local indexing; "
-            "use a real provider implementation or set allow_stub_provider=true for control-plane tests"
-        )
-
-    embedding_provider = provider or StubEmbeddingProvider(dimension=int(profile["dimension"]))
+    embedding_provider = _resolve_embedding_provider(
+        provider=provider,
+        profile=profile,
+        allow_stub_provider=allow_stub_provider,
+    )
     if embedding_provider.dimension != int(profile["dimension"]):
         raise ValueError(
             f"provider dimension {embedding_provider.dimension} does not match profile {profile_name} "
@@ -168,7 +191,7 @@ def index_normalized_document(
         for chunk in chunks
     ]
 
-    store = LocalVectorStore(vector_path, profile_name=profile_name, dimension=int(profile["dimension"]))
+    store = open_vector_store(vector_path, profile_name=profile_name, dimension=int(profile["dimension"]), backend=vector_backend)
     try:
         # Stage records under the deterministic batch hash first. Search only
         # sees this rebuild after publish_version commits, so interrupted
@@ -206,7 +229,7 @@ def index_normalized_document(
     )
     ledger.register_vector_index(
         profile_name=profile_name,
-        backend="sqlite-local",
+        backend=vector_backend,
         path=vector_path,
         document_count=counts["documents"],
         chunk_count=counts["chunks"],
@@ -246,10 +269,13 @@ def active_vectors_match_embedding_batch(
     chunk_type: str,
     batch_hash: str,
     expected_chunks: int,
+    backend: str = "sqlite-local",
 ) -> bool:
-    if expected_chunks == 0 or not vector_path.is_file():
+    if expected_chunks == 0:
         return False
-    store = LocalVectorStore(vector_path, profile_name=profile_name, dimension=dimension)
+    if backend == "sqlite-local" and not vector_path.is_file():
+        return False
+    store = open_vector_store(vector_path, profile_name=profile_name, dimension=dimension, backend=backend)
     try:
         counts = store.document_counts(document_id, modality=chunk_type)
         batch_hashes = {
@@ -262,8 +288,8 @@ def active_vectors_match_embedding_batch(
         store.close()
 
 
-def vector_index_counts(vector_path: Path, *, profile_name: str, dimension: int) -> dict[str, Any]:
-    store = LocalVectorStore(vector_path, profile_name=profile_name, dimension=dimension)
+def vector_index_counts(vector_path: Path, *, profile_name: str, dimension: int, backend: str = "sqlite-local") -> dict[str, Any]:
+    store = open_vector_store(vector_path, profile_name=profile_name, dimension=dimension, backend=backend)
     try:
         active_version = store.active_version()
         return {
@@ -291,18 +317,18 @@ def search_vector_index(
     query_image_base64: str | None = None,
     query_image_mime_type: str | None = None,
     provider: EmbeddingProvider | None = None,
+    vector_backend: str = "sqlite-local",
 ) -> list[dict[str, Any]]:
     profile = select_profile(ledger, profile_name=profile_name, mode=mode)
     profile_name = profile["name"]
     ensure_rerank_disabled(rerank)
     if mode == "text" and (query_image_path or query_image_base64):
         raise ValueError("text search does not accept query images")
-    if provider is None and profile["provider"] != "stub":
-        raise NotImplementedError(
-            f"embedding provider {profile['provider']} is not implemented for direct local search; "
-            "pass a real provider implementation for query embedding"
-        )
-    embedding_provider = provider or StubEmbeddingProvider(dimension=int(profile["dimension"]))
+    embedding_provider = _resolve_embedding_provider(
+        provider=provider,
+        profile=profile,
+        allow_stub_provider=False,
+    )
     if embedding_provider.dimension != int(profile["dimension"]):
         raise ValueError(
             f"provider dimension {embedding_provider.dimension} does not match profile {profile_name} "
@@ -321,10 +347,11 @@ def search_vector_index(
         ]
     )[0].vector
     modality = "text" if mode == "text" else "image"
-    store = LocalVectorStore(
+    store = open_vector_store(
         vector_path_for_profile(vector_store_dir, profile_name),
         profile_name=profile_name,
         dimension=int(profile["dimension"]),
+        backend=vector_backend,
     )
     try:
         raw_results = store.search(query_vector, top_k=top_k, modality=modality)

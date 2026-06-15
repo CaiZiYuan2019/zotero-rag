@@ -197,7 +197,7 @@ class EmbeddingIndexerTests(unittest.TestCase):
             finally:
                 ledger.close()
 
-    def test_direct_indexing_rejects_non_stub_profile_without_explicit_override(self) -> None:
+    def test_direct_indexing_resolves_provider_from_profile(self) -> None:
         with workspace_tmpdir("embedding-indexer-guard-") as tmpdir:
             source_dir = tmpdir / "mineru"
             source_dir.mkdir(parents=True)
@@ -227,7 +227,12 @@ class EmbeddingIndexerTests(unittest.TestCase):
                 ledger.upsert_normalized_artifact(normalized.ledger_artifact())
                 ledger.replace_document_chunks(normalized.document_id, normalized.chunks)
 
-                with self.assertRaises(NotImplementedError):
+                # Without allow_stub_provider, the resolver tries to build a
+                # real dashscope provider from the environment. The test
+                # profile uses an invalid dimension (8) so the build fails
+                # before any network call. In production this would raise
+                # RuntimeError when no API key is configured.
+                with self.assertRaises((RuntimeError, ValueError)):
                     index_normalized_document(
                         ledger=ledger,
                         vector_store_dir=tmpdir / "vectors",
@@ -235,6 +240,7 @@ class EmbeddingIndexerTests(unittest.TestCase):
                         document_id="DOC1",
                     )
 
+                # allow_stub_provider=True forces stub even for non-stub profiles.
                 result = index_normalized_document(
                     ledger=ledger,
                     vector_store_dir=tmpdir / "vectors",
@@ -246,7 +252,8 @@ class EmbeddingIndexerTests(unittest.TestCase):
                 batch = ledger.list_embedding_batches(profile_name="qwen_text", document_id="DOC1")[0]
                 self.assertEqual("stub", batch["provider"])
 
-                with self.assertRaises(NotImplementedError):
+                # Same behavior for search: auto-resolve fails without API keys.
+                with self.assertRaises((RuntimeError, ValueError)):
                     search_vector_index(
                         ledger=ledger,
                         vector_store_dir=tmpdir / "vectors",
@@ -255,6 +262,7 @@ class EmbeddingIndexerTests(unittest.TestCase):
                         mode="text",
                     )
 
+                # Passing an explicit stub provider works.
                 hits = search_vector_index(
                     ledger=ledger,
                     vector_store_dir=tmpdir / "vectors",

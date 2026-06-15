@@ -31,7 +31,9 @@ class ProviderRuntimeTests(unittest.TestCase):
             self.assertEqual("mineru_1", status["mineru"]["keys"][0]["alias"])
             self.assertTrue(status["qwen3vl_embedding"]["configured"])
             self.assertEqual("BAILIAN_KEY", status["qwen3vl_embedding"]["key_env_name"])
-            self.assertEqual("BAILIAN_URL", status["qwen3vl_embedding"]["endpoint_env_name"])
+            # BAILIAN_URL is intentionally excluded from embedding endpoint
+            # resolution (it points at the chat API, not embeddings).
+            self.assertIsNone(status["qwen3vl_embedding"]["endpoint_env_name"])
             self.assertNotIn("mineru-secret", serialized)
             self.assertNotIn("qwen-secret", serialized)
 
@@ -40,7 +42,7 @@ class ProviderRuntimeTests(unittest.TestCase):
             env_path = tmpdir / ".env"
             env_path.write_text(
                 "BAILIAN_KEY=qwen-secret\n"
-                "BAILIAN_URL=https://dashscope.example.test/embed\n",
+                "DASHSCOPE_MULTIMODAL_EMBEDDING_URL=https://dashscope.example.test/embed\n",
                 encoding="utf-8",
             )
 

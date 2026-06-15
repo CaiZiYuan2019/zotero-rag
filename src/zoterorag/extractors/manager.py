@@ -15,6 +15,7 @@ from .cache import (
     sha256_file,
     stable_options_hash,
 )
+from .recovery import classify_extract_job
 from .key_pool import ExtractorKeyPool
 
 
@@ -179,3 +180,116 @@ class ExtractionManager:
         finally:
             if api_key is not None:
                 self.key_pool.release_key(api_key.alias)
+
+    def resume_extraction(self, job_id: str) -> ExtractionResult:
+        """Resume one persisted extraction job from its recorded local stage.
+
+        This method is explicit execution, not a status check. It never runs
+        during diagnostics or recovery planning. For remote providers, callers
+        must construct the manager with the intended provider/key pool first.
+        """
+
+        job = self.ledger.get_extract_job(job_id=job_id)
+        if job is None:
+            raise KeyError(f"extract job not found: {job_id}")
+        recovery = classify_extract_job(job)
+        if recovery.action == "skip":
+            return ExtractionResult(job=job, cache_hit=True)
+        if recovery.action == "manual_review":
+            raise RuntimeError(f"extract job {job_id} requires manual review: {recovery.reason}")
+
+        api_key = self.key_pool.acquire_key()
+        if api_key is None and self.key_pool.has_keys():
+            raise RuntimeError("no extractor API key is currently available; all keys are busy or cooling down")
+        try:
+            if recovery.action == "poll":
+                return self._resume_poll(job, api_key_secret=api_key.secret if api_key else None)
+            if recovery.action == "download":
+                return self._resume_download(job, api_key_secret=api_key.secret if api_key else None)
+            if recovery.action == "submit":
+                return self._resume_submit(job, api_key_secret=api_key.secret if api_key else None)
+            raise RuntimeError(f"unsupported extract recovery action: {recovery.action}")
+        except Exception as exc:
+            if api_key is not None:
+                self.key_pool.mark_key_cooldown(
+                    api_key.alias,
+                    cooldown_seconds=self.failure_cooldown_seconds,
+                )
+            self.ledger.set_extract_job_state(
+                job_id,
+                state="failed_retryable",
+                local_stage="error",
+                error_code=exc.__class__.__name__,
+                error_message=str(exc),
+            )
+            raise
+        finally:
+            if api_key is not None:
+                self.key_pool.release_key(api_key.alias)
+
+    def _resume_submit(self, job: dict[str, Any], *, api_key_secret: str | None) -> ExtractionResult:
+        payload = job.get("payload") or {}
+        input_file_text = payload.get("input_file")
+        if not input_file_text:
+            raise RuntimeError("cannot resubmit extract job without payload.input_file")
+        input_file = Path(input_file_text)
+        if not input_file.is_file():
+            raise FileNotFoundError(f"extract input file no longer exists: {input_file}")
+        options = dict(payload.get("options") or {})
+        provider_options = dict(options)
+        provider_options.setdefault("page_ranges", job.get("selected_pages") or "")
+        submitted = self.provider.submit(
+            input_file,
+            str(job["options_hash"]),
+            options=provider_options,
+            api_key=api_key_secret,
+        )
+        self.ledger.set_extract_job_state(
+            job["job_id"],
+            state="running" if submitted.state == "running" else submitted.state,
+            local_stage="poll",
+            external_job_id=submitted.external_job_id,
+            last_poll_at=utc_now(),
+        )
+        refreshed = self.ledger.get_extract_job(job_id=job["job_id"]) or job
+        if submitted.state == "completed":
+            return self._resume_download(refreshed, api_key_secret=api_key_secret)
+        return ExtractionResult(job=refreshed, cache_hit=False)
+
+    def _resume_poll(self, job: dict[str, Any], *, api_key_secret: str | None) -> ExtractionResult:
+        external_job_id = job.get("external_job_id")
+        if not external_job_id:
+            raise RuntimeError("cannot poll extract job without external_job_id")
+        polled = self.provider.poll(str(external_job_id), api_key=api_key_secret)
+        self.ledger.set_extract_job_state(
+            job["job_id"],
+            state=polled.state,
+            local_stage="download" if polled.state == "completed" else "poll",
+            external_job_id=polled.external_job_id,
+            last_poll_at=utc_now(),
+        )
+        refreshed = self.ledger.get_extract_job(job_id=job["job_id"]) or job
+        if polled.state == "completed":
+            return self._resume_download(refreshed, api_key_secret=api_key_secret)
+        return ExtractionResult(job=refreshed, cache_hit=False)
+
+    def _resume_download(self, job: dict[str, Any], *, api_key_secret: str | None) -> ExtractionResult:
+        external_job_id = job.get("external_job_id")
+        if not external_job_id:
+            raise RuntimeError("cannot download extract job without external_job_id")
+        artifact_dir = self.cache_dir / str(job["cache_key"])
+        artifact = self.provider.download(str(external_job_id), artifact_dir, api_key=api_key_secret)
+        payload = {
+            **(job.get("payload") or {}),
+            "source_pdf": str(artifact.source_pdf),
+        }
+        self.ledger.set_extract_job_state(
+            job["job_id"],
+            state="downloaded",
+            local_stage="downloaded",
+            artifact_dir=artifact.artifact_dir,
+            extract_dir=artifact.artifact_dir,
+            manifest_path=artifact.manifest_path,
+            payload=payload,
+        )
+        return ExtractionResult(job=self.ledger.get_extract_job(job_id=job["job_id"]) or job, cache_hit=False)

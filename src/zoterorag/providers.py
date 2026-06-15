@@ -17,8 +17,11 @@ DASHSCOPE_KEY_NAMES = (
     "DASHSCOPE_KEY",
     "QWEN_API_KEY",
 )
+# BAILIAN_URL is intentionally excluded from embedding endpoint resolution:
+# it typically points at the OpenAI-compatible chat endpoint (/compatible-mode/v1)
+# which does not serve multimodal embeddings. Use the embedding-specific env
+# vars below to override the default embedding URL.
 DASHSCOPE_ENDPOINT_NAMES = (
-    "BAILIAN_URL",
     "DASHSCOPE_MULTIMODAL_EMBEDDING_URL",
     "QWEN_EMBEDDING_URL",
 )

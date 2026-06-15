@@ -38,6 +38,25 @@ def strip_stored_version_prefix(*, stored_record_id: str, index_version: str) ->
     return stored_record_id
 
 
+def open_vector_store(
+    path: str | Path,
+    *,
+    profile_name: str,
+    dimension: int,
+    backend: str = "sqlite-local",
+) -> "LocalVectorStore":
+    """Open a vector store for *profile_name*, picking the right backend.
+
+    ``backend`` values:
+      - ``"sqlite-local"`` (default) — SQLite-backed :class:`LocalVectorStore`
+      - ``"lancedb"`` — LanceDB-backed :class:`LanceDBVectorStore`
+    """
+    if backend == "lancedb":
+        from .lancedb_vector import LanceDBVectorStore
+        return LanceDBVectorStore(path, profile_name=profile_name, dimension=dimension)  # type: ignore[return-value]
+    return LocalVectorStore(path, profile_name=profile_name, dimension=dimension)
+
+
 class LocalVectorStore:
     """Small SQLite vector store used for local tests and bootstrap.
 

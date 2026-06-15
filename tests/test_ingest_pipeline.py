@@ -106,13 +106,14 @@ class IngestPipelineTests(unittest.TestCase):
             finally:
                 ledger.close()
 
-    def test_execute_true_is_explicitly_rejected_until_workers_exist(self) -> None:
+    def test_execute_true_requires_dependencies(self) -> None:
         with workspace_tmpdir("ingest-execute-") as tmpdir:
             ledger = StateLedger(tmpdir / "state.sqlite")
             try:
                 seed_profiles(ledger)
                 seed_attachments(ledger)
-                with self.assertRaises(NotImplementedError):
+                # execute=True without extract_manager and paths raises ValueError.
+                with self.assertRaises(ValueError):
                     start_ingest_job(ledger, execute=True)
                 self.assertEqual([], ledger.list_jobs(kind="ingest"))
             finally:

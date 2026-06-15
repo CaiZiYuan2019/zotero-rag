@@ -133,13 +133,21 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
     def ingest_start(payload: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = payload or {}
         try:
-            return start_ingest_job(
-                ledger,
+            execute = bool(payload.get("execute", False))
+            kwargs: dict[str, Any] = dict(
                 mode=str(payload.get("mode", "incremental")),  # type: ignore[arg-type]
                 zotero_key=payload.get("zotero_key"),
                 include_multimodal=bool(payload.get("include_multimodal", True)),
-                execute=bool(payload.get("execute", False)),
+                execute=execute,
             )
+            if execute:
+                kwargs["extract_manager"] = _build_extract_manager(
+                    ledger, config.paths.extract_cache_dir, str(payload.get("env", ".env"))
+                )
+                kwargs["extract_cache_dir"] = config.paths.extract_cache_dir
+                kwargs["normalized_dir"] = config.paths.normalized_dir
+                kwargs["vector_store_dir"] = config.paths.vector_store_dir
+            return start_ingest_job(ledger, **kwargs)
         except NotImplementedError as exc:
             raise HTTPException(status_code=501, detail=str(exc)) from exc
         except ValueError as exc:
@@ -447,6 +455,21 @@ def create_app(config_path: str | Path = "config/config.example.toml") -> Any:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return app
+
+
+def _build_extract_manager(ledger: Any, extract_cache_dir: Any, env_path: str) -> Any:
+    """Build an ExtractionManager wired to real MinerU provider and key pool."""
+    from ..providers import build_mineru_provider
+    from ..extractors import ExtractorKeyPool, ExtractionManager
+
+    key_pool = ExtractorKeyPool.from_env_file(env_path)
+    provider = build_mineru_provider(env_path)
+    return ExtractionManager(
+        ledger=ledger,
+        cache_dir=extract_cache_dir,
+        provider=provider,
+        key_pool=key_pool,
+    )
 
 
 def explicit_embedding_provider(payload: dict[str, Any], profile: dict[str, Any]) -> Any:

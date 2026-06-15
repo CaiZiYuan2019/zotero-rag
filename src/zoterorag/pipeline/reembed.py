@@ -8,7 +8,7 @@ from ..db import JobEvent, StateLedger
 from ..embeddings import index_normalized_document
 from ..embeddings.indexer import require_embedding_profile, vector_path_for_profile
 from ..embeddings.profile import embedding_profile_hash
-from ..index import LocalVectorStore
+from ..index import open_vector_store
 
 
 def create_reembed_plan(
@@ -62,19 +62,15 @@ def start_reembed_job(
     execute: bool = False,
     allow_stub_provider: bool = False,
 ) -> dict[str, Any]:
-    """Create a vector-only rebuild job and optionally execute local indexing.
+    """Create a vector-only rebuild job and optionally execute indexing.
 
-    Real qwen/dashscope providers are intentionally not invoked here. Execution
-    uses the existing local stub provider unless the profile itself is `stub` or
-    the caller explicitly allows stub substitution for control-plane testing.
+    When execute=True, each pending document is re-embedded using the configured
+    profile. The embedding provider is auto-resolved from the profile and
+    environment by ``index_normalized_document``. Set ``allow_stub_provider=True``
+    to force stub embeddings even for non-stub profiles (useful for testing).
     """
 
-    profile = require_embedding_profile(ledger, profile_name)
-    if execute and profile["provider"] != "stub" and not allow_stub_provider:
-        raise NotImplementedError(
-            f"embedding provider {profile['provider']} is not implemented for local reembed execution; "
-            "rerun with execute=false or allow_stub_provider=true"
-        )
+    require_embedding_profile(ledger, profile_name)
 
     plan = create_reembed_plan(
         ledger,
@@ -117,6 +113,7 @@ def start_reembed_job(
 
     executed = []
     skipped = []
+    failed = []
     ledger.set_job_status(job_id, "running")
     for document in plan["documents"]:
         if document["status"] != "pending":
@@ -131,39 +128,54 @@ def start_reembed_job(
                 )
             )
             continue
-        result = index_normalized_document(
-            ledger=ledger,
-            vector_store_dir=vector_store_dir,
-            profile_name=profile_name,
-            document_id=document["document_id"],
-            allow_stub_provider=allow_stub_provider,
-        )
-        result_payload = result.to_dict()
-        executed.append(result_payload)
-        ledger.add_event(
-            JobEvent(
-                job_id=job_id,
-                stage=f"embed:{profile_name}",
-                status="indexed",
-                message=f"indexed {result.indexed_chunks} chunks for {document['document_id']}",
-                payload=result_payload,
+        try:
+            result = index_normalized_document(
+                ledger=ledger,
+                vector_store_dir=vector_store_dir,
+                profile_name=profile_name,
+                document_id=document["document_id"],
+                allow_stub_provider=allow_stub_provider,
             )
-        )
+            result_payload = result.to_dict()
+            executed.append(result_payload)
+            ledger.add_event(
+                JobEvent(
+                    job_id=job_id,
+                    stage=f"embed:{profile_name}",
+                    status="indexed",
+                    message=f"indexed {result.indexed_chunks} chunks for {document['document_id']}",
+                    payload=result_payload,
+                )
+            )
+        except Exception as exc:
+            failed.append({"document": document, "error": str(exc)})
+            ledger.add_event(
+                JobEvent(
+                    job_id=job_id,
+                    stage=f"embed:{profile_name}",
+                    status="failed",
+                    message=f"{document['document_id']}: {exc}",
+                    payload={"document": document, "error": str(exc)},
+                )
+            )
+
+    final_status = "completed" if not failed else "completed_with_errors"
     ledger.add_event(
         JobEvent(
             job_id=job_id,
             stage="complete",
-            status="completed",
-            message=f"indexed {len(executed)} documents; skipped {len(skipped)}",
-            payload={"indexed": len(executed), "skipped": len(skipped)},
+            status=final_status,
+            message=f"indexed {len(executed)} documents; skipped {len(skipped)}; failed {len(failed)}",
+            payload={"indexed": len(executed), "skipped": len(skipped), "failed": len(failed)},
         )
     )
-    ledger.set_job_status(job_id, "completed")
+    ledger.set_job_status(job_id, final_status)
     return {
         "job": ledger.get_job(job_id, include_events=True),
         "plan": plan,
         "indexed": executed,
         "skipped": skipped,
+        "failed": failed,
     }
 
 
@@ -240,7 +252,7 @@ def active_document_vector_state(
     vector_path = vector_path_for_profile(vector_store_dir, str(profile["name"]))
     if not vector_path.is_file():
         return {"chunk_count": None, "profile_hashes": []}
-    store = LocalVectorStore(vector_path, profile_name=str(profile["name"]), dimension=int(profile["dimension"]))
+    store = open_vector_store(vector_path, profile_name=str(profile["name"]), dimension=int(profile["dimension"]))
     try:
         profile_hashes = sorted(
             value
