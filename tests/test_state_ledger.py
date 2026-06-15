@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import unittest
 
 from tests._support import workspace_tmpdir
@@ -208,5 +209,36 @@ class StateLedgerTests(unittest.TestCase):
 
                 with self.assertRaises(ValueError):
                     ledger.activate_embedding_profile("mm-a", "text")
+            finally:
+                ledger.close()
+
+    def test_concurrent_writes_do_not_corrupt_state(self) -> None:
+        with workspace_tmpdir("state-ledger-concurrent-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                errors: list[Exception] = []
+                threads: list[threading.Thread] = []
+
+                def worker(thread_id: int) -> None:
+                    try:
+                        for i in range(20):
+                            job_id = ledger.create_job("test", payload={"thread": thread_id, "i": i})
+                            ledger.set_job_status(job_id, "completed")
+                            ledger.checkpoint(f"subject-{thread_id}-{i}", "stage", "done", {"i": i})
+                    except Exception as exc:  # pragma: no cover
+                        errors.append(exc)
+
+                for t in range(5):
+                    thread = threading.Thread(target=worker, args=(t,))
+                    threads.append(thread)
+                    thread.start()
+
+                for thread in threads:
+                    thread.join()
+
+                self.assertEqual([], errors)
+                summary = ledger.status_summary()
+                self.assertEqual(100, summary["jobs"]["completed"])
+                self.assertEqual(100, summary["checkpoints"])
             finally:
                 ledger.close()

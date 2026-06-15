@@ -6,7 +6,8 @@ import hashlib
 import json
 from pathlib import Path
 import sqlite3
-from typing import Any, Iterable
+import threading
+from typing import Any, Callable, Iterable
 import uuid
 
 
@@ -27,6 +28,44 @@ class JobEvent:
     created_at: str = ""
 
 
+class _ThreadSafeConnection:
+    """Thread-safe proxy for a sqlite3 connection.
+
+    SQLite connections are not thread-safe. This wrapper serializes every
+    method call and context-manager entry/exit through an RLock so that the
+    ledger can be shared safely across FastAPI worker threads and background
+    workers without ``check_same_thread`` races.
+    """
+
+    def __init__(self, conn: sqlite3.Connection, lock: threading.RLock) -> None:
+        self._conn = conn
+        self._lock = lock
+
+    def __enter__(self) -> sqlite3.Connection:
+        self._lock.acquire()
+        return self._conn.__enter__()
+
+    def __exit__(self, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return self._conn.__exit__(*args, **kwargs)
+        finally:
+            self._lock.release()
+
+    def __getattribute__(self, name: str) -> Any:
+        if name in ("_conn", "_lock", "__enter__", "__exit__"):
+            return object.__getattribute__(self, name)
+        attr = getattr(object.__getattribute__(self, "_conn"), name)
+        if callable(attr):
+            lock = object.__getattribute__(self, "_lock")
+
+            def wrapper(*args: Any, **kwargs: Any) -> Any:
+                with lock:
+                    return attr(*args, **kwargs)
+
+            return wrapper
+        return attr
+
+
 class StateLedger:
     """SQLite-backed state ledger.
 
@@ -38,17 +77,18 @@ class StateLedger:
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(
+        self._lock = threading.RLock()
+        raw_conn = sqlite3.connect(
             self.db_path,
             isolation_level=None,
             timeout=30,
-            # FastAPI runs synchronous route handlers in a thread pool. The
-            # state ledger is still a single SQLite connection with explicit
-            # transactions; this flag only permits API status/read handlers to
-            # use that connection from the worker thread that FastAPI selects.
+            # The connection is wrapped by _ThreadSafeConnection, which uses an
+            # RLock to serialize access across threads. check_same_thread=False
+            # is safe here because the wrapper prevents concurrent use.
             check_same_thread=False,
         )
-        self.conn.row_factory = sqlite3.Row
+        raw_conn.row_factory = sqlite3.Row
+        self.conn: sqlite3.Connection = _ThreadSafeConnection(raw_conn, self._lock)
         self._configure()
         self.migrate()
 
