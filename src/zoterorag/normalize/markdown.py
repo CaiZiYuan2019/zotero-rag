@@ -445,6 +445,14 @@ def assign_image_runs(images: list[dict[str, Any]], markdown_text: str) -> list[
     return images
 
 
+# Text chunks smaller than this threshold are not flushed just because a heading
+# appears; they are merged with the following section to reduce fragmentation.
+# Chunks larger than the maximum are still flushed immediately to stay within
+# the embedding model context window.
+CHUNK_TOKEN_TARGET = 1000
+CHUNK_TOKEN_MAX = 2200
+
+
 def build_chunks(document_id: str, markdown_text: str, images: list[dict[str, Any]]) -> list[dict[str, Any]]:
     lines = markdown_text.splitlines()
     heading_path: list[str] = []
@@ -474,14 +482,17 @@ def build_chunks(document_id: str, markdown_text: str, images: list[dict[str, An
     for line in lines:
         heading_match = HEADING_RE.match(line)
         if heading_match:
-            flush_text()
+            # Avoid flushing very short sections just because a heading appears;
+            # merge them with the following content for better semantic coherence.
+            if current_text and estimate_tokens("\n".join(current_text)) >= CHUNK_TOKEN_TARGET:
+                flush_text()
             level = len(heading_match.group(1))
             title = heading_match.group(2).strip()
             heading_path = heading_path[: level - 1] + [title]
             current_text.append(line)
             continue
         current_text.append(line)
-        if estimate_tokens("\n".join(current_text)) >= 2200:
+        if estimate_tokens("\n".join(current_text)) >= CHUNK_TOKEN_MAX:
             flush_text()
     flush_text()
 

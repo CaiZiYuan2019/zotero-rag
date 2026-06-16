@@ -74,6 +74,57 @@ class NormalizeMarkdownTests(unittest.TestCase):
             finally:
                 ledger.close()
 
+    def test_short_sections_are_merged_until_target_token_threshold(self) -> None:
+        with workspace_tmpdir("normalize-merge-") as tmpdir:
+            source_dir = tmpdir / "mineru"
+            source_dir.mkdir(parents=True)
+            markdown = source_dir / "full.md"
+            # Each "word" is ~5 characters, so ~250 words give ~1250 characters and
+            # therefore ~312 tokens (estimate_tokens uses len // 4).
+            words = [f"word{i}" for i in range(250)]
+            short_para = " ".join(words)
+            markdown.write_text(
+                f"# Title\n\n{short_para}\n\n"
+                f"## Section A\n\n{short_para}\n\n"
+                f"## Section B\n\n{short_para}\n",
+                encoding="utf-8",
+            )
+            result = normalize_markdown_document(
+                source_markdown=markdown,
+                output_root=tmpdir / "normalized",
+                document_id="DOC_MERGE",
+            )
+            text_chunks = [c for c in result.chunks if c["chunk_type"] == "text"]
+            # The three short sections are merged into a single chunk because each
+            # section is below the 1000-token target threshold and the total is below
+            # the 2200-token maximum.
+            self.assertEqual(1, len(text_chunks))
+            self.assertGreaterEqual(text_chunks[0]["metadata"]["token_estimate"], 900)
+
+    def test_long_sections_are_still_split_at_max_token_threshold(self) -> None:
+        with workspace_tmpdir("normalize-split-") as tmpdir:
+            source_dir = tmpdir / "mineru"
+            source_dir.mkdir(parents=True)
+            markdown = source_dir / "full.md"
+            # 2400 words of ~5 chars each -> ~14400 chars -> ~3600 tokens.
+            # Split across multiple lines so that a flush leaves remaining content.
+            words = [f"word{i}" for i in range(2400)]
+            long_lines = [" ".join(words[i : i + 100]) for i in range(0, 2400, 100)]
+            long_text = "\n".join(long_lines)
+            markdown.write_text(
+                f"# Title\n\n{long_text}\n",
+                encoding="utf-8",
+            )
+            result = normalize_markdown_document(
+                source_markdown=markdown,
+                output_root=tmpdir / "normalized",
+                document_id="DOC_SPLIT",
+            )
+            text_chunks = [c for c in result.chunks if c["chunk_type"] == "text"]
+            # The long paragraph is split into at least two chunks at the 2200-token
+            # maximum boundary.
+            self.assertGreaterEqual(len(text_chunks), 2)
+
     def test_image_manifest_records_dimensions_and_consecutive_runs(self) -> None:
         with workspace_tmpdir("normalize-md-") as tmpdir:
             source_dir = tmpdir / "mineru"
