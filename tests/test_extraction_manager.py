@@ -176,7 +176,7 @@ class ExtractionManagerTests(unittest.TestCase):
             finally:
                 ledger.close()
 
-    def test_manager_refuses_submit_when_configured_keys_are_unavailable(self) -> None:
+    def test_manager_waits_for_key_to_become_available(self) -> None:
         with workspace_tmpdir("extract-manager-") as tmpdir:
             source = tmpdir / "paper.pdf"
             source.write_bytes(b"%PDF-1.4 fake test body")
@@ -189,6 +189,34 @@ class ExtractionManagerTests(unittest.TestCase):
                     ledger=ledger,
                     cache_dir=tmpdir / "extract_cache",
                     key_pool=pool,
+                )
+                # With the only key held, a zero-timeout acquire returns None.
+                self.assertIsNone(manager._acquire_key_with_wait(timeout_seconds=0.0))
+
+                # Release the key and verify the manager can acquire it.
+                pool.release_key("mineru_a")
+                self.assertIsNotNone(manager._acquire_key_with_wait(timeout_seconds=1.0))
+            finally:
+                pool.release_key("mineru_a")
+                ledger.close()
+
+    def test_manager_still_raises_when_key_never_becomes_available(self) -> None:
+        with workspace_tmpdir("extract-manager-") as tmpdir:
+            source = tmpdir / "paper.pdf"
+            source.write_bytes(b"%PDF-1.4 fake test body")
+            clock = FakeClock()
+            pool = ExtractorKeyPool(
+                [ApiKeyRef(alias="mineru_a", secret="secret-a")],
+                clock=clock.now,
+            )
+            pool.acquire_key()
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    key_pool=pool,
+                    key_acquire_timeout_seconds=0.1,
                 )
                 with self.assertRaises(RuntimeError):
                     manager.ensure_extraction(ExtractionRequest(input_file=source, attachment_key="ATTACH1"))

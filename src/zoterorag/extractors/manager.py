@@ -58,6 +58,7 @@ class ExtractionManager:
         failure_cooldown_seconds: float = 60.0,
         poll_interval_seconds: float = 30.0,
         poll_timeout_seconds: float = 21600.0,
+        key_acquire_timeout_seconds: float = 60.0,
     ) -> None:
         self.ledger = ledger
         self.cache_dir = Path(cache_dir)
@@ -66,6 +67,26 @@ class ExtractionManager:
         self.failure_cooldown_seconds = failure_cooldown_seconds
         self.poll_interval_seconds = poll_interval_seconds
         self.poll_timeout_seconds = poll_timeout_seconds
+        self.key_acquire_timeout_seconds = key_acquire_timeout_seconds
+
+    def _acquire_key_with_wait(self, timeout_seconds: float | None = None) -> ApiKeyRef | None:
+        """Acquire an extractor key, waiting until one becomes available.
+
+        Returns ``None`` immediately when the pool is empty (stub/no-key mode).
+        Raises no exception here; callers decide whether a key is mandatory.
+        """
+        if not self.key_pool.has_keys():
+            return None
+        timeout = timeout_seconds if timeout_seconds is not None else self.key_acquire_timeout_seconds
+        deadline = time.monotonic() + timeout
+        while True:
+            api_key = self.key_pool.acquire_key()
+            if api_key is not None:
+                return api_key
+            wait = min(2.0, deadline - time.monotonic())
+            if wait <= 0:
+                return None
+            time.sleep(wait)
 
     def ensure_extraction(self, request: ExtractionRequest) -> ExtractionResult:
         input_file = Path(request.input_file)
@@ -91,7 +112,7 @@ class ExtractionManager:
         if existing is not None and existing["state"] in REUSABLE_EXTRACT_STATES:
             return ExtractionResult(job=existing, cache_hit=True)
 
-        api_key = self.key_pool.acquire_key()
+        api_key = self._acquire_key_with_wait()
         if api_key is None and self.key_pool.has_keys():
             raise RuntimeError("no extractor API key is currently available; all keys are busy or cooling down")
         api_key_alias = api_key.alias if api_key is not None else f"{self.provider.name}_stub"
@@ -250,7 +271,7 @@ class ExtractionManager:
         if recovery.action == "manual_review":
             raise RuntimeError(f"extract job {job_id} requires manual review: {recovery.reason}")
 
-        api_key = self.key_pool.acquire_key()
+        api_key = self._acquire_key_with_wait()
         if api_key is None and self.key_pool.has_keys():
             raise RuntimeError("no extractor API key is currently available; all keys are busy or cooling down")
         try:
