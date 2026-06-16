@@ -86,6 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--host", default=None)
     serve.add_argument("--port", type=int, default=None)
     serve.add_argument("--check", action="store_true", help="Only validate bind/auth settings without starting Uvicorn.")
+    sub.add_parser("mcp", help="Start the MCP stdio server for AstrBot integration.")
     doctor = sub.add_parser("doctor", help="Run non-invasive local readiness diagnostics.")
     doctor.add_argument("--verify-vectors", action="store_true")
     doctor.add_argument(
@@ -353,6 +354,13 @@ def main(argv: list[str] | None = None) -> int:
             except RuntimeError as exc:
                 emit({"ok": False, "error": str(exc)})
                 return 1
+            return 0
+
+        if args.command == "mcp":
+            ledger.close()
+            from .mcp.server import main as mcp_main
+
+            mcp_main()
             return 0
 
         if args.command == "doctor":
