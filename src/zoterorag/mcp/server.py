@@ -12,6 +12,7 @@ same tool functions defined in ``zoterorag.mcp.tools`` through the MCP protocol.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import sys
@@ -198,7 +199,9 @@ async def serve(config: AppConfig, ledger: StateLedger) -> None:
             return [TextContent(type="text", text=json.dumps(error_payload, ensure_ascii=False))]
 
     # Re-encode stdout so MCP JSON lines are written as UTF-8 on Windows.
-    sys.stdout = open(sys.stdout.fileno(), mode="w", encoding="utf-8", errors="replace", closefd=False)
+    sys.stdout = io.TextIOWrapper(
+        sys.stdout.buffer, encoding="utf-8", errors="replace"
+    )
 
     async with stdio_server() as (read_stream, write_stream):
         await server.run(
