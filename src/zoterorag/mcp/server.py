@@ -198,11 +198,6 @@ async def serve(config: AppConfig, ledger: StateLedger) -> None:
             error_payload = {"error": type(exc).__name__, "message": str(exc)}
             return [TextContent(type="text", text=json.dumps(error_payload, ensure_ascii=False))]
 
-    # Re-encode stdout so MCP JSON lines are written as UTF-8 on Windows.
-    sys.stdout = io.TextIOWrapper(
-        sys.stdout.buffer, encoding="utf-8", errors="replace"
-    )
-
     async with stdio_server() as (read_stream, write_stream):
         await server.run(
             read_stream,
@@ -221,11 +216,23 @@ def main(config_path: str | None = None) -> None:
         config_path: Optional TOML config path. Falls back to ``ZOTERORAG_CONFIG``
             env var, then ``config/config.toml``.
     """
+    # Re-encode stdout before any operation so MCP JSON lines are always UTF-8.
+    sys.stdout = io.TextIOWrapper(
+        sys.stdout.buffer, encoding="utf-8", errors="replace"
+    )
+
     if config_path is None:
         config_path = os.environ.get("ZOTERORAG_CONFIG")
-    config, ledger = _load_runtime(config_path)
+    try:
+        config, ledger = _load_runtime(config_path)
+    except Exception as exc:
+        print(f"[zoterorag_mcp] FATAL: failed to load runtime: {exc}", file=sys.stderr, flush=True)
+        raise
     try:
         asyncio.run(serve(config, ledger))
+    except Exception as exc:
+        print(f"[zoterorag_mcp] FATAL: server crashed: {exc}", file=sys.stderr, flush=True)
+        raise
     finally:
         ledger.close()
 
