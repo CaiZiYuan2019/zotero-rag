@@ -88,7 +88,7 @@ class LanceDBVectorStore:
                 return 0
             raise
         excluded = set(exclude_document_ids)
-        all_rows = active_table.to_pandas().to_dict("records")
+        all_rows = active_table.to_arrow().to_pylist()
         rows_to_copy = [
             _record_to_row(
                 VectorRecord(
@@ -127,7 +127,7 @@ class LanceDBVectorStore:
     def active_version(self) -> str:
         try:
             meta_table = self._db.open_table("vector_meta")
-            rows = meta_table.to_pandas().to_dict("records")
+            rows = meta_table.to_arrow().to_pylist()
         except Exception as exc:
             # Broad because LanceDB raises varying exception types for missing tables.
             if _is_table_missing(exc):
@@ -173,7 +173,7 @@ class LanceDBVectorStore:
 
         # LanceDB native vector search when a vector column is configured.
         # We fall back to brute-force cosine similarity for portability.
-        all_rows = table.to_pandas().to_dict("records")
+        all_rows = table.to_arrow().to_pylist()
 
         scored = []
         for row in all_rows:
@@ -201,7 +201,7 @@ class LanceDBVectorStore:
         version = index_version or self.active_version()
         try:
             table = self._db.open_table(_table_name(version))
-            rows = table.to_pandas().to_dict("records")
+            rows = table.to_arrow().to_pylist()
         except Exception as exc:
             # Broad because LanceDB raises varying exception types for missing tables.
             if _is_table_missing(exc):
@@ -225,7 +225,7 @@ class LanceDBVectorStore:
         version = index_version or self.active_version()
         try:
             table = self._db.open_table(_table_name(version))
-            rows = table.to_pandas().to_dict("records")
+            rows = table.to_arrow().to_pylist()
         except Exception as exc:
             # Broad because LanceDB raises varying exception types for missing tables.
             if _is_table_missing(exc):
@@ -256,7 +256,7 @@ class LanceDBVectorStore:
         version = index_version or self.active_version()
         try:
             table = self._db.open_table(_table_name(version))
-            rows = table.to_pandas().to_dict("records")
+            rows = table.to_arrow().to_pylist()
         except Exception as exc:
             # Broad because LanceDB raises varying exception types for missing tables.
             if _is_table_missing(exc):

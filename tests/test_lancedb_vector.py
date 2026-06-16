@@ -135,9 +135,11 @@ class LanceDBVectorStoreBehaviorTests(unittest.TestCase):
 
     def test_copy_active_returns_zero_when_active_table_missing(self) -> None:
         meta_table = MagicMock()
-        meta_table.to_pandas.return_value.to_dict.return_value = [
+        mock_arrow = MagicMock()
+        mock_arrow.to_pylist.return_value = [
             {"profile_name": "p1", "active_version": "v1"}
         ]
+        meta_table.to_arrow.return_value = mock_arrow
 
         def open_table(name: str):
             if name == "vector_meta":

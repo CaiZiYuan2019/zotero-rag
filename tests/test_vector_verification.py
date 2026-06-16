@@ -252,7 +252,9 @@ class VectorVerificationTests(unittest.TestCase):
                     },
                 ]
                 mock_table = MagicMock()
-                mock_table.to_pandas.return_value.to_dict.return_value = rows
+                mock_arrow = MagicMock()
+                mock_arrow.to_pylist.return_value = rows
+                mock_table.to_arrow.return_value = mock_arrow
                 mock_db = MagicMock()
                 mock_db.open_table.return_value = mock_table
                 mock_lancedb = MagicMock()
@@ -322,7 +324,9 @@ class VectorVerificationTests(unittest.TestCase):
                     },
                 ]
                 mock_table = MagicMock()
-                mock_table.to_pandas.return_value.to_dict.return_value = rows
+                mock_arrow = MagicMock()
+                mock_arrow.to_pylist.return_value = rows
+                mock_table.to_arrow.return_value = mock_arrow
                 mock_db = MagicMock()
                 mock_db.open_table.return_value = mock_table
                 mock_lancedb = MagicMock()

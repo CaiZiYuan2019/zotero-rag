@@ -200,7 +200,7 @@ def _verify_lancedb_store(
             # Broad because LanceDB raises varying exception types for missing tables.
             return 0, 0, 0, [f"missing_active_table:{table_name}:{exc}"]
 
-        rows = table.to_pandas().to_dict("records")
+        rows = table.to_arrow().to_pylist()
         rows = [r for r in rows if r.get("profile_name") == profile_name]
         actual_chunks = len(rows)
         actual_documents = len({r.get("document_id") for r in rows})
