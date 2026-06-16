@@ -511,6 +511,42 @@ class ExtractionManagerResumeTests(unittest.TestCase):
             finally:
                 ledger.close()
 
+    def test_failed_retryable_resume_poll_falls_back_to_resubmit(self) -> None:
+        with workspace_tmpdir("extract-resume-fallback-") as tmpdir:
+            source = tmpdir / "paper.pdf"
+            source.write_bytes(b"%PDF-1.4 fake body")
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=FailingPollThenRecordingProvider(),
+                )
+                job_id = str(uuid.uuid4())
+                ledger.upsert_extract_job(
+                    {
+                        "job_id": job_id,
+                        "attachment_key": "ATT1",
+                        "pdf_sha256": "a" * 64,
+                        "selected_pages": "",
+                        "cache_key": "cache-1",
+                        "provider": "failing-poll-then-recording",
+                        "provider_version": "1",
+                        "options_hash": "options",
+                        "api_key_alias": "stub_stub",
+                        "external_job_id": "batch-old",
+                        "state": "failed_retryable",
+                        "local_stage": "error",
+                        "payload": {"input_file": str(source)},
+                    }
+                )
+                result = manager.resume_extraction(job_id)
+
+                self.assertEqual("downloaded", result.job["state"])
+                self.assertNotEqual("batch-old", result.job.get("external_job_id"))
+            finally:
+                ledger.close()
+
     def test_resume_poll_failure_marks_retryable(self) -> None:
         with workspace_tmpdir("extract-resume-poll-fail-") as tmpdir:
             source = tmpdir / "paper.pdf"
@@ -564,6 +600,31 @@ class FailingDownloadProvider(RecordingProvider):
         options=None,
     ) -> ExtractArtifact:
         raise RuntimeError("download failed")
+
+
+class FailingPollThenRecordingProvider(RecordingProvider):
+    name = "failing-poll-then-recording"
+    version = "1"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._poll_count = 0
+
+    def submit(
+        self,
+        input_file,
+        options_hash: str,
+        *,
+        options=None,
+        api_key=None,
+    ) -> ExtractJobState:
+        return ExtractJobState(external_job_id="batch-new", state="running")
+
+    def poll(self, external_job_id: str, *, api_key=None, options=None) -> ExtractJobState:
+        self._poll_count += 1
+        if self._poll_count == 1:
+            return ExtractJobState(external_job_id=external_job_id, state="failed", message="remote gone")
+        return ExtractJobState(external_job_id=external_job_id, state="completed")
 
 
 class FailingPollProvider:

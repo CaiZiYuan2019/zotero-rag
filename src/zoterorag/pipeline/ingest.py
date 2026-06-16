@@ -650,15 +650,27 @@ def _execute_normalize_stage(
 ) -> None:
     """Run offline markdown normalization for one document."""
 
-    # Find the extract job that has a downloaded artifact
-    extract_jobs = [
-        j for j in ledger.list_extract_jobs(limit=None)
-        if j.get("attachment_key") == attachment_key and j["state"] in DONE_EXTRACT_STATES
-    ]
-    if not extract_jobs:
-        raise ValueError(f"no completed extract job for {attachment_key}; run extraction first")
+    # Find the extract job that has a downloaded artifact. Prefer the job id
+    # recorded by the extract stage so that attachments sharing the same PDF
+    # cache_key can reuse a single extract job without creating duplicate
+    # records.
+    extract_job: dict[str, Any] | None = None
+    extract_checkpoint = ledger.get_checkpoint(attachment_key, "extract")
+    if extract_checkpoint is not None and extract_checkpoint.get("status") == "done":
+        shared_job_id = extract_checkpoint.get("payload", {}).get("extract_job_id")
+        if shared_job_id:
+            candidate = ledger.get_extract_job(job_id=shared_job_id)
+            if candidate is not None and candidate["state"] in DONE_EXTRACT_STATES:
+                extract_job = candidate
 
-    extract_job = extract_jobs[0]
+    if extract_job is None:
+        extract_jobs = [
+            j for j in ledger.list_extract_jobs(limit=None)
+            if j.get("attachment_key") == attachment_key and j["state"] in DONE_EXTRACT_STATES
+        ]
+        if not extract_jobs:
+            raise ValueError(f"no completed extract job for {attachment_key}; run extraction first")
+        extract_job = extract_jobs[0]
     artifact_dir = extract_job.get("artifact_dir") or extract_job.get("extract_dir")
     if not artifact_dir:
         raise ValueError(f"extract job {extract_job['job_id']} has no artifact_dir")

@@ -252,6 +252,61 @@ class IngestPipelineTests(unittest.TestCase):
             finally:
                 ledger.close()
 
+    def test_shared_pdf_cache_key_attachment_reuses_extract_artifact(self) -> None:
+        """Two attachments pointing to the same PDF must share one extract job."""
+        with workspace_tmpdir("ingest-shared-cache-key-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                seed_profiles(ledger)
+                source = tmpdir / "shared.pdf"
+                source.write_bytes(b"shared pdf content")
+                att1 = build_attachment("ATT_SHARED_1", title="Shared One")
+                att1["file_path"] = str(source)
+                att1["file_exists"] = True
+                att2 = build_attachment("ATT_SHARED_2", title="Shared Two")
+                att2["file_path"] = str(source)
+                att2["file_exists"] = True
+                ledger.upsert_attachments([att1, att2])
+
+                extract_manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=MarkdownStubExtractorProvider(),
+                )
+                first = start_ingest_job(
+                    ledger,
+                    zotero_key="ATT_SHARED_1",
+                    include_multimodal=False,
+                    execute=True,
+                    extract_manager=extract_manager,
+                    extract_cache_dir=tmpdir / "extract_cache",
+                    normalized_dir=tmpdir / "normalized",
+                    vector_store_dir=tmpdir / "vectors",
+                )
+                self.assertEqual("completed", first["job"]["status"])
+
+                # The second attachment reuses the same cached artifact.
+                second = start_ingest_job(
+                    ledger,
+                    zotero_key="ATT_SHARED_2",
+                    include_multimodal=False,
+                    execute=True,
+                    extract_manager=extract_manager,
+                    extract_cache_dir=tmpdir / "extract_cache",
+                    normalized_dir=tmpdir / "normalized",
+                    vector_store_dir=tmpdir / "vectors",
+                )
+                self.assertEqual("completed", second["job"]["status"])
+                self.assertEqual(1, len(second["executed"]))
+                self.assertEqual(0, len(second["failed"]))
+                self.assertIsNotNone(ledger.get_normalized_artifact("ATT_SHARED_2"))
+
+                # Only one extract job record should exist for the shared PDF.
+                jobs = ledger.list_extract_jobs(limit=None)
+                self.assertEqual(1, len(jobs))
+            finally:
+                ledger.close()
+
     def test_running_extract_job_is_resumed_and_completes(self) -> None:
         """An interrupted run that left an extract job in 'running' state can resume."""
         with workspace_tmpdir("ingest-running-resume-") as tmpdir:

@@ -276,7 +276,10 @@ class ExtractionManager:
             raise RuntimeError("no extractor API key is currently available; all keys are busy or cooling down")
         try:
             if recovery.action == "poll":
-                return self._resume_poll(job, api_key_secret=api_key.secret if api_key else None)
+                secret = api_key.secret if api_key else None
+                if job.get("state") == "failed_retryable":
+                    return self._resume_poll_with_fallback(job, api_key_secret=secret)
+                return self._resume_poll(job, api_key_secret=secret)
             if recovery.action == "download":
                 return self._resume_download(job, api_key_secret=api_key.secret if api_key else None)
             if recovery.action == "submit":
@@ -327,9 +330,15 @@ class ExtractionManager:
             last_poll_at=utc_now(),
         )
         refreshed = self.ledger.get_extract_job(job_id=job["job_id"]) or job
+        if submitted.state == "running":
+            return self._resume_poll(refreshed, api_key_secret=api_key_secret)
         if submitted.state == "completed":
             return self._resume_download(refreshed, api_key_secret=api_key_secret)
-        return ExtractionResult(job=refreshed, cache_hit=False)
+        raise MinerUAPIError(
+            "resubmitted extract job failed immediately",
+            stage="submit",
+            batch_id=submitted.external_job_id,
+        )
 
     def _resume_poll(self, job: dict[str, Any], *, api_key_secret: str | None) -> ExtractionResult:
         external_job_id = job.get("external_job_id")
@@ -378,6 +387,25 @@ class ExtractionManager:
             stage="extract",
             batch_id=str(external_job_id),
         )
+
+    def _resume_poll_with_fallback(
+        self, job: dict[str, Any], *, api_key_secret: str | None
+    ) -> ExtractionResult:
+        """Poll a previously failed job; if the remote batch is gone or still
+        failed, clear its external id and resubmit the PDF under a fresh job.
+        """
+        try:
+            return self._resume_poll(job, api_key_secret=api_key_secret)
+        except MinerUAPIError:
+            self.ledger.set_extract_job_state(
+                job["job_id"],
+                state="submitted",
+                local_stage="submitted",
+                external_job_id=None,
+                error_code=None,
+                error_message=None,
+            )
+            return self._resume_submit(job, api_key_secret=api_key_secret)
 
     def _resume_download(self, job: dict[str, Any], *, api_key_secret: str | None) -> ExtractionResult:
         external_job_id = job.get("external_job_id")

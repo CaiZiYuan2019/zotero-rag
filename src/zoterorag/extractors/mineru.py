@@ -460,12 +460,22 @@ def raise_for_mineru_api_error(
     except json.JSONDecodeError as exc:
         raise MinerUAPIError("MinerU API response is not valid JSON.", stage=stage, batch_id=batch_id) from exc
     if body.get("code") != 0:
+        code = body.get("code")
+        upstream_msg = str(body.get("msg") or body.get("message") or "")
+        # Keep the message short and free of sensitive data, but include the
+        # upstream code so operators can tell whether the batch expired, was
+        # rejected, or hit a transient server error.
+        if upstream_msg:
+            upstream_msg = (upstream_msg[:120] + "...") if len(upstream_msg) > 120 else upstream_msg
+            message = f"MinerU API returned error code {code}: {upstream_msg}"
+        else:
+            message = f"MinerU API returned error code {code}"
         raise MinerUAPIError(
-            "MinerU API returned an error code",
+            message,
             stage=stage,
             batch_id=batch_id,
             status_code=response.status_code,
-            code=body.get("code"),
+            code=code,
         )
     return body
 
