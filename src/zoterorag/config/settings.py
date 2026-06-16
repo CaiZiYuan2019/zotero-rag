@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
+import re
 from typing import Any
 import tomllib
 
@@ -145,6 +147,37 @@ def _validate_profiles(profiles_data: list[dict[str, Any]]) -> tuple[EmbeddingPr
     return tuple(profiles)
 
 
+_PLACEHOLDER_RE = re.compile(r"<([A-Za-z_][A-Za-z0-9_]*)>")
+
+
+def _expand_path_placeholders(value: str) -> str:
+    """Expand environment variables and ``<ENV_NAME>`` placeholders.
+
+    Supports standard shell forms (``$VAR``, ``${VAR}``, Windows ``%VAR%``)
+    via :func:`os.path.expandvars`, plus project-specific angle-bracket
+    placeholders such as ``<ZOTERO_DB_PATH>``.
+    """
+    expanded = os.path.expandvars(value)
+    for match in _PLACEHOLDER_RE.finditer(expanded):
+        env_name = match.group(1)
+        env_value = os.environ.get(env_name)
+        if env_value is None:
+            continue
+        expanded = expanded.replace(match.group(0), env_value)
+    return expanded
+
+
+def _check_unresolved_placeholders(value: str, field_name: str) -> None:
+    """Raise a clear error if a path still contains ``<ENV_NAME>`` placeholders."""
+    placeholders = _PLACEHOLDER_RE.findall(value)
+    if placeholders:
+        names = ", ".join(sorted(set(placeholders)))
+        raise ValueError(
+            f"{field_name} contains unresolved placeholder(s): {names}. "
+            f"Set the corresponding environment variable(s) or edit the config file."
+        )
+
+
 def _project_root(config_path: Path) -> Path:
     """Return the project root for a configuration file.
 
@@ -185,9 +218,14 @@ def load_config(path: str | Path = "config/config.toml") -> AppConfig:
     else:
         data_dir = (_project_root(config_path) / raw_data_dir).resolve()
 
+    zotero_db = _expand_path_placeholders(str(paths_data["zotero_db"]))
+    zotero_storage = _expand_path_placeholders(str(paths_data["zotero_storage"]))
+    _check_unresolved_placeholders(zotero_db, "paths.zotero_db")
+    _check_unresolved_placeholders(zotero_storage, "paths.zotero_storage")
+
     paths = PathsConfig(
-        zotero_db=Path(paths_data["zotero_db"]),
-        zotero_storage=Path(paths_data["zotero_storage"]),
+        zotero_db=Path(zotero_db),
+        zotero_storage=Path(zotero_storage),
         data_dir=data_dir,
     )
     server = ServerConfig(

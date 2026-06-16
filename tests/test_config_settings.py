@@ -95,6 +95,83 @@ modality = "text"
                 load_config(config_path)
             self.assertIn("zotero_storage", str(ctx.exception))
 
+    def test_environment_placeholders_in_zotero_paths_are_expanded(self) -> None:
+        with workspace_tmpdir("config-env-") as tmpdir:
+            config_path = tmpdir / "config.toml"
+            config_path.write_text(
+                """
+[paths]
+zotero_db = "<ZOTERO_DB_PATH>/zotero.sqlite"
+zotero_storage = "$ZOTERO_STORAGE_PATH/storage"
+data_dir = "data"
+
+[[embedding_profiles]]
+name = "stub_text"
+provider = "stub"
+model = "stub"
+dimension = 8
+modality = "text"
+enabled = true
+default_for_text = true
+""",
+                encoding="utf-8",
+            )
+            original_db = os.environ.get("ZOTERO_DB_PATH")
+            original_storage = os.environ.get("ZOTERO_STORAGE_PATH")
+            try:
+                os.environ["ZOTERO_DB_PATH"] = str(tmpdir / "zotero_lib")
+                os.environ["ZOTERO_STORAGE_PATH"] = str(tmpdir / "zotero_lib")
+                config = load_config(config_path)
+                self.assertEqual(
+                    Path(tmpdir / "zotero_lib" / "zotero.sqlite").resolve(),
+                    config.paths.zotero_db,
+                )
+                self.assertEqual(
+                    Path(tmpdir / "zotero_lib" / "storage").resolve(),
+                    config.paths.zotero_storage,
+                )
+            finally:
+                if original_db is None:
+                    os.environ.pop("ZOTERO_DB_PATH", None)
+                else:
+                    os.environ["ZOTERO_DB_PATH"] = original_db
+                if original_storage is None:
+                    os.environ.pop("ZOTERO_STORAGE_PATH", None)
+                else:
+                    os.environ["ZOTERO_STORAGE_PATH"] = original_storage
+
+    def test_unresolved_placeholders_raise_clear_error(self) -> None:
+        with workspace_tmpdir("config-unresolved-") as tmpdir:
+            config_path = tmpdir / "config.toml"
+            config_path.write_text(
+                """
+[paths]
+zotero_db = "<ZOTERO_DB_PATH>/zotero.sqlite"
+zotero_storage = "/tmp/storage"
+data_dir = "data"
+
+[[embedding_profiles]]
+name = "stub_text"
+provider = "stub"
+model = "stub"
+dimension = 8
+modality = "text"
+enabled = true
+default_for_text = true
+""",
+                encoding="utf-8",
+            )
+            original = os.environ.pop("ZOTERO_DB_PATH", None)
+            try:
+                with self.assertRaises(ValueError) as ctx:
+                    load_config(config_path)
+                message = str(ctx.exception)
+                self.assertIn("ZOTERO_DB_PATH", message)
+                self.assertIn("unresolved placeholder", message)
+            finally:
+                if original is not None:
+                    os.environ["ZOTERO_DB_PATH"] = original
+
     def test_require_api_token_rejects_non_boolean_strings(self) -> None:
         with workspace_tmpdir("config-bool-") as tmpdir:
             config_path = tmpdir / "config.toml"
