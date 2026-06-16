@@ -186,6 +186,27 @@ class NormalizeMarkdownTests(unittest.TestCase):
             self.assertIn("before", text)
             self.assertIn("after", text)
 
+    def test_final_text_chunk_preserves_document_tail(self) -> None:
+        with workspace_tmpdir("normalize-tail-") as tmpdir:
+            source_dir = tmpdir / "mineru"
+            source_dir.mkdir(parents=True)
+            markdown = source_dir / "full.md"
+            # 500 words -> ~5500 chars -> ~1375 tokens, above overlap threshold.
+            words = [f"word{i}" for i in range(500)]
+            long_para = " ".join(words)
+            markdown.write_text(
+                f"# Title\n\n{long_para} PRESERVE_THIS_TAIL_MARKER\n",
+                encoding="utf-8",
+            )
+            result = normalize_markdown_document(
+                source_markdown=markdown,
+                output_root=tmpdir / "normalized",
+                document_id="DOC_TAIL",
+            )
+            text_chunks = [c for c in result.chunks if c["chunk_type"] == "text"]
+            combined = "\n".join(c["text"] for c in text_chunks)
+            self.assertIn("PRESERVE_THIS_TAIL_MARKER", combined)
+
     def test_image_manifest_records_dimensions_and_consecutive_runs(self) -> None:
         with workspace_tmpdir("normalize-md-") as tmpdir:
             source_dir = tmpdir / "mineru"

@@ -514,12 +514,15 @@ def build_chunks(document_id: str, markdown_text: str, images: list[dict[str, An
     chunk_index = 0
     image_line_indices: list[int] = []
 
-    def flush_text() -> None:
+    def flush_text(*, is_final: bool = False) -> None:
         nonlocal chunk_index, current_text
         if not current_text:
             return
         raw_text = "\n".join(current_text)
-        body_text, overlap_text = _split_text_for_overlap(raw_text, CHUNK_OVERLAP_TOKENS)
+        if is_final:
+            body_text, overlap_text = raw_text, ""
+        else:
+            body_text, overlap_text = _split_text_for_overlap(raw_text, CHUNK_OVERLAP_TOKENS)
         text = strip_image_paths_for_text_chunk(body_text).strip()
         current_text = [overlap_text.strip()] if overlap_text.strip() else []
         if not text:
@@ -559,7 +562,7 @@ def build_chunks(document_id: str, markdown_text: str, images: list[dict[str, An
         current_text.append(line)
         if _estimate_tokens_for_lines(current_text) >= CHUNK_TOKEN_MAX:
             flush_text()
-    flush_text()
+    flush_text(is_final=True)
 
     image_chunks = []
     for image, line_index in zip(images, image_line_indices):
