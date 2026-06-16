@@ -71,11 +71,30 @@ class ExtractorKeyPool:
             if any(name == prefix or name.startswith(f"{prefix}_") for prefix in prefixes)
         ]
         candidates.sort(key=lambda name: key_sort_tuple(name, prefixes))
+        seen_aliases: set[str] = set()
         for name in candidates:
-            secret = values[name].strip()
-            if not secret:
+            raw_value = values[name].strip()
+            if not raw_value:
                 continue
-            keys.append(ApiKeyRef(alias=alias_from_env_name(name, len(keys) + 1), secret=secret))
+            secrets = [s.strip() for s in raw_value.split(",") if s.strip()]
+            if not secrets:
+                continue
+            base_alias = base_alias_from_env_name(name)
+            for idx, secret in enumerate(secrets, start=1):
+                if len(secrets) == 1:
+                    # Single key: keep legacy alias naming so existing tests/users
+                    # see the same aliases as before.
+                    alias = alias_from_env_name(name, len(keys) + 1)
+                else:
+                    alias = f"{base_alias}_{idx}"
+                # Defensive: ensure aliases are unique across all env variables.
+                original_alias = alias
+                dedup = 1
+                while alias in seen_aliases:
+                    dedup += 1
+                    alias = f"{original_alias}_{dedup}"
+                seen_aliases.add(alias)
+                keys.append(ApiKeyRef(alias=alias, secret=secret))
         return cls(keys)
 
     def has_keys(self) -> bool:
@@ -225,6 +244,12 @@ def _parse_env_value(rest: str) -> tuple[str, str]:
         if char == "#" and (i == 0 or rest[i - 1].isspace()):
             return rest[:i].rstrip(), ""
     return rest.rstrip(), ""
+
+
+def base_alias_from_env_name(name: str) -> str:
+    """Return the alias prefix for a MinerU env variable without an index."""
+    suffix = name.removeprefix("MINERU_API_KEY").removeprefix("MINERU_KEY").strip("_")
+    return f"mineru_{suffix.lower()}" if suffix else "mineru"
 
 
 def alias_from_env_name(name: str, fallback_index: int) -> str:

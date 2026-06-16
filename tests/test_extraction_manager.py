@@ -104,6 +104,26 @@ class ExtractionManagerTests(unittest.TestCase):
             self.assertNotIn("sk-test-secret", public)
             self.assertIn("mineru_second", public)
 
+    def test_env_key_pool_splits_comma_separated_keys(self) -> None:
+        with workspace_tmpdir("extract-key-pool-comma-") as tmpdir:
+            env_path = tmpdir / ".env"
+            env_path.write_text(
+                "MINERU_KEY=sk-test-secret-0001,sk-test-secret-0002\n"
+                "MINERU_KEY_SECOND=sk-test-secret-0003\n",
+                encoding="utf-8",
+            )
+            pool = ExtractorKeyPool.from_env_file(env_path)
+            aliases = [key.alias for key in pool._keys]
+            secrets = {key.secret for key in pool._keys}
+            public = json.dumps(pool.list_public_keys(), ensure_ascii=False)
+
+            self.assertEqual(["mineru_1", "mineru_2", "mineru_second"], aliases)
+            self.assertEqual(
+                {"sk-test-secret-0001", "sk-test-secret-0002", "sk-test-secret-0003"},
+                secrets,
+            )
+            self.assertNotIn("sk-test-secret", public)
+
     def test_api_key_ref_repr_and_str_redact_secret(self) -> None:
         key = ApiKeyRef(alias="mineru_a", secret="sk-test-secret-xyz")
         repr_text = repr(key)
