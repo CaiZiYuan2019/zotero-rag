@@ -173,8 +173,11 @@ def _check_unresolved_placeholders(value: str, field_name: str) -> None:
     if placeholders:
         names = ", ".join(sorted(set(placeholders)))
         raise ValueError(
-            f"{field_name} contains unresolved placeholder(s): {names}. "
-            f"Set the corresponding environment variable(s) or edit the config file."
+            f"{field_name} contains unresolved placeholder(s): {names}.\n"
+            f"Either edit config/config.toml and replace the placeholder with an absolute path, "
+            f"or set the environment variable in the same shell before running the command:\n"
+            f"  PowerShell: $env:{placeholders[0]}='C:\\Path\\To\\Zotero'\n"
+            f"  cmd.exe:    set {placeholders[0]}=C:\\Path\\To\\Zotero"
         )
 
 
