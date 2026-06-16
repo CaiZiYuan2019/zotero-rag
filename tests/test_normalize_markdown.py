@@ -169,6 +169,7 @@ class NormalizeMarkdownTests(unittest.TestCase):
             markdown = source_dir / "full.md"
             markdown.write_text(
                 "# Title\n\n"
+                "## Section A\n\n"
                 "Paragraph before the figure with enough words.\n\n"
                 "![Figure 1](images/fig.png)\n\n"
                 "Paragraph after the figure with enough words.\n",
@@ -185,6 +186,7 @@ class NormalizeMarkdownTests(unittest.TestCase):
             self.assertIn("[Image: Figure 1]", text)
             self.assertIn("before", text)
             self.assertIn("after", text)
+            self.assertEqual(["Title", "Section A"], image_chunks[0]["heading_path"])
 
     def test_final_text_chunk_preserves_document_tail(self) -> None:
         with workspace_tmpdir("normalize-tail-") as tmpdir:

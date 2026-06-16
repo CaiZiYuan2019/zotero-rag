@@ -513,6 +513,7 @@ def build_chunks(document_id: str, markdown_text: str, images: list[dict[str, An
     text_chunks: list[dict[str, Any]] = []
     chunk_index = 0
     image_line_indices: list[int] = []
+    image_heading_paths: list[list[str]] = []
 
     def flush_text(*, is_final: bool = False) -> None:
         nonlocal chunk_index, current_text
@@ -547,6 +548,7 @@ def build_chunks(document_id: str, markdown_text: str, images: list[dict[str, An
     for line_index, line in enumerate(lines):
         if _is_image_line(line):
             image_line_indices.append(line_index)
+            image_heading_paths.append(list(heading_path))
             continue
         heading_match = HEADING_RE.match(line)
         if heading_match:
@@ -565,7 +567,7 @@ def build_chunks(document_id: str, markdown_text: str, images: list[dict[str, An
     flush_text(is_final=True)
 
     image_chunks = []
-    for image, line_index in zip(images, image_line_indices):
+    for image, line_index, img_heading_path in zip(images, image_line_indices, image_heading_paths):
         before_lines = _extract_context_lines(lines, line_index, CHUNK_OVERLAP_TOKENS, "before")
         after_lines = _extract_context_lines(lines, line_index, CHUNK_OVERLAP_TOKENS, "after")
         alt = image.get("alt_text") or image["ordered_name"]
@@ -585,7 +587,7 @@ def build_chunks(document_id: str, markdown_text: str, images: list[dict[str, An
                 "chunk_type": "image",
                 "chunk_index": len(text_chunks) + image["image_index"],
                 "text": context_text,
-                "heading_path": [],
+                "heading_path": img_heading_path,
                 "metadata": {
                     "image_index": image["image_index"],
                     "image_path": image["ordered_relative_path"],
