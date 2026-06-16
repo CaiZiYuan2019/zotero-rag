@@ -51,7 +51,15 @@ class DocumentServiceTests(unittest.TestCase):
                 self.assertNotIn("document_md", document["artifact"])
                 self.assertTrue(document["chunks"])
                 self.assertEqual({"text"}, {chunk["chunk_type"] for chunk in document["chunks"]})
-                self.assertIn("[Image: Figure A]", document["chunks"][0]["text"])
+                # Image lines are now represented by dedicated image chunks, not by
+                # placeholders inside text chunks.
+                self.assertNotIn("[Image: Figure A]", document["chunks"][0]["text"])
+
+                image_document = get_document(
+                    ledger, normalized.document_id, include_chunks=True, chunk_type="image"
+                )
+                self.assertEqual({"image"}, {chunk["chunk_type"] for chunk in image_document["chunks"]})
+                self.assertIn("[Image: Figure A]", image_document["chunks"][0]["text"])
             finally:
                 ledger.close()
 

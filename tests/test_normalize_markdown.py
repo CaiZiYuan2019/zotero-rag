@@ -62,9 +62,14 @@ class NormalizeMarkdownTests(unittest.TestCase):
                 self.assertGreaterEqual(len(chunks), 3)
                 text_chunks = [chunk for chunk in chunks if chunk["chunk_type"] == "text"]
                 image_chunks = [chunk for chunk in chunks if chunk["chunk_type"] == "image"]
+                # Image lines are now skipped from text chunks; images have their own
+                # chunks with surrounding text context.
                 self.assertNotIn("images/hash-b.png", text_chunks[0]["text"])
                 self.assertNotIn("images/img001.png", text_chunks[0]["text"])
-                self.assertIn("[Image: Figure A]", text_chunks[0]["text"])
+                self.assertNotIn("[Image: Figure A]", text_chunks[0]["text"])
+                self.assertIn("[Image: Figure A]", image_chunks[0]["text"])
+                # The image chunk should include some surrounding text context.
+                self.assertIn("Intro paragraph", image_chunks[0]["text"])
                 self.assertEqual("images/img001.png", image_chunks[0]["metadata"]["image_path"])
                 self.assertEqual(
                     "embedding_images/img001.png",
@@ -124,6 +129,62 @@ class NormalizeMarkdownTests(unittest.TestCase):
             # The long paragraph is split into at least two chunks at the 2200-token
             # maximum boundary.
             self.assertGreaterEqual(len(text_chunks), 2)
+
+    def test_text_chunks_include_overlap_from_previous_chunk(self) -> None:
+        with workspace_tmpdir("normalize-overlap-") as tmpdir:
+            source_dir = tmpdir / "mineru"
+            source_dir.mkdir(parents=True)
+            markdown = source_dir / "full.md"
+            # 500 words -> ~5500 chars -> ~1375 tokens per section.
+            # Both sections are above CHUNK_TOKEN_TARGET but below CHUNK_TOKEN_MAX,
+            # so each flushes at its heading. The overlap should carry the trailing
+            # ~200 tokens from the first chunk into the second chunk.
+            words_a = [f"sectionA{i}" for i in range(500)]
+            words_b = [f"sectionB{i}" for i in range(500)]
+            section_a = " ".join(words_a)
+            section_b = " ".join(words_b)
+            markdown.write_text(
+                f"# Title\n\n{section_a}\n\n## Section B\n\n{section_b}\n",
+                encoding="utf-8",
+            )
+            result = normalize_markdown_document(
+                source_markdown=markdown,
+                output_root=tmpdir / "normalized",
+                document_id="DOC_OVERLAP",
+            )
+            text_chunks = [c for c in result.chunks if c["chunk_type"] == "text"]
+            self.assertEqual(2, len(text_chunks))
+            first = text_chunks[0]["text"]
+            second = text_chunks[1]["text"]
+            # The second chunk should start with some overlap from the first chunk.
+            self.assertIn("sectionA", second)
+            self.assertIn("sectionB", second)
+
+    def test_image_chunk_includes_surrounding_text_context(self) -> None:
+        with workspace_tmpdir("normalize-image-context-") as tmpdir:
+            source_dir = tmpdir / "mineru"
+            images_dir = source_dir / "images"
+            images_dir.mkdir(parents=True)
+            (images_dir / "fig.png").write_bytes(b"fake-image")
+            markdown = source_dir / "full.md"
+            markdown.write_text(
+                "# Title\n\n"
+                "Paragraph before the figure with enough words.\n\n"
+                "![Figure 1](images/fig.png)\n\n"
+                "Paragraph after the figure with enough words.\n",
+                encoding="utf-8",
+            )
+            result = normalize_markdown_document(
+                source_markdown=markdown,
+                output_root=tmpdir / "normalized",
+                document_id="DOC_IMG_CTX",
+            )
+            image_chunks = [c for c in result.chunks if c["chunk_type"] == "image"]
+            self.assertEqual(1, len(image_chunks))
+            text = image_chunks[0]["text"]
+            self.assertIn("[Image: Figure 1]", text)
+            self.assertIn("before", text)
+            self.assertIn("after", text)
 
     def test_image_manifest_records_dimensions_and_consecutive_runs(self) -> None:
         with workspace_tmpdir("normalize-md-") as tmpdir:

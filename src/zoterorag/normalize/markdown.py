@@ -451,6 +451,59 @@ def assign_image_runs(images: list[dict[str, Any]], markdown_text: str) -> list[
 # the embedding model context window.
 CHUNK_TOKEN_TARGET = 1000
 CHUNK_TOKEN_MAX = 2200
+# Overlap carried between consecutive text chunks so that concepts near chunk
+# boundaries appear in both chunks.
+CHUNK_OVERLAP_TOKENS = 200
+
+
+def _is_image_line(line: str) -> bool:
+    return bool(MARKDOWN_IMAGE_RE.search(line) or HTML_IMAGE_RE.search(line))
+
+
+def _estimate_tokens_for_lines(lines: list[str]) -> int:
+    return estimate_tokens("\n".join(lines))
+
+
+def _split_text_for_overlap(text: str, overlap_tokens: int) -> tuple[str, str]:
+    """Split text into (body, overlap) where overlap is roughly overlap_tokens.
+
+    If the text is too short to keep a meaningful body plus overlap, the whole
+    text is returned as body and overlap is empty.
+    """
+    overlap_chars = overlap_tokens * 4
+    min_body_chars = overlap_chars
+    if len(text) < min_body_chars + overlap_chars:
+        return text, ""
+    return text[:-overlap_chars], text[-overlap_chars:]
+
+
+def _extract_context_lines(
+    lines: list[str],
+    center_index: int,
+    overlap_tokens: int,
+    direction: str,
+) -> list[str]:
+    """Collect approximately overlap_tokens of nearby non-image text lines."""
+    context: list[str] = []
+    total_chars = 0
+    step = 1 if direction == "after" else -1
+    start = center_index + step
+    end = len(lines) if direction == "after" else -1
+    for i in range(start, end, step):
+        line = lines[i]
+        if _is_image_line(line):
+            continue
+        stripped = line.strip()
+        if stripped == "":
+            continue
+        if direction == "after":
+            context.append(line)
+        else:
+            context.insert(0, line)
+        total_chars += len(line) + 1
+        if total_chars // 4 >= overlap_tokens:
+            break
+    return context
 
 
 def build_chunks(document_id: str, markdown_text: str, images: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -459,12 +512,21 @@ def build_chunks(document_id: str, markdown_text: str, images: list[dict[str, An
     current_text: list[str] = []
     text_chunks: list[dict[str, Any]] = []
     chunk_index = 0
+    image_line_indices: list[int] = []
 
     def flush_text() -> None:
         nonlocal chunk_index, current_text
-        text = strip_image_paths_for_text_chunk("\n".join(line for line in current_text)).strip()
-        current_text = []
+        if not current_text:
+            return
+        raw_text = "\n".join(current_text)
+        body_text, overlap_text = _split_text_for_overlap(raw_text, CHUNK_OVERLAP_TOKENS)
+        text = strip_image_paths_for_text_chunk(body_text).strip()
+        current_text = [overlap_text.strip()] if overlap_text.strip() else []
         if not text:
+            # If the emitted body is empty but overlap remains, restore it so we
+            # do not lose content due to image-only lines.
+            if overlap_text.strip():
+                current_text = [overlap_text.strip()]
             return
         chunk_index += 1
         text_chunks.append(
@@ -479,12 +541,15 @@ def build_chunks(document_id: str, markdown_text: str, images: list[dict[str, An
             }
         )
 
-    for line in lines:
+    for line_index, line in enumerate(lines):
+        if _is_image_line(line):
+            image_line_indices.append(line_index)
+            continue
         heading_match = HEADING_RE.match(line)
         if heading_match:
             # Avoid flushing very short sections just because a heading appears;
             # merge them with the following content for better semantic coherence.
-            if current_text and estimate_tokens("\n".join(current_text)) >= CHUNK_TOKEN_TARGET:
+            if current_text and _estimate_tokens_for_lines(current_text) >= CHUNK_TOKEN_TARGET:
                 flush_text()
             level = len(heading_match.group(1))
             title = heading_match.group(2).strip()
@@ -492,19 +557,31 @@ def build_chunks(document_id: str, markdown_text: str, images: list[dict[str, An
             current_text.append(line)
             continue
         current_text.append(line)
-        if estimate_tokens("\n".join(current_text)) >= CHUNK_TOKEN_MAX:
+        if _estimate_tokens_for_lines(current_text) >= CHUNK_TOKEN_MAX:
             flush_text()
     flush_text()
 
     image_chunks = []
-    for image in images:
+    for image, line_index in zip(images, image_line_indices):
+        before_lines = _extract_context_lines(lines, line_index, CHUNK_OVERLAP_TOKENS, "before")
+        after_lines = _extract_context_lines(lines, line_index, CHUNK_OVERLAP_TOKENS, "after")
+        alt = image.get("alt_text") or image["ordered_name"]
+        before_text = strip_image_paths_for_text_chunk("\n".join(before_lines)).strip()
+        after_text = strip_image_paths_for_text_chunk("\n".join(after_lines)).strip()
+        parts: list[str] = []
+        if before_text:
+            parts.append(before_text)
+        parts.append(f"[Image: {alt}]")
+        if after_text:
+            parts.append(after_text)
+        context_text = "\n".join(parts)
         image_chunks.append(
             {
                 "chunk_id": f"{document_id}:image:{image['image_index']:05d}",
                 "document_id": document_id,
                 "chunk_type": "image",
                 "chunk_index": len(text_chunks) + image["image_index"],
-                "text": image.get("alt_text") or image["ordered_name"],
+                "text": context_text,
                 "heading_path": [],
                 "metadata": {
                     "image_index": image["image_index"],
