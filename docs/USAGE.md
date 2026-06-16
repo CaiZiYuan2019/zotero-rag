@@ -118,8 +118,15 @@ rate_limit = {}
 
 ```bash
 # MinerU PDF 提取（支持多 key 轮询）
+# 写法 A：单 key
 MINERU_KEY=your_mineru_api_key
-# MINERU_KEY_2=second_key    # 可选：更多 key
+
+# 写法 B：同一变量内用逗号分隔多个 key（key 中不能包含逗号或空格）
+MINERU_KEY=your_mineru_api_key,your_second_key
+
+# 写法 C：独立变量（可与其他写法混用）
+# MINERU_KEY_2=second_key
+# MINERU_KEY_BACKUP=third_key
 
 # 百炼 Qwen Embedding
 BAILIAN_KEY=your_bailian_api_key
@@ -133,6 +140,8 @@ BAILIAN_KEY=your_bailian_api_key
 
 # 注意：BAILIAN_URL 不会被 embedding 模块使用（它通常指向 chat API）
 ```
+
+多 key 会按轮询使用，并在某个 key 触发限流/失败时自动冷却。可用 `zoterorag providers status --env .env` 查看已读取的 key 数量与状态。
 
 ### 2.3 API 鉴权 Token
 
