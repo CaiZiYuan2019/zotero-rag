@@ -8,7 +8,7 @@ from tests._support import workspace_tmpdir
 from zoterorag.config import EmbeddingProfile
 from zoterorag.db import StateLedger
 from zoterorag.embeddings.profile import embedding_profile_hash
-from zoterorag.extractors.base import ExtractArtifact, StubExtractorProvider
+from zoterorag.extractors.base import ExtractArtifact, ExtractJobState, StubExtractorProvider
 from zoterorag.extractors.manager import ExtractionManager, ExtractionRequest
 from zoterorag.normalize import normalize_markdown_document
 from zoterorag.pipeline import (
@@ -252,6 +252,87 @@ class IngestPipelineTests(unittest.TestCase):
             finally:
                 ledger.close()
 
+    def test_running_extract_job_is_resumed_and_completes(self) -> None:
+        """An interrupted run that left an extract job in 'running' state can resume."""
+        with workspace_tmpdir("ingest-running-resume-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                seed_profiles(ledger)
+                attachment = build_attachment_with_file(tmpdir, "ATT_RUN", title="Running Paper")
+                ledger.upsert_attachments([attachment])
+
+                provider = TwoPhaseStubExtractorProvider()
+
+                # Seed a running extract job as if a previous run was interrupted.
+                # Compute the same cache_key that ensure_extraction would use.
+                from zoterorag.extractors.cache import (
+                    extractor_cache_key,
+                    sha256_file,
+                    stable_options_hash,
+                )
+
+                pdf_sha256 = sha256_file(attachment["file_path"])
+                # Match the default timeout that ensure_extraction adds for a
+                # single-page document when no options are provided.
+                options = {"timeout_seconds": 36}
+                options_hash = stable_options_hash(options)
+                cache_key = extractor_cache_key(
+                    pdf_sha256=pdf_sha256,
+                    selected_pages="",
+                    extractor_name=provider.name,
+                    extractor_version=provider.version,
+                    options_hash=options_hash,
+                    endpoint_url="",
+                )
+                ledger.upsert_extract_job(
+                    {
+                        "job_id": "running-job-id",
+                        "attachment_key": "ATT_RUN",
+                        "pdf_sha256": pdf_sha256,
+                        "selected_pages": "",
+                        "cache_key": cache_key,
+                        "provider": provider.name,
+                        "provider_version": provider.version,
+                        "options_hash": options_hash,
+                        "api_key_alias": "stub",
+                        "external_job_id": "ext-running",
+                        "state": "running",
+                        "local_stage": "poll",
+                        "submitted_at": "2026-01-01T00:00:00+00:00",
+                        "last_poll_at": "2026-01-01T00:00:00+00:00",
+                        "payload": {
+                            "input_file": attachment["file_path"],
+                            "options": options,
+                        },
+                    }
+                )
+
+                extract_manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=provider,
+                )
+                result = start_ingest_job(
+                    ledger,
+                    zotero_key="ATT_RUN",
+                    include_multimodal=False,
+                    execute=True,
+                    extract_manager=extract_manager,
+                    extract_cache_dir=tmpdir / "extract_cache",
+                    normalized_dir=tmpdir / "normalized",
+                    vector_store_dir=tmpdir / "vectors",
+                )
+
+                self.assertEqual("completed", result["job"]["status"])
+                self.assertEqual(1, len(result["executed"]))
+                self.assertEqual(0, len(result["failed"]))
+                self.assertEqual("downloaded", ledger.get_extract_job(job_id="running-job-id")["state"])
+                self.assertEqual("done", ledger.get_checkpoint("ATT_RUN", "extract")["status"])
+                self.assertEqual("normalized", ledger.get_checkpoint("ATT_RUN", "normalize")["status"])
+                self.assertIsNotNone(ledger.get_normalized_artifact("ATT_RUN"))
+            finally:
+                ledger.close()
+
 
 def seed_profiles(ledger: StateLedger) -> None:
     ledger.upsert_embedding_profiles(
@@ -401,6 +482,38 @@ class MarkdownStubExtractorProvider(StubExtractorProvider):
             artifact_dir=output_dir,
             manifest_path=manifest,
         )
+
+
+class TwoPhaseStubExtractorProvider(MarkdownStubExtractorProvider):
+    """Stub extractor that returns 'running' on the first poll, then 'completed'."""
+
+    name = "two-phase-stub"
+    version = "0"
+
+    def __init__(self) -> None:
+        self._poll_count = 0
+
+    def submit(
+        self,
+        input_file: Path,
+        options_hash: str,
+        *,
+        options: dict[str, Any] | None = None,
+        api_key: str | None = None,
+    ) -> ExtractJobState:
+        return ExtractJobState(external_job_id=self.fingerprint(input_file, options_hash), state="running")
+
+    def poll(
+        self,
+        external_job_id: str,
+        *,
+        api_key: str | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> ExtractJobState:
+        self._poll_count += 1
+        if self._poll_count == 1:
+            return ExtractJobState(external_job_id=external_job_id, state="running")
+        return ExtractJobState(external_job_id=external_job_id, state="completed")
 
 
 if __name__ == "__main__":

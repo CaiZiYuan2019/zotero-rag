@@ -336,18 +336,48 @@ class ExtractionManager:
         if not external_job_id:
             raise RuntimeError("cannot poll extract job without external_job_id")
         options = (job.get("payload") or {}).get("options") or {}
+
+        # Honor the per-job timeout from the original submission; fall back to
+        # the manager-level default when it is missing.
+        poll_timeout_seconds = float(options.get("timeout_seconds", self.poll_timeout_seconds))
+        poll_deadline = time.monotonic() + poll_timeout_seconds
+
         polled = self.provider.poll(str(external_job_id), api_key=api_key_secret, options=options)
-        self.ledger.set_extract_job_state(
-            job["job_id"],
-            state=polled.state,
-            local_stage="download" if polled.state == "completed" else "poll",
-            external_job_id=polled.external_job_id,
-            last_poll_at=utc_now(),
-        )
+        while polled.state not in ("completed", "failed"):
+            if time.monotonic() >= poll_deadline:
+                raise MinerUAPIError(
+                    f"MinerU batch {external_job_id} did not complete within "
+                    f"{poll_timeout_seconds:.0f}s",
+                    stage="poll-timeout",
+                    batch_id=str(external_job_id),
+                )
+            time.sleep(self.poll_interval_seconds)
+            polled = self.provider.poll(str(external_job_id), api_key=api_key_secret, options=options)
+            self.ledger.set_extract_job_state(
+                job["job_id"],
+                state=polled.state,
+                local_stage="download" if polled.state == "completed" else "poll",
+                external_job_id=polled.external_job_id,
+                last_poll_at=utc_now(),
+            )
+
         refreshed = self.ledger.get_extract_job(job_id=job["job_id"]) or job
         if polled.state == "completed":
             return self._resume_download(refreshed, api_key_secret=api_key_secret)
-        return ExtractionResult(job=refreshed, cache_hit=False)
+
+        # polled.state == "failed"
+        self.ledger.set_extract_job_state(
+            job["job_id"],
+            state="failed_retryable",
+            local_stage="error",
+            error_code="MinerUAPIError",
+            error_message=polled.message or "MinerU batch failed",
+        )
+        raise MinerUAPIError(
+            polled.message or "MinerU batch failed",
+            stage="extract",
+            batch_id=str(external_job_id),
+        )
 
     def _resume_download(self, job: dict[str, Any], *, api_key_secret: str | None) -> ExtractionResult:
         external_job_id = job.get("external_job_id")

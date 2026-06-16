@@ -581,7 +581,40 @@ def _execute_extract_stage(
         _progress(f"  extract: resuming download for completed job {result.job['job_id']}")
         result = extract_manager.resume_extraction(result.job["job_id"])
 
+    # Cached jobs that are still in progress need to be driven to completion
+    # (or failure) before downstream normalize can run. This handles interrupted
+    # ingest runs that left extract jobs in ``running``/``submitted`` state.
+    if result.job["state"] in {"submitted", "running"}:
+        _progress(f"  extract: resuming poll for job {result.job['job_id']}")
+        result = extract_manager.resume_extraction(result.job["job_id"])
+
     _progress(f"  extract: {result.job['state']} (cache_hit={result.cache_hit})")
+
+    # Safety fallback: never mark extract as done unless the job truly reached a
+    # state that has a local artifact available for normalize.
+    if result.job["state"] not in DONE_EXTRACT_STATES:
+        ledger.checkpoint(
+            attachment_key,
+            "extract",
+            "blocked",
+            {
+                "job_id": job_id,
+                "extract_job_id": result.job["job_id"],
+                "state": result.job["state"],
+                "cache_hit": result.cache_hit,
+                "reason": f"extract job still {result.job['state']}",
+            },
+        )
+        ledger.add_event(
+            JobEvent(
+                job_id=job_id,
+                stage="extract",
+                status=result.job["state"],
+                message=f"extract job {result.job['job_id']} still {result.job['state']}; will retry",
+                payload={"job_id": result.job["job_id"], "state": result.job["state"], "cache_hit": result.cache_hit},
+            )
+        )
+        return
 
     ledger.checkpoint(
         attachment_key,
