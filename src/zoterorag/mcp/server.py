@@ -86,12 +86,13 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "query_text": {"type": "string", "description": "Text query."},
             "query_image": {
                 "type": "object",
-                "description": "Optional image descriptor with 'path' or 'base64'.",
+                "description": "Optional query image descriptor with type='file_path' or 'base64'.",
                 "properties": {
-                    "path": {"type": "string"},
-                    "base64": {"type": "string"},
+                    "type": {"type": "string", "enum": ["file_path", "base64"]},
+                    "value": {"type": "string"},
                     "mime_type": {"type": "string"},
                 },
+                "required": ["type", "value"],
                 "additionalProperties": False,
             },
             "profile_name": {"type": "string", "description": "Optional vector profile name."},
@@ -210,9 +211,15 @@ async def serve(config: AppConfig, ledger: StateLedger) -> None:
         )
 
 
-def main() -> None:
-    """Entry point for ``python -m zoterorag.mcp``."""
-    config_path = os.environ.get("ZOTERORAG_CONFIG")
+def main(config_path: str | None = None) -> None:
+    """Entry point for ``python -m zoterorag.mcp``.
+
+    Args:
+        config_path: Optional TOML config path. Falls back to ``ZOTERORAG_CONFIG``
+            env var, then ``config/config.toml``.
+    """
+    if config_path is None:
+        config_path = os.environ.get("ZOTERORAG_CONFIG")
     config, ledger = _load_runtime(config_path)
     try:
         asyncio.run(serve(config, ledger))

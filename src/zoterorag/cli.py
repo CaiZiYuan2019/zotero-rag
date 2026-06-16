@@ -360,7 +360,7 @@ def main(argv: list[str] | None = None) -> int:
             ledger.close()
             from .mcp.server import main as mcp_main
 
-            mcp_main()
+            mcp_main(config_path=args.config)
             return 0
 
         if args.command == "doctor":
