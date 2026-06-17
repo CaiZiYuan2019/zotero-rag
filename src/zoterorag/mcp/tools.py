@@ -8,8 +8,6 @@ from ..db import StateLedger
 from ..documents import get_document
 from ..embeddings import search_vector_index
 from ..models import list_embedding_model_catalog
-from ..pipeline import build_progress_report
-from ..runtime import config_as_public_dict
 from ..search import fulltext_search, metadata_search, normalize_query_image
 from ..search.results import RerankNotSupportedError, ensure_rerank_disabled
 
@@ -25,12 +23,37 @@ class McpToolContext:
 
 
 def zotero_rag_status(context: McpToolContext) -> dict[str, Any]:
-    """Return runtime status safe for an external MCP caller."""
+    """Return a concise build status summary safe for an external MCP caller."""
+
+    summary = context.ledger.status_summary()
+    attachments = summary.get("attachments", {})
+    extract_jobs = summary.get("extract_jobs", {})
+    batches = summary.get("embedding_batches", {})
+    chunks = summary.get("chunks", {})
+
+    # Profile-level searchable document counts.
+    indexes = {idx["profile_name"]: idx for idx in context.ledger.list_vector_indexes()}
+    text_idx = indexes.get("qwen3vl_cloud_2560_text", {})
+    mm_idx = indexes.get("qwen3vl_cloud_2560_multimodal", {})
 
     return {
-        "runtime": config_as_public_dict(context.config),
-        "state": context.ledger.status_summary(),
-        "progress": build_progress_report(context.ledger),
+        "library": {
+            "total_attachments": sum(attachments.values()),
+            "buildable": attachments.get("included_auto", 0),
+            "needs_review": attachments.get("needs_review", 0),
+        },
+        "build": {
+            "extracted": extract_jobs.get("downloaded", 0),
+            "normalized": summary.get("normalized_artifacts", 0),
+            "text_indexed": text_idx.get("document_count", 0),
+            "multimodal_indexed": mm_idx.get("document_count", 0),
+            "text_chunks": chunks.get("text", 0),
+            "image_chunks": chunks.get("image", 0),
+            "failed_retryable": extract_jobs.get("failed_retryable", 0),
+            "running_extract": extract_jobs.get("running", 0) + extract_jobs.get("submitted", 0),
+            "completed_embedding_batches": batches.get("completed", 0),
+        },
+        "profiles": [p["name"] for p in context.ledger.list_embedding_profiles()],
     }
 
 

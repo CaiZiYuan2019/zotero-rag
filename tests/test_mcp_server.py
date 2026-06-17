@@ -128,9 +128,10 @@ def test_mcp_call_status_tool() -> None:
     assert len(content) == 1
     assert content[0]["type"] == "text"
     payload = json.loads(content[0]["text"])
-    assert "runtime" in payload
-    assert "state" in payload
-    assert "progress" in payload
+    assert "library" in payload
+    assert "build" in payload
+    assert "profiles" in payload
+    assert isinstance(payload["build"]["text_indexed"], int)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="stdio subprocess timing sensitive on Windows CI")
