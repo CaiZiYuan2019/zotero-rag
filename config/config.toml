@@ -1,6 +1,6 @@
 [paths]
-zotero_db = "<ZOTERO_DB_PATH>/zotero.sqlite"
-zotero_storage = "<ZOTERO_STORAGE_PATH>/storage"
+zotero_db = "E:/ZoteroLib/lib/zotero.sqlite"
+zotero_storage = "E:/ZoteroLib/lib/storage"
 data_dir = "data"
 
 [server]
