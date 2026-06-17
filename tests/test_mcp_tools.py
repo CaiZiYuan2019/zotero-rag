@@ -91,7 +91,9 @@ class McpToolsTests(unittest.TestCase):
                 status = zotero_rag_status(context)
                 models = zotero_rag_list_models(context)
 
-                self.assertIn("state", status)
+                self.assertIn("library", status)
+                self.assertIn("build", status)
+                self.assertIn("profiles", status)
                 self.assertEqual(2, len(models["models"]))
                 self.assertEqual(2, len(models["vector_indexes"]))
             finally:
