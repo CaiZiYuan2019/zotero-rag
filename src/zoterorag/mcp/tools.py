@@ -92,12 +92,17 @@ def zotero_rag_search_text(
     query: str,
     profile_name: str | None = None,
     top_k: int = 10,
-    include_metadata: bool = True,
-    include_fulltext: bool = True,
+    include_metadata: bool = False,
+    include_fulltext: bool = False,
     include_vector: bool = True,
     rerank: bool = False,
 ) -> dict[str, Any]:
     """Text-only MCP search.
+
+    By default only the text vector index is searched, matching the CLI
+    ``search-vector`` behavior. Set ``include_metadata`` or ``include_fulltext``
+    only when those sources are explicitly needed; for metadata-only queries
+    prefer ``zotero_rag_metadata_search``.
 
     The result is always safe for plain-text LLMs: no file paths, no base64, and
     no image payloads. Vector search failures are returned as warnings because a

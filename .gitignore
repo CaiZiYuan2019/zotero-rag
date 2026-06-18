@@ -54,3 +54,7 @@ src/*.egg-info/
 
 # MinerU example
 mineru_example/
+
+# code check reports
+docs/CODEBASE_AUDIT_REPORT.md
+

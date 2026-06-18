@@ -423,6 +423,83 @@ class StateLedger:
                 ON chunks(document_id, chunk_type, chunk_index)
                 """
             )
+            self._migrate_fts5()
+
+    def _migrate_fts5(self) -> None:
+        """Create and backfill standalone FTS5 indexes.
+
+        FTS5 virtual tables store their own copy of the searchable text columns.
+        They are maintained manually alongside the source tables so that writes
+        remain explicit and schema migrations stay simple.
+
+        If an older external-content-style FTS5 table exists (created with
+        ``content='...'``), it is dropped and recreated as a standalone index.
+
+        If FTS5 is unavailable in this SQLite build, the method logs a warning
+        and returns so the application can still run using the LIKE fallback.
+        """
+
+        try:
+            self.conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS _fts5_probe USING fts5(x)")
+            self.conn.execute("DROP TABLE _fts5_probe")
+        except sqlite3.Error as exc:
+            logger.warning("FTS5 is not available in this SQLite build: %s", exc)
+            return
+
+        existing = {
+            row["name"]: row["sql"] or ""
+            for row in self.conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type='table' AND name IN ('attachments_fts', 'chunks_fts')"
+            ).fetchall()
+        }
+        if "attachments_fts" in existing and "content=" in existing["attachments_fts"]:
+            self.conn.execute("DROP TABLE attachments_fts")
+            existing.pop("attachments_fts", None)
+        if "chunks_fts" in existing and "content=" in existing["chunks_fts"]:
+            self.conn.execute("DROP TABLE chunks_fts")
+            existing.pop("chunks_fts", None)
+
+        self.conn.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS attachments_fts USING fts5(
+                attachment_key, parent_key, relative_path, title, abstract,
+                date_value, url, classification, source_quality
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+                chunk_id, document_id, text
+            )
+            """
+        )
+        attachments_fts_count = self.conn.execute(
+            "SELECT count(*) FROM attachments_fts"
+        ).fetchone()[0]
+        if attachments_fts_count == 0:
+            self.conn.execute(
+                """
+                INSERT INTO attachments_fts(
+                    rowid, attachment_key, parent_key, relative_path, title,
+                    abstract, date_value, url, classification, source_quality
+                )
+                SELECT
+                    rowid, attachment_key, parent_key, relative_path, title,
+                    abstract, date_value, url, classification, source_quality
+                FROM attachments
+                """
+            )
+        chunks_fts_count = self.conn.execute(
+            "SELECT count(*) FROM chunks_fts"
+        ).fetchone()[0]
+        if chunks_fts_count == 0:
+            self.conn.execute(
+                """
+                INSERT INTO chunks_fts(rowid, chunk_id, document_id, text)
+                SELECT rowid, chunk_id, document_id, text FROM chunks
+                """
+            )
 
     def _ensure_columns(self, table_name: str, columns: dict[str, str]) -> None:
         existing = {
@@ -968,6 +1045,27 @@ class StateLedger:
                         now,
                     ),
                 )
+                self.conn.execute(
+                    """
+                    DELETE FROM attachments_fts
+                    WHERE rowid = (SELECT rowid FROM attachments WHERE attachment_key = ?)
+                    """,
+                    (item["attachment_key"],),
+                )
+                self.conn.execute(
+                    """
+                    INSERT INTO attachments_fts(
+                        rowid, attachment_key, parent_key, relative_path, title,
+                        abstract, date_value, url, classification, source_quality
+                    )
+                    SELECT
+                        rowid, attachment_key, parent_key, relative_path, title,
+                        abstract, date_value, url, classification, source_quality
+                    FROM attachments
+                    WHERE attachment_key = ?
+                    """,
+                    (item["attachment_key"],),
+                )
                 count += 1
         return count
 
@@ -1019,17 +1117,66 @@ class StateLedger:
     ) -> list[dict[str, Any]]:
         """Direct metadata search over scanned Zotero shadow results.
 
-        This deliberately searches only the local state ledger populated from
-        the shadow DB. It never reads Zotero's live database, and it never calls
-        embedding services. The implementation is parameterized LIKE search for
-        the bootstrap phase; the call shape is stable so an FTS5-backed version
-        can replace it later without changing API/CLI consumers.
+        Uses a standalone FTS5 index when available and falls back to the
+        original parameterized LIKE search if FTS5 is unavailable or returns no
+        results. This keeps the API stable while avoiding full-table scans.
         """
 
         terms = [term.casefold() for term in query.split() if term.strip()]
         if not terms:
             return []
 
+        def _load_rows_from_attachments(keys: list[str]) -> list[sqlite3.Row]:
+            if not keys:
+                return []
+            where = f"attachment_key IN ({','.join('?' for _ in keys)})"
+            params: list[Any] = list(keys)
+            if classification is not None:
+                where += " AND classification = ?"
+                params.append(classification)
+            sql = f"""
+                SELECT attachment_key, parent_key, content_type, relative_path,
+                       title, abstract, date_value, url, classification,
+                       source_quality, reasons_json, file_path, file_exists,
+                       file_size, file_mtime, metadata_json, content_fingerprint,
+                       scan_status, first_seen_at, last_seen_at, updated_at
+                FROM attachments
+                WHERE {where}
+                LIMIT ?
+            """
+            params.append(limit * 10)
+            return self.conn.execute(sql, params).fetchall()
+
+        try:
+            fts_query = _build_fts5_query(terms)
+            rows = self.conn.execute(
+                """
+                SELECT attachment_key
+                FROM attachments_fts
+                WHERE attachments_fts MATCH ?
+                LIMIT ?
+                """,
+                (fts_query, limit * 10),
+            ).fetchall()
+            attachment_keys = [row["attachment_key"] for row in rows]
+            if attachment_keys:
+                like_rows = _load_rows_from_attachments(attachment_keys)
+                results = []
+                for row in like_rows:
+                    item = dict(row)
+                    reasons_json = item.pop("reasons_json")
+                    metadata_json = item.pop("metadata_json")
+                    item["file_exists"] = bool(row["file_exists"])
+                    item["reasons"] = json.loads(reasons_json)
+                    item["metadata"] = json.loads(metadata_json)
+                    item["score"] = metadata_match_score(item, terms)
+                    results.append(item)
+                results.sort(key=lambda item: (item["score"], item.get("title") or ""), reverse=True)
+                return results[:limit]
+        except sqlite3.Error:
+            logger.exception("FTS5 metadata search failed; falling back to LIKE")
+
+        # Original LIKE fallback.
         where_parts = []
         params: list[Any] = []
         searchable_columns = (
@@ -1396,9 +1543,16 @@ class StateLedger:
         now = utc_now()
         count = 0
         with self.conn:
+            self.conn.execute(
+                """
+                DELETE FROM chunks_fts
+                WHERE rowid IN (SELECT rowid FROM chunks WHERE document_id = ?)
+                """,
+                (document_id,),
+            )
             self.conn.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
             for chunk in chunks:
-                self.conn.execute(
+                cursor = self.conn.execute(
                     """
                     INSERT INTO chunks(
                         chunk_id, document_id, chunk_type, chunk_index, text,
@@ -1419,6 +1573,13 @@ class StateLedger:
                         json.dumps(chunk.get("metadata", {}), ensure_ascii=False, sort_keys=True, default=str),
                         now,
                     ),
+                )
+                self.conn.execute(
+                    """
+                    INSERT INTO chunks_fts(rowid, chunk_id, document_id, text)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (cursor.lastrowid, chunk["chunk_id"], document_id, chunk.get("text", "")),
                 )
                 count += 1
         return count
@@ -1482,9 +1643,16 @@ class StateLedger:
                     payload_json,
                 ),
             )
+            self.conn.execute(
+                """
+                DELETE FROM chunks_fts
+                WHERE rowid IN (SELECT rowid FROM chunks WHERE document_id = ?)
+                """,
+                (artifact["document_id"],),
+            )
             self.conn.execute("DELETE FROM chunks WHERE document_id = ?", (artifact["document_id"],))
             for chunk in chunks:
-                self.conn.execute(
+                cursor = self.conn.execute(
                     """
                     INSERT INTO chunks(
                         chunk_id, document_id, chunk_type, chunk_index, text,
@@ -1505,6 +1673,13 @@ class StateLedger:
                         json.dumps(chunk.get("metadata", {}), ensure_ascii=False, sort_keys=True, default=str),
                         now,
                     ),
+                )
+                self.conn.execute(
+                    """
+                    INSERT INTO chunks_fts(rowid, chunk_id, document_id, text)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (cursor.lastrowid, chunk["chunk_id"], artifact["document_id"], chunk.get("text", "")),
                 )
         return self.get_normalized_artifact(artifact["document_id"])  # type: ignore[return-value]
 
@@ -1543,6 +1718,49 @@ class StateLedger:
         terms = [term.casefold() for term in query.split() if term.strip()]
         if not terms:
             return []
+
+        def _load_chunks_by_ids(chunk_ids: list[str]) -> list[sqlite3.Row]:
+            if not chunk_ids:
+                return []
+            where = f"chunk_id IN ({','.join('?' for _ in chunk_ids)})"
+            params: list[Any] = list(chunk_ids)
+            if chunk_type is not None:
+                where += " AND chunk_type = ?"
+                params.append(chunk_type)
+            sql = f"""
+                SELECT chunk_id, document_id, chunk_type, chunk_index, text,
+                       heading_path_json, prev_chunk_id, next_chunk_id,
+                       metadata_json, updated_at
+                FROM chunks
+                WHERE {where}
+                LIMIT ?
+            """
+            params.append(limit * 10)
+            return self.conn.execute(sql, params).fetchall()
+
+        try:
+            fts_query = _build_fts5_query(terms)
+            rows = self.conn.execute(
+                """
+                SELECT chunk_id
+                FROM chunks_fts
+                WHERE chunks_fts MATCH ?
+                LIMIT ?
+                """,
+                (fts_query, limit * 10),
+            ).fetchall()
+            chunk_ids = [row["chunk_id"] for row in rows]
+            if chunk_ids:
+                like_rows = _load_chunks_by_ids(chunk_ids)
+                results = [decode_chunk_row(row) for row in like_rows]
+                for item in results:
+                    item["score"] = chunk_match_score(item, terms)
+                results.sort(key=lambda item: (item["score"], item["document_id"], -item["chunk_index"]), reverse=True)
+                return results[:limit]
+        except sqlite3.Error:
+            logger.exception("FTS5 fulltext search failed; falling back to LIKE")
+
+        # Original LIKE fallback.
         where_parts = []
         params: list[Any] = []
         for term in terms:
@@ -1584,6 +1802,12 @@ class StateLedger:
                     """,
                     (json.dumps(["absent_from_full_shadow_scan"]), now, now),
                 )
+                self.conn.execute(
+                    """
+                    DELETE FROM attachments_fts
+                    WHERE rowid IN (SELECT rowid FROM attachments WHERE classification = 'deleted')
+                    """
+                )
             return int(cursor.rowcount)
 
         placeholders = ",".join("?" for _ in keys)
@@ -1601,6 +1825,17 @@ class StateLedger:
                   AND classification != 'deleted'
                 """,
                 [json.dumps(["absent_from_full_shadow_scan"]), now, now, *keys],
+            )
+            self.conn.execute(
+                f"""
+                DELETE FROM attachments_fts
+                WHERE rowid IN (
+                    SELECT rowid FROM attachments
+                    WHERE attachment_key NOT IN ({placeholders})
+                      AND classification = 'deleted'
+                )
+                """,
+                list(keys),
             )
         return int(cursor.rowcount)
 
@@ -1632,6 +1867,20 @@ class StateLedger:
             "normalized_artifacts": normalized["n"],
             "chunks": {row["chunk_type"]: row["n"] for row in chunks},
         }
+
+
+def _build_fts5_query(terms: list[str]) -> str:
+    """Build an FTS5 MATCH query that requires every term to appear.
+
+    Terms are quoted and joined with AND. Empty or whitespace-only terms are
+    dropped. This matches the existing LIKE behavior where each word in the
+    query must be present somewhere in the searchable text.
+    """
+
+    escaped = [term.replace('"', '""') for term in terms if term.strip()]
+    if not escaped:
+        return ""
+    return " AND ".join(f'"{term}"' for term in escaped)
 
 
 def attachment_fingerprint(item: dict[str, Any]) -> str:

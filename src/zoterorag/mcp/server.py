@@ -73,9 +73,21 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "query": {"type": "string", "description": "Search query."},
             "profile_name": {"type": "string", "description": "Optional vector profile name."},
             "top_k": {"type": "integer", "default": 10},
-            "include_metadata": {"type": "boolean", "default": True},
-            "include_fulltext": {"type": "boolean", "default": True},
-            "include_vector": {"type": "boolean", "default": True},
+            "include_metadata": {
+                "type": "boolean",
+                "default": False,
+                "description": "Whether to search Zotero attachment/item metadata. Prefer zotero_rag_metadata_search when only metadata is needed.",
+            },
+            "include_fulltext": {
+                "type": "boolean",
+                "default": False,
+                "description": "Whether to search normalized Markdown chunk text without embeddings.",
+            },
+            "include_vector": {
+                "type": "boolean",
+                "default": True,
+                "description": "Whether to search the text vector index. Enabled by default.",
+            },
             "rerank": {"type": "boolean", "default": False},
         },
         "required": ["query"],
@@ -137,7 +149,7 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "zotero_rag_status": "Return ZoteroRAG runtime status, state summary, and ingest progress.",
     "zotero_rag_list_models": "List available embedding model profiles.",
     "zotero_rag_metadata_search": "Search Zotero metadata only (no fulltext or vectors).",
-    "zotero_rag_search_text": "Search across metadata, fulltext, and text vector indexes. Safe for plain-text LLMs.",
+    "zotero_rag_search_text": "Search the text vector index by default. Enable include_metadata only when Zotero bibliographic metadata is required (prefer zotero_rag_metadata_search for metadata-only queries). Enable include_fulltext only when normalized chunk text without embeddings is required. Safe for plain-text LLMs.",
     "zotero_rag_search_multimodal": "Multimodal vector search. Use consumer='llm_multimodal' and image_return='file_ref' or 'base64' to receive images.",
     "zotero_rag_get_document": "Retrieve a single document with optional chunks.",
 }
