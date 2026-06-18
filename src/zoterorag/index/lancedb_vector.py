@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -10,6 +11,16 @@ from .local_vector import VectorRecord, cosine_similarity
 
 
 logger = logging.getLogger(__name__)
+
+# Module-level cache of ``lancedb.DB`` connections keyed by absolute path.
+#
+# LanceDB's synchronous ``connect()`` can deadlock when called from a worker
+# thread while the main thread runs an asyncio event loop (e.g. the MCP
+# stdio server). Caching the connection on the main thread and reusing it
+# across threads avoids that initialization path without changing the public
+# store interface.
+_DB_CACHE: dict[str, Any] = {}
+_DB_CACHE_LOCK = threading.Lock()
 
 
 class LanceDBVectorStore:
@@ -28,7 +39,13 @@ class LanceDBVectorStore:
         self.path.mkdir(parents=True, exist_ok=True)
 
         lancedb = _import_lancedb()
-        self._db = lancedb.connect(str(self.path))
+        cache_key = str(self.path.resolve())
+        with _DB_CACHE_LOCK:
+            db = _DB_CACHE.get(cache_key)
+            if db is None:
+                db = lancedb.connect(str(self.path))
+                _DB_CACHE[cache_key] = db
+        self._db = db
         self._table_cache: dict[str, Any] = {}
 
     def close(self) -> None:
@@ -44,9 +61,14 @@ class LanceDBVectorStore:
     # Write path
     # ------------------------------------------------------------------
 
-    def upsert(self, records: Iterable[VectorRecord], *, index_version: str = "legacy") -> int:
+    def upsert(
+        self, records: Iterable[VectorRecord], *, index_version: str = "legacy"
+    ) -> int:
         table_name = _table_name(index_version)
-        rows = [_record_to_row(record, index_version, self.profile_name) for record in records]
+        rows = [
+            _record_to_row(record, index_version, self.profile_name)
+            for record in records
+        ]
         if not rows:
             return 0
         for record in records:
@@ -122,7 +144,9 @@ class LanceDBVectorStore:
         # Delete old row for this profile, then add the new one.
         predicate = _build_profile_name_predicate(self.profile_name)
         meta_table.delete(predicate)
-        meta_table.add([{"profile_name": self.profile_name, "active_version": index_version}])
+        meta_table.add(
+            [{"profile_name": self.profile_name, "active_version": index_version}]
+        )
 
     def active_version(self) -> str:
         try:
@@ -293,17 +317,19 @@ class LanceDBVectorStore:
                 raise
             import pyarrow as pa
 
-            schema = pa.schema([
-                pa.field("record_id", pa.string()),
-                pa.field("profile_name", pa.string()),
-                pa.field("document_id", pa.string()),
-                pa.field("chunk_id", pa.string()),
-                pa.field("modality", pa.string()),
-                pa.field("index_version", pa.string()),
-                pa.field("vector_json", pa.string()),
-                pa.field("text", pa.string()),
-                pa.field("metadata_json", pa.string()),
-            ])
+            schema = pa.schema(
+                [
+                    pa.field("record_id", pa.string()),
+                    pa.field("profile_name", pa.string()),
+                    pa.field("document_id", pa.string()),
+                    pa.field("chunk_id", pa.string()),
+                    pa.field("modality", pa.string()),
+                    pa.field("index_version", pa.string()),
+                    pa.field("vector_json", pa.string()),
+                    pa.field("text", pa.string()),
+                    pa.field("metadata_json", pa.string()),
+                ]
+            )
             # Create empty table with schema, then add data.
             table = self._db.create_table(table_name, schema=schema)
         self._table_cache[table_name] = table
@@ -318,10 +344,12 @@ class LanceDBVectorStore:
                 raise
             import pyarrow as pa
 
-            schema = pa.schema([
-                pa.field("profile_name", pa.string()),
-                pa.field("active_version", pa.string()),
-            ])
+            schema = pa.schema(
+                [
+                    pa.field("profile_name", pa.string()),
+                    pa.field("active_version", pa.string()),
+                ]
+            )
             table = self._db.create_table("vector_meta", schema=schema)
             return table
 
@@ -329,6 +357,36 @@ class LanceDBVectorStore:
 # ---------------------------------------------------------------------------
 # Module helpers
 # ---------------------------------------------------------------------------
+
+
+def warmup_lancedb_connection(path: str | Path) -> None:
+    """Ensure a LanceDB connection exists in the module cache.
+
+    Calling this from the main thread before any worker thread touches the
+    store prevents ``lancedb.connect()`` from being invoked inside a worker
+    thread while an asyncio event loop is running, which avoids deadlocks in
+    the MCP stdio environment.
+    """
+
+    lancedb = _import_lancedb()
+    resolved = Path(path).resolve()
+    cache_key = str(resolved)
+    with _DB_CACHE_LOCK:
+        if cache_key in _DB_CACHE:
+            return
+        resolved.mkdir(parents=True, exist_ok=True)
+        _DB_CACHE[cache_key] = lancedb.connect(str(resolved))
+
+
+def clear_lancedb_cache() -> None:
+    """Clear the module-level LanceDB connection cache.
+
+    Intended for tests that mock ``lancedb.connect()`` and need a fresh cache
+    for every test case.
+    """
+
+    with _DB_CACHE_LOCK:
+        _DB_CACHE.clear()
 
 
 def _table_name(index_version: str) -> str:
@@ -339,7 +397,9 @@ def _table_name(index_version: str) -> str:
     return f"vectors_{safe}" if safe else "vectors_legacy"
 
 
-def _record_to_row(record: VectorRecord, index_version: str, profile_name: str) -> dict[str, Any]:
+def _record_to_row(
+    record: VectorRecord, index_version: str, profile_name: str
+) -> dict[str, Any]:
     stored_record_id = (
         record.record_id
         if index_version == "legacy"
@@ -354,7 +414,9 @@ def _record_to_row(record: VectorRecord, index_version: str, profile_name: str) 
         "index_version": index_version,
         "vector_json": json.dumps(record.vector),
         "text": record.text,
-        "metadata_json": json.dumps(record.metadata or {}, ensure_ascii=False, sort_keys=True),
+        "metadata_json": json.dumps(
+            record.metadata or {}, ensure_ascii=False, sort_keys=True
+        ),
     }
 
 
@@ -381,7 +443,7 @@ def _strip_version_prefix(stored_record_id: str, index_version: str) -> str:
     if index_version and index_version != "legacy":
         prefix = f"{index_version}:"
         if stored_record_id.startswith(prefix):
-            return stored_record_id[len(prefix):]
+            return stored_record_id[len(prefix) :]
     return stored_record_id
 
 

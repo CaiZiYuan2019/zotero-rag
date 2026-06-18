@@ -12,9 +12,12 @@ same tool functions defined in ``zoterorag.mcp.tools`` through the MCP protocol.
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 import io
 import json
 import os
+from pathlib import Path
 import sys
 from typing import Any
 
@@ -24,6 +27,7 @@ from mcp.types import EmbeddedResource, ImageContent, TextContent, Tool
 
 from ..config import AppConfig
 from ..db import StateLedger
+from ..index.lancedb_vector import warmup_lancedb_connection
 from ..runtime import initialize_runtime
 from .tools import (
     McpToolContext,
@@ -56,7 +60,10 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "zotero_rag_metadata_search": {
         "type": "object",
         "properties": {
-            "query": {"type": "string", "description": "Search query over Zotero metadata."},
+            "query": {
+                "type": "string",
+                "description": "Search query over Zotero metadata.",
+            },
             "classification": {
                 "type": "string",
                 "description": "Optional classification filter.",
@@ -71,7 +78,10 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "Search query."},
-            "profile_name": {"type": "string", "description": "Optional vector profile name."},
+            "profile_name": {
+                "type": "string",
+                "description": "Optional vector profile name.",
+            },
             "top_k": {"type": "integer", "default": 10},
             "include_metadata": {
                 "type": "boolean",
@@ -108,7 +118,10 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "required": ["type", "value"],
                 "additionalProperties": False,
             },
-            "profile_name": {"type": "string", "description": "Optional vector profile name."},
+            "profile_name": {
+                "type": "string",
+                "description": "Optional vector profile name.",
+            },
             "top_k": {"type": "integer", "default": 10},
             "consumer": {
                 "type": "string",
@@ -187,10 +200,41 @@ def _make_tools() -> list[Tool]:
 
 
 async def serve(config: AppConfig, ledger: StateLedger) -> None:
-    """Run the MCP stdio server."""
+    """Run the MCP stdio server.
+
+    Tool handlers execute in a thread pool because several tools call
+    LanceDB/SQLite code that blocks the asyncio event loop. Running them on a
+    separate thread prevents the MCP stdio heartbeat from starving and avoids
+    deadlocks with LanceDB's internal background event loop.
+    """
     server = Server(SERVER_NAME)
     context = _build_mcp_context(config, ledger)
     tools = _make_tools()
+
+    # ``config.mcp`` may be absent when the config file does not define an
+    # ``[mcp]`` section. Default timeout keeps long searches from hanging the
+    # MCP client indefinitely.
+    mcp_config = getattr(config, "mcp", None)
+    tool_timeout: float = 30.0
+    if mcp_config is not None:
+        tool_timeout = float(getattr(mcp_config, "tool_timeout", tool_timeout))
+
+    # Warm up LanceDB connections on the main thread before any worker thread
+    # can trigger ``lancedb.connect()``. This avoids a deadlock between
+    # LanceDB's internal background loop and the asyncio event loop that runs
+    # the stdio transport.
+    for index in ledger.list_vector_indexes():
+        if index.get("backend") == "lancedb":
+            try:
+                warmup_lancedb_connection(Path(str(index["path"])))
+            except Exception as exc:  # pragma: no cover - optional warmup
+                print(
+                    f"[zoterorag_mcp] WARNING: failed to warm up LanceDB connection for {index.get('profile_name')}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+    executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mcp_tool_")
 
     @server.list_tools()
     async def list_tools() -> list[Tool]:
@@ -202,23 +246,56 @@ async def serve(config: AppConfig, ledger: StateLedger) -> None:
     ) -> list[TextContent | ImageContent | EmbeddedResource]:
         func = TOOL_FUNCTIONS.get(name)
         if func is None:
-            return [TextContent(type="text", text=json.dumps({"error": f"unknown tool: {name}"}))]
+            return [
+                TextContent(
+                    type="text", text=json.dumps({"error": f"unknown tool: {name}"})
+                )
+            ]
+        loop = asyncio.get_running_loop()
         try:
-            result = func(context, **arguments)
-            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, default=str))]
+            result = await asyncio.wait_for(
+                loop.run_in_executor(executor, partial(func, context, **arguments)),
+                timeout=tool_timeout,
+            )
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(result, ensure_ascii=False, default=str),
+                )
+            ]
+        except asyncio.TimeoutError:
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(
+                        {
+                            "error": "TimeoutError",
+                            "message": f"tool {name} timed out after {tool_timeout}s",
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+            ]
         except Exception as exc:  # pragma: no cover - keep server alive
             error_payload = {"error": type(exc).__name__, "message": str(exc)}
-            return [TextContent(type="text", text=json.dumps(error_payload, ensure_ascii=False))]
+            return [
+                TextContent(
+                    type="text", text=json.dumps(error_payload, ensure_ascii=False)
+                )
+            ]
 
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream,
-            write_stream,
-            server.create_initialization_options(
-                notification_options=None,
-                experimental_capabilities={},
-            ),
-        )
+    try:
+        async with stdio_server() as (read_stream, write_stream):
+            await server.run(
+                read_stream,
+                write_stream,
+                server.create_initialization_options(
+                    notification_options=None,
+                    experimental_capabilities={},
+                ),
+            )
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def main(config_path: str | None = None) -> None:
@@ -229,21 +306,25 @@ def main(config_path: str | None = None) -> None:
             env var, then ``config/config.toml``.
     """
     # Re-encode stdout before any operation so MCP JSON lines are always UTF-8.
-    sys.stdout = io.TextIOWrapper(
-        sys.stdout.buffer, encoding="utf-8", errors="replace"
-    )
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
     if config_path is None:
         config_path = os.environ.get("ZOTERORAG_CONFIG")
     try:
         config, ledger = _load_runtime(config_path)
     except Exception as exc:
-        print(f"[zoterorag_mcp] FATAL: failed to load runtime: {exc}", file=sys.stderr, flush=True)
+        print(
+            f"[zoterorag_mcp] FATAL: failed to load runtime: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
         raise
     try:
         asyncio.run(serve(config, ledger))
     except Exception as exc:
-        print(f"[zoterorag_mcp] FATAL: server crashed: {exc}", file=sys.stderr, flush=True)
+        print(
+            f"[zoterorag_mcp] FATAL: server crashed: {exc}", file=sys.stderr, flush=True
+        )
         raise
     finally:
         ledger.close()

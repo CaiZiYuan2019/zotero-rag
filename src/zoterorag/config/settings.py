@@ -47,7 +47,9 @@ class ServerConfig:
 
     def __post_init__(self) -> None:
         if not isinstance(self.port, int) or not (1 <= self.port <= 65535):
-            raise ValueError(f"server.port must be an integer between 1 and 65535, got {self.port!r}")
+            raise ValueError(
+                f"server.port must be an integer between 1 and 65535, got {self.port!r}"
+            )
 
 
 @dataclass(frozen=True)
@@ -70,17 +72,35 @@ class EmbeddingProfile:
 
     def __post_init__(self) -> None:
         if not isinstance(self.dimension, int) or self.dimension <= 0:
-            raise ValueError(f"embedding profile {self.name!r} dimension must be a positive integer, got {self.dimension!r}")
+            raise ValueError(
+                f"embedding profile {self.name!r} dimension must be a positive integer, got {self.dimension!r}"
+            )
         if self.modality not in {"text", "multimodal"}:
-            raise ValueError(f"embedding profile {self.name!r} modality must be 'text' or 'multimodal', got {self.modality!r}")
+            raise ValueError(
+                f"embedding profile {self.name!r} modality must be 'text' or 'multimodal', got {self.modality!r}"
+            )
         if self.backend not in {"sqlite-local", "lancedb"}:
-            raise ValueError(f"embedding profile {self.name!r} backend must be 'sqlite-local' or 'lancedb', got {self.backend!r}")
+            raise ValueError(
+                f"embedding profile {self.name!r} backend must be 'sqlite-local' or 'lancedb', got {self.backend!r}"
+            )
+
+
+@dataclass(frozen=True)
+class McpConfig:
+    tool_timeout: float = 30.0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.tool_timeout, (int, float)) or self.tool_timeout <= 0:
+            raise ValueError(
+                f"mcp.tool_timeout must be a positive number, got {self.tool_timeout!r}"
+            )
 
 
 @dataclass(frozen=True)
 class AppConfig:
     paths: PathsConfig
     server: ServerConfig = field(default_factory=ServerConfig)
+    mcp: McpConfig = field(default_factory=McpConfig)
     embedding_profiles: tuple[EmbeddingProfile, ...] = ()
 
     def ensure_runtime_dirs(self) -> None:
@@ -109,7 +129,9 @@ def _parse_bool(value: Any, field_name: str) -> bool:
     raise TypeError(f"{field_name} must be a boolean, got {type(value).__name__}")
 
 
-def _validate_profiles(profiles_data: list[dict[str, Any]]) -> tuple[EmbeddingProfile, ...]:
+def _validate_profiles(
+    profiles_data: list[dict[str, Any]],
+) -> tuple[EmbeddingProfile, ...]:
     """Validate embedding profile entries and ensure default uniqueness per modality."""
     required_fields = ("name", "provider", "model", "dimension", "modality")
     seen_names: set[str] = set()
@@ -127,7 +149,10 @@ def _validate_profiles(profiles_data: list[dict[str, Any]]) -> tuple[EmbeddingPr
         # Normalize boolean-like values that may come from manual edits or callers.
         for bool_field in ("enabled", "default_for_text", "default_for_multimodal"):
             if bool_field in entry:
-                entry[bool_field] = _parse_bool(entry[bool_field], f"embedding_profiles.{entry['name']}.{bool_field}")
+                entry[bool_field] = _parse_bool(
+                    entry[bool_field],
+                    f"embedding_profiles.{entry['name']}.{bool_field}",
+                )
         profiles.append(EmbeddingProfile(**entry))
 
     for modality in ("text", "multimodal"):
@@ -137,7 +162,9 @@ def _validate_profiles(profiles_data: list[dict[str, Any]]) -> tuple[EmbeddingPr
         enabled_profiles = [p for p in modality_profiles if p.enabled]
         if not enabled_profiles:
             continue
-        default_flag = "default_for_text" if modality == "text" else "default_for_multimodal"
+        default_flag = (
+            "default_for_text" if modality == "text" else "default_for_multimodal"
+        )
         defaults = [p for p in enabled_profiles if getattr(p, default_flag)]
         if len(defaults) != 1:
             raise ValueError(
@@ -209,9 +236,12 @@ def load_config(path: str | Path = "config/config.toml") -> AppConfig:
     data = tomllib.loads(config_path.read_text(encoding="utf-8"))
     paths_data = data.get("paths", {})
     server_data = data.get("server", {})
+    mcp_data = data.get("mcp", {})
     profiles_data = data.get("embedding_profiles", [])
 
-    missing_paths = [field for field in ("zotero_db", "zotero_storage") if field not in paths_data]
+    missing_paths = [
+        field for field in ("zotero_db", "zotero_storage") if field not in paths_data
+    ]
     if missing_paths:
         raise ValueError(f"missing required paths config: {missing_paths}")
 
@@ -240,4 +270,7 @@ def load_config(path: str | Path = "config/config.toml") -> AppConfig:
         ),
     )
     profiles = _validate_profiles(profiles_data)
-    return AppConfig(paths=paths, server=server, embedding_profiles=profiles)
+    mcp = McpConfig(
+        tool_timeout=float(mcp_data.get("tool_timeout", 30.0)),
+    )
+    return AppConfig(paths=paths, server=server, mcp=mcp, embedding_profiles=profiles)

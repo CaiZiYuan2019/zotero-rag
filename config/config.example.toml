@@ -8,6 +8,12 @@ host = "127.0.0.1"
 port = 8765
 require_api_token = true
 
+[mcp]
+# Maximum seconds to wait for a synchronous tool handler before returning a
+# TimeoutError response. Keep this comfortably above the slowest expected
+# vector search.
+tool_timeout = 30.0
+
 [[embedding_profiles]]
 name = "qwen3vl_cloud_2560_text"
 provider = "dashscope"

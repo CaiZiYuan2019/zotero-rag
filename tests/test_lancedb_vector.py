@@ -9,6 +9,7 @@ from zoterorag.index.lancedb_vector import (
     _build_record_id_in_predicate,
     _is_table_missing,
     _validate_predicate_literal,
+    clear_lancedb_cache,
 )
 
 
@@ -63,6 +64,7 @@ class LanceDBVectorStoreBehaviorTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.mock_db = MagicMock()
+        clear_lancedb_cache()
 
     def test_active_version_returns_legacy_when_meta_table_missing(self) -> None:
         self.mock_db.open_table.side_effect = RuntimeError("table not found")
@@ -152,4 +154,6 @@ class LanceDBVectorStoreBehaviorTests(unittest.TestCase):
             return_value=self._mock_lancedb_module(),
         ):
             store = LanceDBVectorStore("/tmp/vectors", profile_name="p1", dimension=3)
-            self.assertEqual(0, store.copy_active_records_to_version(index_version="v2"))
+            self.assertEqual(
+                0, store.copy_active_records_to_version(index_version="v2")
+            )
