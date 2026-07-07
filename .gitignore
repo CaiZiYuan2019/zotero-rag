@@ -58,3 +58,5 @@ mineru_example/
 # code check reports
 docs/CODEBASE_AUDIT_REPORT.md
 
+# search report
+report/
