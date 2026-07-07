@@ -9,8 +9,15 @@ from typing import Any, Literal
 from ..db import JobEvent, StateLedger
 from ..embeddings.profile import embedding_profile_hash
 from ..embeddings.indexer import index_normalized_document
-from ..normalize.markdown import normalize_markdown_document
+from ..normalize.markdown import normalize_markdown_document, sanitize_id
+from ..normalize.merge_extract_segments import (
+    merge_extract_segments,
+    segment_artifact_dirs_from_jobs,
+)
+from ..pdf_pages import get_pdf_page_count
 from ..search.results import RerankNotSupportedError
+from ..extractors.segments import compute_page_segments
+from ..config.settings import ExtractConfig
 
 
 IngestMode = Literal["incremental", "full"]
@@ -81,6 +88,7 @@ def start_ingest_job(
     extract_cache_dir: str | Path | None = None,
     normalized_dir: str | Path | None = None,
     vector_store_dir: str | Path | None = None,
+    extract_config: ExtractConfig | None = None,
 ) -> dict[str, Any]:
     """Create a persisted ingest job and optionally execute it.
 
@@ -153,6 +161,8 @@ def start_ingest_job(
     extract_cache_dir = Path(extract_cache_dir)
     normalized_dir = Path(normalized_dir)
     vector_store_dir = Path(vector_store_dir)
+    if extract_config is None:
+        extract_config = ExtractConfig()
 
     executed: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
@@ -177,6 +187,7 @@ def start_ingest_job(
                 extract_cache_dir=extract_cache_dir,
                 normalized_dir=normalized_dir,
                 vector_store_dir=vector_store_dir,
+                extract_config=extract_config,
             )
             executed.append(result)
             _progress("  -> done\n")
@@ -292,7 +303,9 @@ def plan_attachment(
 ) -> dict[str, Any]:
     document_id = artifact["document_id"] if artifact is not None else attachment["attachment_key"]
     full_rebuild = mode == "full"
-    extract_stage = stage_for_extract(attachment, extract_jobs, force=full_rebuild, artifact=artifact)
+    extract_stage = stage_for_extract(
+        attachment, extract_jobs, ledger=ledger, force=full_rebuild, artifact=artifact
+    )
     normalize_stage = stage_for_artifact(artifact, force=full_rebuild)
     text_stage = stage_for_embedding(
         ledger,
@@ -326,15 +339,66 @@ def plan_attachment(
     }
 
 
+def _all_segment_jobs_done(segment_job_ids: list[str], ledger: StateLedger) -> tuple[bool, list[dict[str, Any]]]:
+    """Return (all_done, jobs) for a list of segment job ids."""
+
+    jobs: list[dict[str, Any]] = []
+    for job_id in segment_job_ids:
+        job = ledger.get_extract_job(job_id=job_id)
+        if job is None:
+            return False, []
+        jobs.append(job)
+        if job["state"] not in DONE_EXTRACT_STATES:
+            return False, jobs
+    return True, jobs
+
+
 def stage_for_extract(
     attachment: dict[str, Any],
     extract_jobs: list[dict[str, Any]],
     *,
+    ledger: StateLedger,
     force: bool,
     artifact: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not attachment.get("file_exists"):
         return {"stage": "extract", "status": "blocked", "reason": "missing_file"}
+
+    # If this attachment was previously split into segments, the checkpoint
+    # records the segment job ids. We must wait for all segments to finish
+    # before declaring the extract stage done.
+    checkpoint = ledger.get_checkpoint(attachment["attachment_key"], "extract")
+    segment_job_ids = (checkpoint.get("payload") or {}).get("segment_job_ids") if checkpoint else None
+    if segment_job_ids and not force:
+        all_done, segment_jobs = _all_segment_jobs_done(segment_job_ids, ledger)
+        if all_done:
+            return {
+                "stage": "extract",
+                "status": "done",
+                "job_id": segment_jobs[0]["job_id"],
+                "state": segment_jobs[0]["state"],
+                "segment_job_ids": segment_job_ids,
+                "merged_artifact_dir": (checkpoint.get("payload") or {}).get("merged_artifact_dir"),
+            }
+        failed = next(
+            (job for job in segment_jobs if job["state"] == "failed_manual_review"),
+            None,
+        )
+        if failed is not None:
+            return {
+                "stage": "extract",
+                "status": "blocked",
+                "reason": "segment_failed",
+                "job_id": failed["job_id"],
+                "segment_job_ids": segment_job_ids,
+            }
+        return {
+            "stage": "extract",
+            "status": "pending",
+            "reason": "segments_in_progress",
+            "segment_job_ids": segment_job_ids,
+        }
+
     done = next((job for job in extract_jobs if job["state"] in DONE_EXTRACT_STATES), None)
     if done is not None and not force:
         return {"stage": "extract", "status": "done", "job_id": done["job_id"], "state": done["state"]}
@@ -503,6 +567,7 @@ def _execute_document_stages(
     extract_cache_dir: Path,
     normalized_dir: Path,
     vector_store_dir: Path,
+    extract_config: ExtractConfig,
 ) -> dict[str, Any]:
     """Execute pending stages for a single document, resuming from checkpoints."""
 
@@ -522,6 +587,7 @@ def _execute_document_stages(
                 document=document,
                 extract_manager=extract_manager,
                 extract_cache_dir=extract_cache_dir,
+                extract_config=extract_config,
             )
         elif stage_name == "normalize":
             _execute_normalize_stage(
@@ -557,10 +623,15 @@ def _execute_extract_stage(
     document: dict[str, Any],
     extract_manager: Any,
     extract_cache_dir: Path,
+    extract_config: ExtractConfig,
 ) -> None:
-    """Run MinerU extraction for one attachment."""
+    """Run MinerU extraction for one attachment, splitting large PDFs into segments."""
 
     from ..extractors.manager import ExtractionRequest
+
+    extract_stage = next((s for s in document["stages"] if s["stage"] == "extract"), None)
+    if extract_stage is None or extract_stage["status"] not in {"pending", "blocked"}:
+        return
 
     attachment = ledger.get_attachment(attachment_key)
     if attachment is None:
@@ -577,31 +648,183 @@ def _execute_extract_stage(
         {"job_id": job_id, "input_file": str(file_path)},
     )
 
-    _progress("  extract: submitting...")
-    request = ExtractionRequest(
-        input_file=Path(file_path),
-        attachment_key=attachment_key,
+    # If a previous run already split this attachment, resume the segments.
+    checkpoint = ledger.get_checkpoint(attachment_key, "extract")
+    segment_job_ids = (checkpoint.get("payload") or {}).get("segment_job_ids") if checkpoint else None
+    is_full_rebuild = extract_stage.get("reason") == "full_rebuild"
+    if segment_job_ids and not is_full_rebuild:
+        _progress(f"  extract: resuming {len(segment_job_ids)} segments...")
+        segment_jobs = _resume_segment_jobs(segment_job_ids, extract_manager, ledger)
+        if _all_jobs_downloaded(segment_jobs):
+            _merge_and_checkpoint_segments(
+                ledger=ledger,
+                job_id=job_id,
+                attachment_key=attachment_key,
+                segment_jobs=segment_jobs,
+                extract_cache_dir=extract_cache_dir,
+            )
+        else:
+            _checkpoint_segment_blocked(
+                ledger=ledger,
+                job_id=job_id,
+                attachment_key=attachment_key,
+                segment_jobs=segment_jobs,
+                segment_job_ids=segment_job_ids,
+            )
+        return
+
+    total_pages = get_pdf_page_count(file_path)
+    should_split = (
+        extract_config.split_large_pdfs
+        and total_pages is not None
+        and total_pages > extract_config.max_pages_per_extraction
     )
-    result = extract_manager.ensure_extraction(request)
 
-    # ``completed`` means the remote batch finished but the local artifact has
-    # not been downloaded yet. Resume the download instead of leaving downstream
-    # normalize with no artifact on disk.
+    if not should_split:
+        _progress("  extract: submitting...")
+        request = ExtractionRequest(
+            input_file=Path(file_path),
+            attachment_key=attachment_key,
+        )
+        result = extract_manager.ensure_extraction(request)
+        result = _drive_extraction_to_completion(result, extract_manager)
+        _checkpoint_single_extract_result(
+            ledger=ledger,
+            job_id=job_id,
+            attachment_key=attachment_key,
+            result=result,
+        )
+        return
+
+    segments = compute_page_segments(total_pages, extract_config.max_pages_per_extraction)
+    _progress(f"  extract: splitting PDF into {len(segments)} segments (pages={total_pages})...")
+    segment_results: list[Any] = []
+    for segment in segments:
+        request = ExtractionRequest(
+            input_file=Path(file_path),
+            attachment_key=attachment_key,
+            selected_pages=segment.selected_pages,
+            selected_page_count=segment.page_count,
+        )
+        result = extract_manager.ensure_extraction(request)
+        result = _drive_extraction_to_completion(result, extract_manager)
+        segment_results.append(result)
+        _progress(f"  extract: segment {segment.index + 1}/{len(segments)} state={result.job['state']}")
+
+    segment_jobs = [r.job for r in segment_results]
+    if not _all_jobs_downloaded(segment_jobs):
+        _checkpoint_segment_blocked(
+            ledger=ledger,
+            job_id=job_id,
+            attachment_key=attachment_key,
+            segment_jobs=segment_jobs,
+            segment_job_ids=[job["job_id"] for job in segment_jobs],
+        )
+        return
+
+    _merge_and_checkpoint_segments(
+        ledger=ledger,
+        job_id=job_id,
+        attachment_key=attachment_key,
+        segment_jobs=segment_jobs,
+        extract_cache_dir=extract_cache_dir,
+    )
+
+
+def _drive_extraction_to_completion(result: Any, extract_manager: Any) -> Any:
+    """Drive a freshly submitted extraction result to downloaded or failed."""
+
     if result.job["state"] == "completed" and result.job.get("local_stage") != "downloaded":
-        _progress(f"  extract: resuming download for completed job {result.job['job_id']}")
         result = extract_manager.resume_extraction(result.job["job_id"])
-
-    # Cached jobs that are still in progress need to be driven to completion
-    # (or failure) before downstream normalize can run. This handles interrupted
-    # ingest runs that left extract jobs in ``running``/``submitted`` state.
     if result.job["state"] in {"submitted", "running"}:
-        _progress(f"  extract: resuming poll for job {result.job['job_id']}")
         result = extract_manager.resume_extraction(result.job["job_id"])
+    return result
 
+
+def _all_jobs_downloaded(jobs: list[dict[str, Any]]) -> bool:
+    return all(job["state"] in DONE_EXTRACT_STATES for job in jobs)
+
+
+def _resume_segment_jobs(
+    segment_job_ids: list[str],
+    extract_manager: Any,
+    ledger: StateLedger,
+) -> list[dict[str, Any]]:
+    """Resume each segment job and return refreshed job records."""
+
+    jobs: list[dict[str, Any]] = []
+    for job_id in segment_job_ids:
+        job = ledger.get_extract_job(job_id=job_id)
+        if job is None:
+            raise ValueError(f"segment extract job not found: {job_id}")
+        if job["state"] not in DONE_EXTRACT_STATES:
+            result = extract_manager.resume_extraction(job_id)
+            job = result.job
+        jobs.append(job)
+    return jobs
+
+
+def _merged_artifact_dir(extract_cache_dir: Path, attachment_key: str) -> Path:
+    return extract_cache_dir / "merged" / sanitize_id(attachment_key)
+
+
+def _merge_and_checkpoint_segments(
+    *,
+    ledger: StateLedger,
+    job_id: str,
+    attachment_key: str,
+    segment_jobs: list[dict[str, Any]],
+    extract_cache_dir: Path,
+) -> None:
+    """Merge segment artifacts and persist a done checkpoint."""
+
+    segment_job_ids = [job["job_id"] for job in segment_jobs]
+    merged_dir = _merged_artifact_dir(extract_cache_dir, attachment_key)
+
+    # Skip re-merging if the merged artifact already exists and looks valid.
+    merged_md = merged_dir / "merged_full.md"
+    if not merged_md.is_file():
+        segment_dirs = segment_artifact_dirs_from_jobs(segment_jobs)
+        merge_extract_segments(segment_dirs, merged_dir)
+
+    ledger.checkpoint(
+        attachment_key,
+        "extract",
+        "done",
+        {
+            "job_id": job_id,
+            "extract_job_id": segment_job_ids[0],
+            "segment_job_ids": segment_job_ids,
+            "merged_artifact_dir": str(merged_dir),
+            "merged_markdown": str(merged_md),
+        },
+    )
+
+    ledger.add_event(
+        JobEvent(
+            job_id=job_id,
+            stage="extract",
+            status="completed",
+            message=f"extract segments merged for {attachment_key}: {len(segment_jobs)} segments",
+            payload={
+                "job_id": job_id,
+                "attachment_key": attachment_key,
+                "segment_job_ids": segment_job_ids,
+                "merged_artifact_dir": str(merged_dir),
+            },
+        )
+    )
+
+
+def _checkpoint_single_extract_result(
+    *,
+    ledger: StateLedger,
+    job_id: str,
+    attachment_key: str,
+    result: Any,
+) -> None:
     _progress(f"  extract: {result.job['state']} (cache_hit={result.cache_hit})")
 
-    # Safety fallback: never mark extract as done unless the job truly reached a
-    # state that has a local artifact available for normalize.
     if result.job["state"] not in DONE_EXTRACT_STATES:
         ledger.checkpoint(
             attachment_key,
@@ -621,7 +844,11 @@ def _execute_extract_stage(
                 stage="extract",
                 status=result.job["state"],
                 message=f"extract job {result.job['job_id']} still {result.job['state']}; will retry",
-                payload={"job_id": result.job["job_id"], "state": result.job["state"], "cache_hit": result.cache_hit},
+                payload={
+                    "job_id": result.job["job_id"],
+                    "state": result.job["state"],
+                    "cache_hit": result.cache_hit,
+                },
             )
         )
         return
@@ -644,7 +871,46 @@ def _execute_extract_stage(
             stage="extract",
             status="completed" if result.job["state"] in DONE_EXTRACT_STATES else result.job["state"],
             message=f"extract job {result.job['job_id']} state={result.job['state']}",
-            payload={"job_id": result.job["job_id"], "state": result.job["state"], "cache_hit": result.cache_hit},
+            payload={
+                "job_id": result.job["job_id"],
+                "state": result.job["state"],
+                "cache_hit": result.cache_hit,
+            },
+        )
+    )
+
+
+def _checkpoint_segment_blocked(
+    *,
+    ledger: StateLedger,
+    job_id: str,
+    attachment_key: str,
+    segment_jobs: list[dict[str, Any]],
+    segment_job_ids: list[str],
+) -> None:
+    failed_states = {job["state"] for job in segment_jobs if job["state"] not in DONE_EXTRACT_STATES}
+    ledger.checkpoint(
+        attachment_key,
+        "extract",
+        "blocked",
+        {
+            "job_id": job_id,
+            "segment_job_ids": segment_job_ids,
+            "states": [job["state"] for job in segment_jobs],
+            "reason": f"segment jobs not all downloaded: {failed_states}",
+        },
+    )
+    ledger.add_event(
+        JobEvent(
+            job_id=job_id,
+            stage="extract",
+            status="blocked",
+            message=f"segment extraction blocked for {attachment_key}: {failed_states}",
+            payload={
+                "attachment_key": attachment_key,
+                "segment_job_ids": segment_job_ids,
+                "states": [job["state"] for job in segment_jobs],
+            },
         )
     )
 
@@ -665,6 +931,7 @@ def _execute_normalize_stage(
     # cache_key can reuse a single extract job without creating duplicate
     # records.
     extract_job: dict[str, Any] | None = None
+    segment_job_ids: list[str] | None = None
     extract_checkpoint = ledger.get_checkpoint(attachment_key, "extract")
     if extract_checkpoint is not None and extract_checkpoint.get("status") == "done":
         shared_job_id = extract_checkpoint.get("payload", {}).get("extract_job_id")
@@ -672,6 +939,7 @@ def _execute_normalize_stage(
             candidate = ledger.get_extract_job(job_id=shared_job_id)
             if candidate is not None and candidate["state"] in DONE_EXTRACT_STATES:
                 extract_job = candidate
+        segment_job_ids = extract_checkpoint.get("payload", {}).get("segment_job_ids")
 
     if extract_job is None:
         extract_jobs = [
@@ -681,14 +949,20 @@ def _execute_normalize_stage(
         if not extract_jobs:
             raise ValueError(f"no completed extract job for {attachment_key}; run extraction first")
         extract_job = extract_jobs[0]
-    artifact_dir = extract_job.get("artifact_dir") or extract_job.get("extract_dir")
-    if not artifact_dir:
-        raise ValueError(f"extract job {extract_job['job_id']} has no artifact_dir")
 
-    artifact_path = Path(artifact_dir)
-    source_md = _find_source_markdown(artifact_path)
-    if source_md is None:
-        raise FileNotFoundError(f"no markdown file found in extract artifact: {artifact_path}")
+    source_md: Path | None = None
+    merged_artifact_dir = extract_checkpoint.get("payload", {}).get("merged_artifact_dir") if extract_checkpoint else None
+    if merged_artifact_dir:
+        source_md = Path(merged_artifact_dir) / "merged_full.md"
+        if not source_md.is_file():
+            raise FileNotFoundError(f"merged markdown not found: {source_md}")
+    else:
+        artifact_dir = extract_job.get("artifact_dir") or extract_job.get("extract_dir")
+        if not artifact_dir:
+            raise ValueError(f"extract job {extract_job['job_id']} has no artifact_dir")
+        source_md = _find_source_markdown(Path(artifact_dir))
+        if source_md is None:
+            raise FileNotFoundError(f"no markdown file found in extract artifact: {artifact_dir}")
 
     ledger.checkpoint(
         document_id,
@@ -713,6 +987,7 @@ def _execute_normalize_stage(
         document_id=document_id,
         attachment_key=attachment_key,
         extract_job_id=extract_job["job_id"],
+        segment_job_ids=segment_job_ids,
     )
     _progress(f"  normalize: {normalize_result.ledger_artifact()['chunk_count']} chunks, {normalize_result.ledger_artifact()['image_count']} images")
 

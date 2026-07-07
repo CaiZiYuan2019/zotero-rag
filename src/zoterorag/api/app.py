@@ -262,6 +262,7 @@ def create_app(config_path: str | Path = "config/config.toml") -> Any:
                 kwargs["extract_cache_dir"] = config.paths.extract_cache_dir
                 kwargs["normalized_dir"] = config.paths.normalized_dir
                 kwargs["vector_store_dir"] = config.paths.vector_store_dir
+                kwargs["extract_config"] = config.extract
             return start_ingest_job(ledger, **kwargs)
         except NotImplementedError as exc:
             raise HTTPException(status_code=501, detail=str(exc)) from exc

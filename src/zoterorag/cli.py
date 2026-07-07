@@ -457,6 +457,7 @@ def main(argv: list[str] | None = None) -> int:
                         kwargs["extract_cache_dir"] = config.paths.extract_cache_dir
                         kwargs["normalized_dir"] = config.paths.normalized_dir
                         kwargs["vector_store_dir"] = config.paths.vector_store_dir
+                        kwargs["extract_config"] = config.extract
                     emit(start_ingest_job(ledger, **kwargs))
                     return 0
                 except RerankNotSupportedError as exc:

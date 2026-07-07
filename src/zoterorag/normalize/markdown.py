@@ -68,6 +68,7 @@ def normalize_markdown_document(
     document_id: str,
     attachment_key: str | None = None,
     extract_job_id: str | None = None,
+    segment_job_ids: list[str] | None = None,
     image_policy: ImagePolicy | None = None,
 ) -> NormalizeResult:
     """Normalize a MinerU-like Markdown folder into durable local artifacts.
@@ -107,6 +108,7 @@ def normalize_markdown_document(
         "document_id": document_id,
         "attachment_key": attachment_key,
         "extract_job_id": extract_job_id,
+        "segment_job_ids": segment_job_ids,
         "source_markdown": str(source_path),
         "status": "normalized",
         "document_hash": sha256_text(normalized_text),

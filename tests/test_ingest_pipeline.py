@@ -8,6 +8,9 @@ from tests._support import workspace_tmpdir
 from zoterorag.config import EmbeddingProfile
 from zoterorag.db import StateLedger
 from zoterorag.embeddings.profile import embedding_profile_hash
+from unittest.mock import patch
+
+from zoterorag.config import ExtractConfig
 from zoterorag.extractors.base import ExtractArtifact, ExtractJobState, StubExtractorProvider
 from zoterorag.extractors.manager import ExtractionManager, ExtractionRequest
 from zoterorag.normalize import normalize_markdown_document
@@ -385,6 +388,94 @@ class IngestPipelineTests(unittest.TestCase):
                 self.assertEqual("done", ledger.get_checkpoint("ATT_RUN", "extract")["status"])
                 self.assertEqual("normalized", ledger.get_checkpoint("ATT_RUN", "normalize")["status"])
                 self.assertIsNotNone(ledger.get_normalized_artifact("ATT_RUN"))
+            finally:
+                ledger.close()
+
+    def test_split_large_pdf_into_segments(self) -> None:
+        with workspace_tmpdir("ingest-split-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                seed_profiles(ledger)
+                attachment = build_attachment_with_file(tmpdir, "ATT_SPLIT", title="Long Paper")
+                ledger.upsert_attachments([attachment])
+
+                extract_manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=MarkdownStubExtractorProvider(),
+                )
+                extract_config = ExtractConfig(split_large_pdfs=True, max_pages_per_extraction=200)
+
+                with patch("zoterorag.pipeline.ingest.get_pdf_page_count", return_value=250):
+                    result = start_ingest_job(
+                        ledger,
+                        zotero_key="ATT_SPLIT",
+                        include_multimodal=False,
+                        execute=True,
+                        extract_manager=extract_manager,
+                        extract_cache_dir=tmpdir / "extract_cache",
+                        normalized_dir=tmpdir / "normalized",
+                        vector_store_dir=tmpdir / "vectors",
+                        extract_config=extract_config,
+                    )
+
+                self.assertEqual("completed", result["job"]["status"])
+                self.assertEqual(1, len(result["executed"]))
+                self.assertEqual(0, len(result["failed"]))
+
+                checkpoint = ledger.get_checkpoint("ATT_SPLIT", "extract")
+                self.assertEqual("done", checkpoint["status"])
+                segment_job_ids = checkpoint["payload"]["segment_job_ids"]
+                self.assertEqual(2, len(segment_job_ids))
+
+                extract_jobs = [
+                    ledger.get_extract_job(job_id=job_id) for job_id in segment_job_ids
+                ]
+                self.assertTrue(all(job["state"] == "downloaded" for job in extract_jobs))
+
+                artifact = ledger.get_normalized_artifact("ATT_SPLIT")
+                self.assertIsNotNone(artifact)
+                self.assertEqual(segment_job_ids, artifact["payload"]["segment_job_ids"])
+                self.assertGreater(len(ledger.list_chunks("ATT_SPLIT", chunk_type="text")), 0)
+            finally:
+                ledger.close()
+
+    def test_split_disabled_uses_single_job(self) -> None:
+        with workspace_tmpdir("ingest-no-split-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                seed_profiles(ledger)
+                attachment = build_attachment_with_file(tmpdir, "ATT_NOSPLIT", title="Long Paper No Split")
+                ledger.upsert_attachments([attachment])
+
+                extract_manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=MarkdownStubExtractorProvider(),
+                )
+                extract_config = ExtractConfig(split_large_pdfs=False, max_pages_per_extraction=200)
+
+                with patch("zoterorag.pipeline.ingest.get_pdf_page_count", return_value=250):
+                    result = start_ingest_job(
+                        ledger,
+                        zotero_key="ATT_NOSPLIT",
+                        include_multimodal=False,
+                        execute=True,
+                        extract_manager=extract_manager,
+                        extract_cache_dir=tmpdir / "extract_cache",
+                        normalized_dir=tmpdir / "normalized",
+                        vector_store_dir=tmpdir / "vectors",
+                        extract_config=extract_config,
+                    )
+
+                self.assertEqual("completed", result["job"]["status"])
+                checkpoint = ledger.get_checkpoint("ATT_NOSPLIT", "extract")
+                self.assertNotIn("segment_job_ids", checkpoint["payload"])
+                jobs = [
+                    job for job in ledger.list_extract_jobs(limit=None)
+                    if job.get("attachment_key") == "ATT_NOSPLIT"
+                ]
+                self.assertEqual(1, len(jobs))
             finally:
                 ledger.close()
 

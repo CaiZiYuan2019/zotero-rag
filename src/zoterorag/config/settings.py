@@ -97,10 +97,24 @@ class McpConfig:
 
 
 @dataclass(frozen=True)
+class ExtractConfig:
+    split_large_pdfs: bool = True
+    max_pages_per_extraction: int = 200
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.max_pages_per_extraction, int) or self.max_pages_per_extraction < 1:
+            raise ValueError(
+                f"extract.max_pages_per_extraction must be a positive integer, "
+                f"got {self.max_pages_per_extraction!r}"
+            )
+
+
+@dataclass(frozen=True)
 class AppConfig:
     paths: PathsConfig
     server: ServerConfig = field(default_factory=ServerConfig)
     mcp: McpConfig = field(default_factory=McpConfig)
+    extract: ExtractConfig = field(default_factory=ExtractConfig)
     embedding_profiles: tuple[EmbeddingProfile, ...] = ()
 
     def ensure_runtime_dirs(self) -> None:
@@ -237,6 +251,7 @@ def load_config(path: str | Path = "config/config.toml") -> AppConfig:
     paths_data = data.get("paths", {})
     server_data = data.get("server", {})
     mcp_data = data.get("mcp", {})
+    extract_data = data.get("extract", {})
     profiles_data = data.get("embedding_profiles", [])
 
     missing_paths = [
@@ -273,4 +288,17 @@ def load_config(path: str | Path = "config/config.toml") -> AppConfig:
     mcp = McpConfig(
         tool_timeout=float(mcp_data.get("tool_timeout", 30.0)),
     )
-    return AppConfig(paths=paths, server=server, mcp=mcp, embedding_profiles=profiles)
+    extract = ExtractConfig(
+        split_large_pdfs=_parse_bool(
+            extract_data.get("split_large_pdfs", True),
+            "extract.split_large_pdfs",
+        ),
+        max_pages_per_extraction=int(extract_data.get("max_pages_per_extraction", 200)),
+    )
+    return AppConfig(
+        paths=paths,
+        server=server,
+        mcp=mcp,
+        extract=extract,
+        embedding_profiles=profiles,
+    )
