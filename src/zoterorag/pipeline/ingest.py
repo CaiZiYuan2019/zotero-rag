@@ -168,75 +168,102 @@ def start_ingest_job(
     skipped: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
 
-    total = len(plan["documents"])
-    _progress(f"\n=== ingest {total} documents ===\n")
+    try:
+        total = len(plan["documents"])
+        _progress(f"\n=== ingest {total} documents ===\n")
 
-    for idx, document in enumerate(plan["documents"], start=1):
-        if document["next_stage"] == "complete":
-            skipped.append(document)
-            continue
+        for idx, document in enumerate(plan["documents"], start=1):
+            if document["next_stage"] == "complete":
+                skipped.append(document)
+                continue
 
-        title = str(document.get("title") or document["document_id"])[:80]
-        try:
-            _progress(f"[{idx}/{total}] {title}")
-            result = _execute_document_stages(
-                ledger=ledger,
+            title = str(document.get("title") or document["document_id"])[:80]
+            try:
+                _progress(f"[{idx}/{total}] {title}")
+                result = _execute_document_stages(
+                    ledger=ledger,
+                    job_id=job_id,
+                    document=document,
+                    extract_manager=extract_manager,
+                    extract_cache_dir=extract_cache_dir,
+                    normalized_dir=normalized_dir,
+                    vector_store_dir=vector_store_dir,
+                    extract_config=extract_config,
+                )
+                executed.append(result)
+                _progress("  -> done\n")
+            except (FileNotFoundError, ValueError, RuntimeError, RerankNotSupportedError) as exc:
+                failed.append({"document": document, "error": str(exc)})
+                _progress(f"  -> FAILED: {exc}\n")
+                ledger.add_event(
+                    JobEvent(
+                        job_id=job_id,
+                        stage="document_error",
+                        status="failed",
+                        message=f"{document['document_id']}: {exc}",
+                        payload={"document": document, "error": str(exc)},
+                    )
+                )
+            except Exception as exc:
+                # Catch-all: a single misbehaving document must not abort the job.
+                error_text = traceback.format_exc()
+                failed.append({"document": document, "error": str(exc), "traceback": error_text})
+                _progress(f"  -> FAILED (unexpected): {exc}\n")
+                ledger.add_event(
+                    JobEvent(
+                        job_id=job_id,
+                        stage="document_error",
+                        status="failed",
+                        message=f"{document['document_id']}: unexpected {exc.__class__.__name__}: {exc}",
+                        payload={"document": document, "error": str(exc), "traceback": error_text},
+                    )
+                )
+
+        final_status = "completed" if not failed else "completed_with_errors"
+        _progress(f"\n=== {final_status}: {len(executed)} ok, {len(skipped)} skipped, {len(failed)} failed ===\n")
+        ledger.add_event(
+            JobEvent(
                 job_id=job_id,
-                document=document,
-                extract_manager=extract_manager,
-                extract_cache_dir=extract_cache_dir,
-                normalized_dir=normalized_dir,
-                vector_store_dir=vector_store_dir,
-                extract_config=extract_config,
+                stage="complete",
+                status=final_status,
+                message=f"indexed {len(executed)} documents; skipped {len(skipped)}; failed {len(failed)}",
+                payload={"indexed": len(executed), "skipped": len(skipped), "failed": len(failed)},
             )
-            executed.append(result)
-            _progress("  -> done\n")
-        except (FileNotFoundError, ValueError, RuntimeError, RerankNotSupportedError) as exc:
-            failed.append({"document": document, "error": str(exc)})
-            _progress(f"  -> FAILED: {exc}\n")
-            ledger.add_event(
-                JobEvent(
-                    job_id=job_id,
-                    stage="document_error",
-                    status="failed",
-                    message=f"{document['document_id']}: {exc}",
-                    payload={"document": document, "error": str(exc)},
-                )
-            )
-        except Exception as exc:
-            # Catch-all: a single misbehaving document must not abort the job.
-            error_text = traceback.format_exc()
-            failed.append({"document": document, "error": str(exc), "traceback": error_text})
-            _progress(f"  -> FAILED (unexpected): {exc}\n")
-            ledger.add_event(
-                JobEvent(
-                    job_id=job_id,
-                    stage="document_error",
-                    status="failed",
-                    message=f"{document['document_id']}: unexpected {exc.__class__.__name__}: {exc}",
-                    payload={"document": document, "error": str(exc), "traceback": error_text},
-                )
-            )
-
-    final_status = "completed" if not failed else "completed_with_errors"
-    _progress(f"\n=== {final_status}: {len(executed)} ok, {len(skipped)} skipped, {len(failed)} failed ===\n")
-    ledger.add_event(
-        JobEvent(
-            job_id=job_id,
-            stage="complete",
-            status=final_status,
-            message=f"indexed {len(executed)} documents; skipped {len(skipped)}; failed {len(failed)}",
-            payload={"indexed": len(executed), "skipped": len(skipped), "failed": len(failed)},
         )
-    )
-    ledger.set_job_status(job_id, final_status)
-    return {
-        "job": ledger.get_job(job_id, include_events=True),
-        "plan": plan,
-        "executed": executed,
-        "skipped": skipped,
-        "failed": failed,
-    }
+        ledger.set_job_status(job_id, final_status)
+        return {
+            "job": ledger.get_job(job_id, include_events=True),
+            "plan": plan,
+            "executed": executed,
+            "skipped": skipped,
+            "failed": failed,
+        }
+
+    except KeyboardInterrupt:
+        ledger.add_event(
+            JobEvent(
+                job_id=job_id,
+                stage="complete",
+                status="interrupted",
+                message=f"ingest interrupted by user; {len(executed)} ok, {len(skipped)} skipped, {len(failed)} failed",
+                payload={"indexed": len(executed), "skipped": len(skipped), "failed": len(failed)},
+            )
+        )
+        ledger.set_job_status(job_id, "interrupted")
+        raise
+    except Exception:
+        error_text = traceback.format_exc()
+        ledger.add_event(
+            JobEvent(
+                job_id=job_id,
+                stage="complete",
+                status="failed",
+                message=f"ingest failed unexpectedly; {len(executed)} ok, {len(skipped)} skipped, {len(failed)} failed",
+                payload={"indexed": len(executed), "skipped": len(skipped), "failed": len(failed), "traceback": error_text},
+            )
+        )
+        ledger.set_job_status(job_id, "failed")
+        raise
 
 
 def pause_ingest_job(ledger: StateLedger, job_id: str, *, reason: str = "manual pause") -> dict[str, Any]:

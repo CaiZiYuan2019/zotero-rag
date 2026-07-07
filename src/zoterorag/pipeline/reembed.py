@@ -117,81 +117,108 @@ def start_reembed_job(
     skipped = []
     failed = []
     ledger.set_job_status(job_id, "running")
-    for document in plan["documents"]:
-        if document["status"] != "pending":
-            skipped.append(document)
-            ledger.add_event(
-                JobEvent(
-                    job_id=job_id,
-                    stage="embed",
-                    status="skipped",
-                    message=f"{document['document_id']} is {document['status']}",
-                    payload=document,
+    try:
+        for document in plan["documents"]:
+            if document["status"] != "pending":
+                skipped.append(document)
+                ledger.add_event(
+                    JobEvent(
+                        job_id=job_id,
+                        stage="embed",
+                        status="skipped",
+                        message=f"{document['document_id']} is {document['status']}",
+                        payload=document,
+                    )
                 )
-            )
-            continue
-        try:
-            result = index_normalized_document(
-                ledger=ledger,
-                vector_store_dir=vector_store_dir,
-                profile_name=profile_name,
-                document_id=document["document_id"],
-                allow_stub_provider=allow_stub_provider,
-            )
-            result_payload = result.to_dict()
-            executed.append(result_payload)
-            ledger.add_event(
-                JobEvent(
-                    job_id=job_id,
-                    stage=f"embed:{profile_name}",
-                    status="indexed",
-                    message=f"indexed {result.indexed_chunks} chunks for {document['document_id']}",
-                    payload=result_payload,
+                continue
+            try:
+                result = index_normalized_document(
+                    ledger=ledger,
+                    vector_store_dir=vector_store_dir,
+                    profile_name=profile_name,
+                    document_id=document["document_id"],
+                    allow_stub_provider=allow_stub_provider,
                 )
-            )
-        except (FileNotFoundError, KeyError, ValueError, RuntimeError, RerankNotSupportedError) as exc:
-            failed.append({"document": document, "error": str(exc)})
-            ledger.add_event(
-                JobEvent(
-                    job_id=job_id,
-                    stage=f"embed:{profile_name}",
-                    status="failed",
-                    message=f"{document['document_id']}: {exc}",
-                    payload={"document": document, "error": str(exc)},
+                result_payload = result.to_dict()
+                executed.append(result_payload)
+                ledger.add_event(
+                    JobEvent(
+                        job_id=job_id,
+                        stage=f"embed:{profile_name}",
+                        status="indexed",
+                        message=f"indexed {result.indexed_chunks} chunks for {document['document_id']}",
+                        payload=result_payload,
+                    )
                 )
-            )
-        except Exception as exc:
-            # Catch-all: a single misbehaving document must not abort the job.
-            error_text = traceback.format_exc()
-            failed.append({"document": document, "error": str(exc), "traceback": error_text})
-            ledger.add_event(
-                JobEvent(
-                    job_id=job_id,
-                    stage=f"embed:{profile_name}",
-                    status="failed",
-                    message=f"{document['document_id']}: unexpected {exc.__class__.__name__}: {exc}",
-                    payload={"document": document, "error": str(exc), "traceback": error_text},
+            except (FileNotFoundError, KeyError, ValueError, RuntimeError, RerankNotSupportedError) as exc:
+                failed.append({"document": document, "error": str(exc)})
+                ledger.add_event(
+                    JobEvent(
+                        job_id=job_id,
+                        stage=f"embed:{profile_name}",
+                        status="failed",
+                        message=f"{document['document_id']}: {exc}",
+                        payload={"document": document, "error": str(exc)},
+                    )
                 )
-            )
+            except Exception as exc:
+                # Catch-all: a single misbehaving document must not abort the job.
+                error_text = traceback.format_exc()
+                failed.append({"document": document, "error": str(exc), "traceback": error_text})
+                ledger.add_event(
+                    JobEvent(
+                        job_id=job_id,
+                        stage=f"embed:{profile_name}",
+                        status="failed",
+                        message=f"{document['document_id']}: unexpected {exc.__class__.__name__}: {exc}",
+                        payload={"document": document, "error": str(exc), "traceback": error_text},
+                    )
+                )
 
-    final_status = "completed" if not failed else "completed_with_errors"
-    ledger.add_event(
-        JobEvent(
-            job_id=job_id,
-            stage="complete",
-            status=final_status,
-            message=f"indexed {len(executed)} documents; skipped {len(skipped)}; failed {len(failed)}",
-            payload={"indexed": len(executed), "skipped": len(skipped), "failed": len(failed)},
+        final_status = "completed" if not failed else "completed_with_errors"
+        ledger.add_event(
+            JobEvent(
+                job_id=job_id,
+                stage="complete",
+                status=final_status,
+                message=f"indexed {len(executed)} documents; skipped {len(skipped)}; failed {len(failed)}",
+                payload={"indexed": len(executed), "skipped": len(skipped), "failed": len(failed)},
+            )
         )
-    )
-    ledger.set_job_status(job_id, final_status)
-    return {
-        "job": ledger.get_job(job_id, include_events=True),
-        "plan": plan,
-        "indexed": executed,
-        "skipped": skipped,
-        "failed": failed,
-    }
+        ledger.set_job_status(job_id, final_status)
+        return {
+            "job": ledger.get_job(job_id, include_events=True),
+            "plan": plan,
+            "indexed": executed,
+            "skipped": skipped,
+            "failed": failed,
+        }
+
+    except KeyboardInterrupt:
+        ledger.add_event(
+            JobEvent(
+                job_id=job_id,
+                stage="complete",
+                status="interrupted",
+                message=f"reembed interrupted by user; {len(executed)} ok, {len(skipped)} skipped, {len(failed)} failed",
+                payload={"indexed": len(executed), "skipped": len(skipped), "failed": len(failed)},
+            )
+        )
+        ledger.set_job_status(job_id, "interrupted")
+        raise
+    except Exception:
+        error_text = traceback.format_exc()
+        ledger.add_event(
+            JobEvent(
+                job_id=job_id,
+                stage="complete",
+                status="failed",
+                message=f"reembed failed unexpectedly; {len(executed)} ok, {len(skipped)} skipped, {len(failed)} failed",
+                payload={"indexed": len(executed), "skipped": len(skipped), "failed": len(failed), "traceback": error_text},
+            )
+        )
+        ledger.set_job_status(job_id, "failed")
+        raise
 
 
 def plan_normalized_document(

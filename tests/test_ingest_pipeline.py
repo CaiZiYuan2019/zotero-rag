@@ -166,6 +166,46 @@ class IngestPipelineTests(unittest.TestCase):
             finally:
                 ledger.close()
 
+    def test_keyboard_interrupt_marks_ingest_job_interrupted(self) -> None:
+        """Ctrl+C during ingest execution must leave the job in 'interrupted' state."""
+        with workspace_tmpdir("ingest-interrupt-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                seed_profiles(ledger)
+                attachment = build_attachment_with_file(tmpdir, "ATT_INTERRUPT", title="Interrupt Paper")
+                ledger.upsert_attachments([attachment])
+
+                extract_manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=MarkdownStubExtractorProvider(),
+                )
+
+                with patch("zoterorag.pipeline.ingest._execute_document_stages", side_effect=KeyboardInterrupt):
+                    with self.assertRaises(KeyboardInterrupt):
+                        start_ingest_job(
+                            ledger,
+                            zotero_key="ATT_INTERRUPT",
+                            include_multimodal=False,
+                            execute=True,
+                            extract_manager=extract_manager,
+                            extract_cache_dir=tmpdir / "extract_cache",
+                            normalized_dir=tmpdir / "normalized",
+                            vector_store_dir=tmpdir / "vectors",
+                        )
+
+                jobs = ledger.list_jobs(kind="ingest")
+                self.assertEqual(1, len(jobs))
+                self.assertEqual("interrupted", jobs[0]["status"])
+
+                events = ledger.list_job_events(jobs[0]["job_id"])
+                complete_event = next((e for e in events if e["stage"] == "complete"), None)
+                self.assertIsNotNone(complete_event)
+                self.assertEqual("interrupted", complete_event["status"])
+                self.assertIn("interrupted by user", complete_event["message"])
+            finally:
+                ledger.close()
+
     def test_completed_extract_state_triggers_download_recovery(self) -> None:
         with workspace_tmpdir("ingest-completed-recovery-") as tmpdir:
             ledger = StateLedger(tmpdir / "state.sqlite")

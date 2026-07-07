@@ -356,9 +356,13 @@ attachment_key + relative_path + file_size + file_mtime
 
 ### 4.4 断点续跑
 
-建库过程可随时中断（Ctrl+C），每个文档每个阶段完成后写入 checkpoint。
+建库过程可随时中断（Ctrl+C），每个文档每个阶段完成后写入 checkpoint。正常按 Ctrl+C 后，ingest / reembed 顶层作业会被标记为 `interrupted`；如果发生未预期异常，则标记为 `failed`。
 
 ```bash
+# 查看卡住的作业
+zoterorag jobs list --kind ingest --status running
+zoterorag jobs list --kind ingest --status interrupted
+
 # 暂停/恢复/取消
 zoterorag ingest pause --job-id <JOB_ID>
 zoterorag ingest resume --job-id <JOB_ID>
@@ -368,6 +372,13 @@ zoterorag ingest cancel --job-id <JOB_ID>
 zoterorag jobs list
 zoterorag jobs show --job-id <JOB_ID>
 ```
+
+**恢复方式：**
+
+- `zoterorag ingest resume --job-id <JOB_ID>`：在原 job 上继续执行，checkpoint 会跳过已完成的文档。
+- 重新 `zoterorag ingest start --execute`：创建一个新 job，但已写入 checkpoint 的文档不会重复处理，也不会重复调用已完成的 API。
+
+**注意：** `ingest start` 的并发守卫只阻止 `status='running'` 的作业。`interrupted` 或 `failed` 不会阻止新建 job，因此如果旧 job 没 resume，直接重新 start 也是安全的。
 
 **各阶段恢复策略：**
 

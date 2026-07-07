@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from tests._support import workspace_tmpdir
 from zoterorag.config import EmbeddingProfile
@@ -44,6 +45,35 @@ class ReembedPipelineTests(unittest.TestCase):
                 self.assertEqual(1, len(second["skipped"]))
                 self.assertEqual("done", second["plan"]["documents"][0]["status"])
                 self.assertEqual("up_to_date", second["plan"]["documents"][0]["reason"])
+            finally:
+                ledger.close()
+
+    def test_keyboard_interrupt_marks_reembed_job_interrupted(self) -> None:
+        """Ctrl+C during reembed execution must leave the job in 'interrupted' state."""
+        with workspace_tmpdir("reembed-interrupt-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                seed_profiles(ledger)
+                seed_normalized_document(tmpdir, ledger)
+
+                with patch("zoterorag.pipeline.reembed.index_normalized_document", side_effect=KeyboardInterrupt):
+                    with self.assertRaises(KeyboardInterrupt):
+                        start_reembed_job(
+                            ledger,
+                            vector_store_dir=tmpdir / "vectors",
+                            profile_name="stub_text",
+                            execute=True,
+                        )
+
+                jobs = ledger.list_jobs(kind="reembed")
+                self.assertEqual(1, len(jobs))
+                self.assertEqual("interrupted", jobs[0]["status"])
+
+                events = ledger.list_job_events(jobs[0]["job_id"])
+                complete_event = next((e for e in events if e["stage"] == "complete"), None)
+                self.assertIsNotNone(complete_event)
+                self.assertEqual("interrupted", complete_event["status"])
+                self.assertIn("interrupted by user", complete_event["message"])
             finally:
                 ledger.close()
 
