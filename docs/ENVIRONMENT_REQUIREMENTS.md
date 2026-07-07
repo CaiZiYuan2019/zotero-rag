@@ -63,10 +63,11 @@ Notes:
   tests that use `fastapi.testclient` may be skipped or fail depending on the
   installed FastAPI/Starlette version.
 
-## Required For MinerU PDF Page Counting
+## Required For MinerU PDF Page Counting And Large-PDF Splitting
 
-Install before validating page counts for real PDFs or before reusing the
-legacy MinerU CLI:
+Install before validating page counts for real PDFs, before enabling automatic
+splitting of PDFs that exceed the MinerU per-request page limit, or before
+reusing the legacy MinerU CLI:
 
 ```powershell
 python -m pip install PyMuPDF>=1.24
@@ -74,9 +75,13 @@ python -m pip install PyMuPDF>=1.24
 
 Used by:
 
-- `reference/mineru_cli.py` as `fitz`
-- future real MinerU job preparation when selected page counts should be read
-  directly from PDF files instead of supplied by the caller.
+- `src/zoterorag/pdf_pages.py` as `fitz` to detect PDF page counts for
+  automatic segmentation.
+- `reference/mineru_cli.py` as `fitz`.
+
+Without PyMuPDF, the pipeline cannot automatically split large PDFs. It will
+still process PDFs when the caller supplies `selected_page_count` or when the
+PDF is within the configured `max_pages_per_extraction`.
 
 ## Required For Image Processing
 

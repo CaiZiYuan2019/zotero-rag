@@ -641,17 +641,27 @@ def _execute_extract_stage(
     if not file_path or not Path(file_path).is_file():
         raise FileNotFoundError(f"attachment file not found: {file_path}")
 
+    # Carry over segment ids from the planning stage so that interrupted
+    # split extractions can be resumed without relying on the checkpoint
+    # that we are about to overwrite with the "running" status.
+    segment_job_ids = extract_stage.get("segment_job_ids")
+    merged_artifact_dir = extract_stage.get("merged_artifact_dir")
+    is_full_rebuild = extract_stage.get("reason") == "full_rebuild"
+
+    running_payload: dict[str, Any] = {"job_id": job_id, "input_file": str(file_path)}
+    if segment_job_ids is not None:
+        running_payload["segment_job_ids"] = segment_job_ids
+    if merged_artifact_dir is not None:
+        running_payload["merged_artifact_dir"] = merged_artifact_dir
+
     ledger.checkpoint(
         attachment_key,
         "extract",
         "running",
-        {"job_id": job_id, "input_file": str(file_path)},
+        running_payload,
     )
 
     # If a previous run already split this attachment, resume the segments.
-    checkpoint = ledger.get_checkpoint(attachment_key, "extract")
-    segment_job_ids = (checkpoint.get("payload") or {}).get("segment_job_ids") if checkpoint else None
-    is_full_rebuild = extract_stage.get("reason") == "full_rebuild"
     if segment_job_ids and not is_full_rebuild:
         _progress(f"  extract: resuming {len(segment_job_ids)} segments...")
         segment_jobs = _resume_segment_jobs(segment_job_ids, extract_manager, ledger)
@@ -662,6 +672,7 @@ def _execute_extract_stage(
                 attachment_key=attachment_key,
                 segment_jobs=segment_jobs,
                 extract_cache_dir=extract_cache_dir,
+                merged_artifact_dir=merged_artifact_dir,
             )
         else:
             _checkpoint_segment_blocked(
@@ -699,17 +710,38 @@ def _execute_extract_stage(
     segments = compute_page_segments(total_pages, extract_config.max_pages_per_extraction)
     _progress(f"  extract: splitting PDF into {len(segments)} segments (pages={total_pages})...")
     segment_results: list[Any] = []
-    for segment in segments:
-        request = ExtractionRequest(
-            input_file=Path(file_path),
-            attachment_key=attachment_key,
-            selected_pages=segment.selected_pages,
-            selected_page_count=segment.page_count,
-        )
-        result = extract_manager.ensure_extraction(request)
-        result = _drive_extraction_to_completion(result, extract_manager)
-        segment_results.append(result)
-        _progress(f"  extract: segment {segment.index + 1}/{len(segments)} state={result.job['state']}")
+    segment_job_ids: list[str] = []
+    try:
+        for segment in segments:
+            request = ExtractionRequest(
+                input_file=Path(file_path),
+                attachment_key=attachment_key,
+                selected_pages=segment.selected_pages,
+                selected_page_count=segment.page_count,
+            )
+            result = extract_manager.ensure_extraction(request)
+            result = _drive_extraction_to_completion(result, extract_manager)
+            segment_results.append(result)
+            segment_job_ids.append(result.job["job_id"])
+            _progress(f"  extract: segment {segment.index + 1}/{len(segments)} state={result.job['state']}")
+    except Exception:
+        # Persist the segment ids that were submitted before the failure so
+        # that a later resume can pick up where we left off.
+        segment_jobs = [
+            job
+            for job in ledger.list_extract_jobs(limit=None)
+            if job.get("attachment_key") == attachment_key
+        ]
+        if segment_jobs:
+            failed_segment_job_ids = [job["job_id"] for job in segment_jobs]
+            _checkpoint_segment_blocked(
+                ledger=ledger,
+                job_id=job_id,
+                attachment_key=attachment_key,
+                segment_jobs=segment_jobs,
+                segment_job_ids=failed_segment_job_ids,
+            )
+        raise
 
     segment_jobs = [r.job for r in segment_results]
     if not _all_jobs_downloaded(segment_jobs):
@@ -728,6 +760,7 @@ def _execute_extract_stage(
         attachment_key=attachment_key,
         segment_jobs=segment_jobs,
         extract_cache_dir=extract_cache_dir,
+        merged_artifact_dir=merged_artifact_dir,
     )
 
 
@@ -775,11 +808,12 @@ def _merge_and_checkpoint_segments(
     attachment_key: str,
     segment_jobs: list[dict[str, Any]],
     extract_cache_dir: Path,
+    merged_artifact_dir: str | Path | None = None,
 ) -> None:
     """Merge segment artifacts and persist a done checkpoint."""
 
     segment_job_ids = [job["job_id"] for job in segment_jobs]
-    merged_dir = _merged_artifact_dir(extract_cache_dir, attachment_key)
+    merged_dir = Path(merged_artifact_dir) if merged_artifact_dir else _merged_artifact_dir(extract_cache_dir, attachment_key)
 
     # Skip re-merging if the merged artifact already exists and looks valid.
     merged_md = merged_dir / "merged_full.md"

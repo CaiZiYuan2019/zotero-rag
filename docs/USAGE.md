@@ -79,6 +79,16 @@ host = "127.0.0.1"                               # API 监听地址
 port = 8765                                       # API 端口
 require_api_token = true                          # 是否要求 token 鉴权
 
+[extract]
+split_large_pdfs = true                           # 是否自动拆分超大 PDF
+max_pages_per_extraction = 200                    # 单次 MinerU 转换的最大页数
+
+# 说明：
+# - 当 PDF 页数超过 max_pages_per_extraction 且 split_large_pdfs=true 时，
+#   系统会自动按页码范围（如 1-200, 201-400）拆分为多个 MinerU 任务提交，
+#   本地合并结果后再标准化。
+# - 自动拆分需要 PyMuPDF（fitz）读取 PDF 页数；未安装时该功能自动降级为单任务。
+
 [[embedding_profiles]]
 name = "qwen3vl_cloud_2560_text"
 provider = "dashscope"
@@ -369,6 +379,11 @@ zoterorag jobs show --job-id <JOB_ID>
 | 已解压，未标准化 | 继续 normalize |
 | 已标准化，未向量化 | 继续 embed |
 | 全部完成 | 跳过（不重复 API 调用） |
+| 超大 PDF 部分 segment 完成 | 继续等待/重试未完成的 segment，全部下载后本地合并 |
+
+**超大 PDF 分片续传：**
+
+超过 `max_pages_per_extraction`（默认 200 页）的 PDF 会被拆分为多个 segment，每个 segment 是一个独立的 `extract_jobs` 记录。中断后重新执行 `ingest start --execute` 或 `ingest resume` 时，系统会检查所有 segment 的状态：已完成的直接复用，未完成的继续 poll/download，全部 segment 就绪后再执行本地合并与标准化。
 
 **Embedding 去重：** 通过 batch hash（profile hash + document ID + chunk hashes）检测已完成的 embedding batch，命中时返回 `reused_existing=true`，完全不调用 API。
 
@@ -913,6 +928,8 @@ shadow DB ──→ scan/classify ──→ attachments (state DB)
                                     ▼
                               extract_jobs ──→ MinerU API ──→ extract_cache/
                                     │
+                                    │  （超大 PDF 拆分为多个 segment jobs，
+                                    │   本地合并后再进入 normalize）
                                     ▼
                               normalized_artifacts ──→ normalize ──→ normalized/
                                     │

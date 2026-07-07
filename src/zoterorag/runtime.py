@@ -108,5 +108,6 @@ def config_as_public_dict(config: AppConfig) -> dict[str, Any]:
             "embedding_cache_dir": str(config.paths.embedding_cache_dir),
         },
         "server": asdict(config.server),
+        "extract": asdict(config.extract),
         "embedding_profiles": [asdict(profile) for profile in config.embedding_profiles],
     }

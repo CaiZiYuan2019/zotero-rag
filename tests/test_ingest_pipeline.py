@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import unittest
+from typing import Any
 
 from tests._support import workspace_tmpdir
 from zoterorag.config import EmbeddingProfile
@@ -437,6 +438,107 @@ class IngestPipelineTests(unittest.TestCase):
                 self.assertIsNotNone(artifact)
                 self.assertEqual(segment_job_ids, artifact["payload"]["segment_job_ids"])
                 self.assertGreater(len(ledger.list_chunks("ATT_SPLIT", chunk_type="text")), 0)
+            finally:
+                ledger.close()
+
+    def test_split_large_pdf_resumes_segments(self) -> None:
+        with workspace_tmpdir("ingest-split-resume-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                seed_profiles(ledger)
+                attachment = build_attachment_with_file(
+                    tmpdir, "ATT_SPLIT_RESUME", title="Long Paper Resume"
+                )
+                ledger.upsert_attachments([attachment])
+
+                class HangingSegmentProvider(MarkdownStubExtractorProvider):
+                    def submit(
+                        self,
+                        input_file: Path,
+                        options_hash: str,
+                        *,
+                        options: dict[str, Any] | None = None,
+                        api_key: str | None = None,
+                    ) -> ExtractJobState:
+                        page_ranges = (options or {}).get("page_ranges", "")
+                        if page_ranges == "1-200":
+                            return ExtractJobState(external_job_id="seg1", state="completed")
+                        # Pretend segment 2 is accepted but still processing.
+                        return ExtractJobState(external_job_id="seg2", state="completed")
+
+                    def poll(
+                        self,
+                        external_job_id: str,
+                        *,
+                        api_key: str | None = None,
+                        options: dict[str, Any] | None = None,
+                    ) -> ExtractJobState:
+                        if external_job_id == "seg1":
+                            return ExtractJobState(external_job_id=external_job_id, state="completed")
+                        # Segment 2 is not ready yet during the first run.
+                        return ExtractJobState(
+                            external_job_id=external_job_id,
+                            state="failed",
+                            message="simulated pending",
+                        )
+
+                extract_manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=HangingSegmentProvider(),
+                )
+                extract_config = ExtractConfig(split_large_pdfs=True, max_pages_per_extraction=200)
+
+                with patch("zoterorag.pipeline.ingest.get_pdf_page_count", return_value=250):
+                    result = start_ingest_job(
+                        ledger,
+                        zotero_key="ATT_SPLIT_RESUME",
+                        include_multimodal=False,
+                        execute=True,
+                        extract_manager=extract_manager,
+                        extract_cache_dir=tmpdir / "extract_cache",
+                        normalized_dir=tmpdir / "normalized",
+                        vector_store_dir=tmpdir / "vectors",
+                        extract_config=extract_config,
+                    )
+
+                # Segment 2 is still running, so the ingest completes with errors.
+                self.assertEqual("completed_with_errors", result["job"]["status"])
+                checkpoint = ledger.get_checkpoint("ATT_SPLIT_RESUME", "extract")
+                self.assertEqual("blocked", checkpoint["status"])
+                segment_job_ids = checkpoint["payload"]["segment_job_ids"]
+                self.assertEqual(2, len(segment_job_ids))
+
+                # Simulate segment 2 completing remotely.
+                seg2_job = ledger.get_extract_job(job_id=segment_job_ids[1])
+                ledger.set_extract_job_state(
+                    seg2_job["job_id"],
+                    state="completed",
+                    local_stage="download",
+                    external_job_id=seg2_job["external_job_id"],
+                )
+
+                # Resume with a normal provider that can download segment 2.
+                normal_manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=MarkdownStubExtractorProvider(),
+                )
+                with patch("zoterorag.pipeline.ingest.get_pdf_page_count", return_value=250):
+                    result2 = start_ingest_job(
+                        ledger,
+                        zotero_key="ATT_SPLIT_RESUME",
+                        include_multimodal=False,
+                        execute=True,
+                        extract_manager=normal_manager,
+                        extract_cache_dir=tmpdir / "extract_cache",
+                        normalized_dir=tmpdir / "normalized",
+                        vector_store_dir=tmpdir / "vectors",
+                        extract_config=extract_config,
+                    )
+
+                self.assertEqual("completed", result2["job"]["status"])
+                self.assertIsNotNone(ledger.get_normalized_artifact("ATT_SPLIT_RESUME"))
             finally:
                 ledger.close()
 

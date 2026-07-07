@@ -23,7 +23,7 @@ from ..pipeline import (
 )
 from ..providers import build_qwen_embedding_provider, provider_readiness
 from ..review import explain_attachment_review
-from ..runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime, scan_zotero_shadow
+from ..runtime import config_as_public_dict, initialize_runtime, scan_zotero_shadow
 from ..search import fulltext_search, metadata_search, normalize_query_image
 from .security import AccessDenied, verify_api_access
 

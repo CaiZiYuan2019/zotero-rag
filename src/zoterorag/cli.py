@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 import sys
+from typing import Any
 
 from .backup import create_backup, plan_restore_backup, resolve_backup_manifest, restore_backup, verify_manifest_files
 from .api.server import serve_api, validate_serve_access
@@ -443,7 +444,6 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     if args.execute:
                         from .providers import build_mineru_provider
-                        from .extractors import ExtractorKeyPool, ExtractionManager
 
                         resolved_env = _resolve_env_path(args.env, project_root)
                         key_pool = ExtractorKeyPool.from_env_file(resolved_env)
