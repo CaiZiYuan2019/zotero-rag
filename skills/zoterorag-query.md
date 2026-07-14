@@ -125,6 +125,7 @@ Read data/normalized/<document_id>/document.md
 | 元数据检索 | `.conda/Scripts/zoterorag.exe search-metadata "关键词"` |
 | 全文检索（文本 chunk） | `.conda/Scripts/zoterorag.exe search-fulltext "关键词" --chunk-type text` |
 | 向量检索（文本） | `.conda/Scripts/zoterorag.exe search-vector "问题" --mode text --top-k 20 --embedding-provider qwen3vl --consumer llm_text --image-return none` |
+| 向量检索（多模态图像） | `.conda/Scripts/zoterorag.exe search-vector "图像描述" --mode multimodal --top-k 15 --embedding-provider qwen3vl --consumer llm_multimodal --image-return file_ref` |
 | 查看文档信息 | `.conda/Scripts/zoterorag.exe documents show <document_id>` |
 | 文档内关键词定位 | `Grep --path data/normalized/<document_id>/document.md --pattern "关键词" --output_mode content -n` |
 
@@ -132,6 +133,8 @@ Read data/normalized/<document_id>/document.md
 
 - 将检索结果临时保存到 `.tmp/` 目录，避免重复调用 API；
 - 对关键文档使用 `Read` 分段读取，优先读取摘要、引言、结果和讨论部分；
+- 对多模态检索命中的图像，使用 `ReadMediaFile` 读取原始图像进行视觉核验；
+- 如需在报告中引用图像，建议复制到 `report/<YYYYMMDD>/images/` 目录并在 Markdown 中使用相对路径链接，避免直接修改 `data/normalized/` 原始库；
 - 使用表格对多个文献的发现进行对比；
 - 所有结论必须标注文献来源（文档 ID 或原文引用），避免无依据概括。
 
@@ -140,4 +143,4 @@ Read data/normalized/<document_id>/document.md
 - **环境路径**：Windows 下 Bash 工具使用 Git Bash，命令中应使用 Unix 路径分隔符 `/` 和 `.conda/Scripts/zoterorag.exe`。
 - **API 调用**：`search-vector` 在 `--embedding-provider qwen3vl` 时会调用 DashScope embedding API，注意避免在短时间内发起大量请求。
 - **向量模型**：单次查询只使用一个 embedding profile，不要跨模型合并结果。
-- **无结果情况**：若检索结果不相关，应尝试同义词、更具体的短语或反向提问（如从功能提问改为从结构提问）。
+- **无结果情况**：若检索结果不相关，应尝试同义词、更具体的短语、中英文、反向提问（如从功能提问改为从结构提问）。
