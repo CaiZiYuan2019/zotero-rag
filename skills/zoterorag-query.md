@@ -62,7 +62,25 @@
 
 建议从多个角度提问，以覆盖功能、机制、结构、方法等维度。
 
-### 步骤 5：定位关键文档并精读原文
+### 步骤 5：多模态图像检索（可选）
+
+当查询涉及论文中的图像时，可使用 `search-vector` 的多模态模式直接对图像内容进行语义检索。
+
+```bash
+.conda/Scripts/zoterorag.exe search-vector "自然语言图像描述" \
+  --mode multimodal \
+  --top-k 15 \
+  --embedding-provider qwen3vl \
+  --consumer llm_multimodal \
+  --image-return file_ref \
+  --max-images 10
+```
+
+返回结果中的 `images[].file_ref` 为图像在归一化目录下的相对路径（如 `images/img001.jpg`），完整路径为 `data/normalized/<document_id>/images/<file_ref>`。
+
+为确认图像对应的元信息，建议同时运行文本模式向量检索或 `search-fulltext` 对 caption、图注及方法部分进行交叉验证。注意查看图像进行确认。
+
+### 步骤 6：定位关键文档并精读原文
 
 通过检索结果中的 `document_id`，使用 `documents show` 查看文档信息，并直接读取 `data/normalized/<document_id>/document.md`。
 
@@ -77,15 +95,16 @@ Read data/normalized/<document_id>/document.md
 
 可使用 `Grep` 在文档内定位关键词具体位置，再分段精读。
 
-### 步骤 6：交叉验证
+### 步骤 7：交叉验证
 
 对核心结论应至少通过两种检索方式验证：
 
-- 向量检索发现相关段落；
+- 向量检索发现相关段落或图像；
 - 全文检索确认术语出现频率和上下文；
-- 必要时通过 `documents show` 读取原文核对。
+- 必要时通过 `documents show` 读取原文核对；
+- 对多模态检索命中的图像，必要时使用 `ReadMediaFile` 读取原始图像进行视觉核验。
 
-### 步骤 7：整理并输出报告
+### 步骤 8：整理并输出报告
 
 将检索结果整理为 Markdown 报告，建议包含：
 
