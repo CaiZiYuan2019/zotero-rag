@@ -15,11 +15,23 @@ def fulltext_search(
     consumer: str = "llm_text",
     image_return: str = "none",
     rerank: bool = False,
+    sort_by: str = "score",
+    match_mode: str = "all",
 ) -> list[dict[str, Any]]:
-    """Search normalized Markdown chunks without embeddings or external APIs."""
+    """Search normalized Markdown chunks without embeddings or external APIs.
+
+    ``sort_by`` accepts ``score`` (default custom chunk score) or ``bm25``;
+    bm25 is exposed larger-is-better.
+    """
 
     ensure_rerank_disabled(rerank)
-    rows = ledger.search_chunks_fulltext(query, chunk_type=chunk_type, limit=limit)
+    rows = ledger.search_chunks_fulltext(
+        query,
+        chunk_type=chunk_type,
+        limit=limit,
+        sort_by=sort_by,
+        match_mode=match_mode,
+    )
     results = []
     for row in rows:
         images = []

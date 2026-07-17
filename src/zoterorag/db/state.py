@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 from pathlib import Path
+import re
 import sqlite3
 import threading
 import time
@@ -19,8 +20,232 @@ logger = logging.getLogger(__name__)
 SCHEMA_VERSION = 1
 
 
+# Ordered column list for the standalone attachments FTS5 index. The migration
+# detects drift against this exact list and upsert/backfill INSERTs must stay in
+# sync with it.
+ATTACHMENTS_FTS_COLUMNS = (
+    "attachment_key",
+    "parent_key",
+    "relative_path",
+    "title",
+    "abstract",
+    "date_value",
+    "url",
+    "classification",
+    "source_quality",
+    "creators",
+    "collections",
+    "tags",
+    "publication_title",
+    "doi",
+)
+
+_ATTACHMENTS_FTS_INSERT_SQL = (
+    "INSERT INTO attachments_fts(rowid, "
+    + ", ".join(ATTACHMENTS_FTS_COLUMNS)
+    + ") VALUES ("
+    + ", ".join("?" for _ in range(len(ATTACHMENTS_FTS_COLUMNS) + 1))
+    + ")"
+)
+
+# Shared attachment SELECT projection so list/get/search all decode the same
+# columns (including the bibliographic additions).
+_ATTACHMENT_SELECT_COLUMNS = """attachment_key, parent_key, content_type, relative_path,
+                   title, abstract, date_value, url, classification,
+                   source_quality, reasons_json, file_path, file_exists,
+                   file_size, file_mtime, metadata_json, content_fingerprint,
+                   scan_status, first_seen_at, last_seen_at, updated_at,
+                   creators_json, collections_json, tags_json, item_type,
+                   publication_title, doi, date_added, date_modified,
+                   date_year, date_normalized"""
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _fts_columns_from_sql(sql: str) -> list[str]:
+    """Extract FTS5 column names from a stored CREATE VIRTUAL TABLE statement.
+
+    Only the plain column identifiers are returned; FTS5 options such as
+    ``content=`` or ``tokenize=`` (which contain ``=``) are skipped.
+    """
+
+    if not sql:
+        return []
+    start = sql.find("(")
+    end = sql.rfind(")")
+    if start == -1 or end == -1 or end <= start:
+        return []
+    inner = sql[start + 1 : end]
+    columns: list[str] = []
+    for part in inner.split(","):
+        token = part.strip()
+        if not token or "=" in token:
+            continue
+        token = token.split()[0].strip().strip('"').strip("`").strip("[").strip("]")
+        if token:
+            columns.append(token)
+    return columns
+
+
+def _expand_json_text(raw: str | None, *, key: str | None = None) -> str:
+    """Expand a JSON array column into space-joined searchable text.
+
+    ``key`` selects a field when the array holds objects (e.g. collections hold
+    ``{"collection_name": ...}``); otherwise scalar string elements are joined.
+    """
+
+    if not raw:
+        return ""
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    parts: list[str] = []
+    if isinstance(data, list):
+        for element in data:
+            if key is not None and isinstance(element, dict):
+                value = element.get(key)
+            else:
+                value = element
+            if value:
+                parts.append(str(value))
+    return " ".join(parts)
+
+
+def _biblio_fts_text(
+    creators_json: str | None,
+    collections_json: str | None,
+    tags_json: str | None,
+) -> tuple[str, str, str]:
+    creators_text = _expand_json_text(creators_json)
+    collections_text = _expand_json_text(collections_json, key="collection_name")
+    tags_text = _expand_json_text(tags_json)
+    return creators_text, collections_text, tags_text
+
+
+def normalize_date(value: str | None) -> tuple[int | None, str | None]:
+    """Return ``(year, normalized)`` parsed loosely from a Zotero date string.
+
+    Zotero stores dirty, human-entered dates. This best-effort parser extracts a
+    4-digit year and, when possible, a ``YYYY`` / ``YYYY-MM`` / ``YYYY-MM-DD``
+    normalized form. On failure it returns ``(None, original_or_None)`` so the
+    caller keeps the raw string for display while range filters simply skip it.
+    """
+
+    if value is None:
+        return None, None
+    text = str(value).strip()
+    if not text:
+        return None, None
+
+    iso = re.match(r"^\s*(\d{4})-(\d{2})-(\d{2})", text)
+    if iso:
+        year = int(iso.group(1))
+        return year, f"{iso.group(1)}-{iso.group(2)}-{iso.group(3)}"
+    ym = re.match(r"^\s*(\d{4})-(\d{2})(?!\d)", text)
+    if ym:
+        return int(ym.group(1)), f"{ym.group(1)}-{ym.group(2)}"
+    year_match = re.search(r"(\d{4})", text)
+    if year_match:
+        year = int(year_match.group(1))
+        if 1000 <= year <= 9999:
+            return year, str(year)
+    return None, text or None
+
+
+_METADATA_SORT_FIELDS = frozenset({"score", "bm25", "date", "date_added", "title"})
+# Upper bound on rows materialized by the pure-filter / candidate load path so
+# author/tag Python filtering never scans an unbounded table.
+_METADATA_SCAN_CAP = 5000
+
+
+@dataclass(frozen=True)
+class _MetadataFilters:
+    classification: str | None
+    date_from: str | None
+    date_to: str | None
+    authors: list[str]
+    collections: list[str]
+    tags: list[str]
+    item_type: str | None
+    publication_title: str | None
+    doi: str | None
+    attachment_keys: list[str] | None
+
+    def has_any(self) -> bool:
+        return any(
+            (
+                self.classification is not None,
+                self.date_from is not None,
+                self.date_to is not None,
+                bool(self.authors),
+                bool(self.collections),
+                bool(self.tags),
+                self.item_type is not None,
+                self.publication_title is not None,
+                self.doi is not None,
+                self.attachment_keys is not None,
+            )
+        )
+
+
+def _date_bound(value: str, *, upper: bool) -> str:
+    """Normalize a date filter bound for string comparison on date_normalized.
+
+    Year-only ("2019") and year-month ("2019-05") upper bounds are extended to
+    be inclusive of the whole period so ``date_to="2019"`` still matches
+    ``2019-12-31``.
+    """
+
+    _, normalized = normalize_date(value)
+    normalized = normalized or str(value).strip()
+    if not upper:
+        return normalized
+    if re.fullmatch(r"\d{4}", normalized):
+        return f"{normalized}-12-31"
+    if re.fullmatch(r"\d{4}-\d{2}", normalized):
+        return f"{normalized}-31"
+    return normalized
+
+
+def _passes_python_filters(item: dict[str, Any], filters: "_MetadataFilters") -> bool:
+    """Apply author (substring) and tag (exact, case-insensitive) filters.
+
+    These run on decoded structured lists rather than raw JSON strings so they
+    cannot match JSON punctuation.
+    """
+
+    if filters.authors:
+        creators = [str(name).casefold() for name in (item.get("creators") or [])]
+        for wanted in filters.authors:
+            needle = wanted.casefold()
+            if not any(needle in name for name in creators):
+                return False
+    if filters.tags:
+        tags = {str(tag).casefold() for tag in (item.get("tags") or [])}
+        for wanted in filters.tags:
+            if wanted.casefold() not in tags:
+                return False
+    return True
+
+
+def _sort_metadata_results(
+    results: list[dict[str, Any]], *, sort_by: str, sort_order: str
+) -> None:
+    reverse = sort_order == "desc"
+    if sort_by in {"score", "bm25"}:
+        results.sort(
+            key=lambda item: (item.get("score", 0.0), str(item.get("title") or "").casefold()),
+            reverse=reverse,
+        )
+    elif sort_by == "date":
+        results.sort(key=lambda item: str(item.get("date_normalized") or ""), reverse=reverse)
+    elif sort_by == "date_added":
+        results.sort(key=lambda item: str(item.get("date_added") or ""), reverse=reverse)
+    elif sort_by == "title":
+        results.sort(key=lambda item: str(item.get("title") or "").casefold(), reverse=reverse)
 
 
 @dataclass(frozen=True)
@@ -305,6 +530,55 @@ class StateLedger:
                     "last_seen_at": "TEXT",
                 },
             )
+            # Bibliographic fields added by the retrieval enhancement. They live
+            # in dedicated columns (never in metadata_json) so biblio-only
+            # changes cannot flip attachment_fingerprint()/scan_status.
+            self._ensure_columns(
+                "attachments",
+                {
+                    "creators_json": "TEXT NOT NULL DEFAULT '[]'",
+                    "collections_json": "TEXT NOT NULL DEFAULT '[]'",
+                    "tags_json": "TEXT NOT NULL DEFAULT '[]'",
+                    "item_type": "TEXT",
+                    "publication_title": "TEXT",
+                    "doi": "TEXT",
+                    "date_added": "TEXT",
+                    "date_modified": "TEXT",
+                    "date_year": "INTEGER",
+                    "date_normalized": "TEXT",
+                },
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS zotero_collections (
+                    collection_key TEXT PRIMARY KEY,
+                    collection_name TEXT NOT NULL,
+                    parent_collection_key TEXT,
+                    library_id INTEGER
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS attachment_collections (
+                    attachment_key TEXT NOT NULL,
+                    collection_key TEXT NOT NULL,
+                    PRIMARY KEY (attachment_key, collection_key)
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_attachment_collections_collection
+                ON attachment_collections(collection_key)
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_attachments_item_type
+                ON attachments(item_type)
+                """
+            )
             # This is the durable review queue produced from the Zotero shadow.
             # It stores classification decisions and file facts only; no PDF
             # content, embedding vectors, or expensive extraction payloads live
@@ -452,18 +726,30 @@ class StateLedger:
                 "SELECT name, sql FROM sqlite_master WHERE type='table' AND name IN ('attachments_fts', 'chunks_fts')"
             ).fetchall()
         }
-        if "attachments_fts" in existing and "content=" in existing["attachments_fts"]:
-            self.conn.execute("DROP TABLE attachments_fts")
-            existing.pop("attachments_fts", None)
+
+        # attachments_fts: parse the stored CREATE SQL for its column set and
+        # drop/recreate whenever it no longer matches the expected columns, is
+        # an old external-content (content=) table, or is missing entirely.
+        # Column detection intentionally parses sqlite_master.sql rather than
+        # using PRAGMA table_info to avoid FTS5 hidden/rank columns.
+        attach_sql = existing.get("attachments_fts")
+        needs_rebuild = attach_sql is None
+        if attach_sql is not None:
+            if "content=" in attach_sql:
+                needs_rebuild = True
+            elif _fts_columns_from_sql(attach_sql) != list(ATTACHMENTS_FTS_COLUMNS):
+                needs_rebuild = True
+        if needs_rebuild and attach_sql is not None:
+            self.conn.execute("DROP TABLE IF EXISTS attachments_fts")
+
         if "chunks_fts" in existing and "content=" in existing["chunks_fts"]:
             self.conn.execute("DROP TABLE chunks_fts")
             existing.pop("chunks_fts", None)
 
         self.conn.execute(
-            """
+            f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS attachments_fts USING fts5(
-                attachment_key, parent_key, relative_path, title, abstract,
-                date_value, url, classification, source_quality
+                {", ".join(ATTACHMENTS_FTS_COLUMNS)}
             )
             """
         )
@@ -478,18 +764,7 @@ class StateLedger:
             "SELECT count(*) FROM attachments_fts"
         ).fetchone()[0]
         if attachments_fts_count == 0:
-            self.conn.execute(
-                """
-                INSERT INTO attachments_fts(
-                    rowid, attachment_key, parent_key, relative_path, title,
-                    abstract, date_value, url, classification, source_quality
-                )
-                SELECT
-                    rowid, attachment_key, parent_key, relative_path, title,
-                    abstract, date_value, url, classification, source_quality
-                FROM attachments
-                """
-            )
+            self._backfill_attachments_fts()
         chunks_fts_count = self.conn.execute(
             "SELECT count(*) FROM chunks_fts"
         ).fetchone()[0]
@@ -500,6 +775,75 @@ class StateLedger:
                 SELECT rowid, chunk_id, document_id, text FROM chunks
                 """
             )
+
+    def _backfill_attachments_fts(self) -> None:
+        """Rebuild every attachments_fts row from the attachments table.
+
+        JSON list columns (creators/collections/tags) are expanded into plain
+        searchable text here so FTS5 can match author names, tag labels, and
+        collection names without indexing raw JSON punctuation.
+        """
+
+        rows = self.conn.execute(
+            """
+            SELECT rowid, attachment_key, parent_key, relative_path, title,
+                   abstract, date_value, url, classification, source_quality,
+                   creators_json, collections_json, tags_json,
+                   publication_title, doi
+            FROM attachments
+            """
+        ).fetchall()
+        for row in rows:
+            creators_text, collections_text, tags_text = _biblio_fts_text(
+                row["creators_json"], row["collections_json"], row["tags_json"]
+            )
+            self.conn.execute(
+                _ATTACHMENTS_FTS_INSERT_SQL,
+                (
+                    row["rowid"],
+                    row["attachment_key"],
+                    row["parent_key"],
+                    row["relative_path"],
+                    row["title"],
+                    row["abstract"],
+                    row["date_value"],
+                    row["url"],
+                    row["classification"],
+                    row["source_quality"],
+                    creators_text,
+                    collections_text,
+                    tags_text,
+                    row["publication_title"],
+                    row["doi"],
+                ),
+            )
+
+    def rebuild_attachments_fts(self, force: bool = False) -> int:
+        """Drop and rebuild attachments_fts from scratch, returning row count.
+
+        This only touches the FTS index and never triggers extraction or
+        embedding. ``force`` drops the table first; otherwise it clears the
+        existing rows before backfilling.
+        """
+
+        with self.conn:
+            try:
+                if force:
+                    self.conn.execute("DROP TABLE IF EXISTS attachments_fts")
+                    self.conn.execute(
+                        f"""
+                        CREATE VIRTUAL TABLE attachments_fts USING fts5(
+                            {", ".join(ATTACHMENTS_FTS_COLUMNS)}
+                        )
+                        """
+                    )
+                else:
+                    self.conn.execute("DELETE FROM attachments_fts")
+                self._backfill_attachments_fts()
+            except sqlite3.Error:
+                logger.exception("attachments_fts rebuild failed")
+                return 0
+            return int(self.conn.execute("SELECT count(*) FROM attachments_fts").fetchone()[0])
 
     def _ensure_columns(self, table_name: str, columns: dict[str, str]) -> None:
         existing = {
@@ -989,6 +1333,16 @@ class StateLedger:
                 else:
                     scan_status = "unchanged"
                     first_seen_at = existing["first_seen_at"] or now
+                creators_json = json.dumps(
+                    item.get("authors", []), ensure_ascii=False, sort_keys=True, default=str
+                )
+                collections_json = json.dumps(
+                    item.get("collections", []), ensure_ascii=False, sort_keys=True, default=str
+                )
+                tags_json = json.dumps(
+                    item.get("tags", []), ensure_ascii=False, sort_keys=True, default=str
+                )
+                date_year, date_normalized = normalize_date(item.get("date"))
                 self.conn.execute(
                     """
                     INSERT INTO attachments(
@@ -996,9 +1350,13 @@ class StateLedger:
                         title, abstract, date_value, url, classification,
                         source_quality, reasons_json, file_path, file_exists,
                         file_size, file_mtime, metadata_json, content_fingerprint,
-                        scan_status, first_seen_at, last_seen_at, updated_at
+                        scan_status, first_seen_at, last_seen_at, updated_at,
+                        creators_json, collections_json, tags_json, item_type,
+                        publication_title, doi, date_added, date_modified,
+                        date_year, date_normalized
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(attachment_key) DO UPDATE SET
                         parent_key = excluded.parent_key,
                         content_type = excluded.content_type,
@@ -1019,7 +1377,17 @@ class StateLedger:
                         scan_status = excluded.scan_status,
                         first_seen_at = COALESCE(attachments.first_seen_at, excluded.first_seen_at),
                         last_seen_at = excluded.last_seen_at,
-                        updated_at = excluded.updated_at
+                        updated_at = excluded.updated_at,
+                        creators_json = excluded.creators_json,
+                        collections_json = excluded.collections_json,
+                        tags_json = excluded.tags_json,
+                        item_type = excluded.item_type,
+                        publication_title = excluded.publication_title,
+                        doi = excluded.doi,
+                        date_added = excluded.date_added,
+                        date_modified = excluded.date_modified,
+                        date_year = excluded.date_year,
+                        date_normalized = excluded.date_normalized
                     """,
                     (
                         item["attachment_key"],
@@ -1043,28 +1411,48 @@ class StateLedger:
                         first_seen_at,
                         now,
                         now,
+                        creators_json,
+                        collections_json,
+                        tags_json,
+                        item.get("item_type"),
+                        item.get("publication_title"),
+                        item.get("doi"),
+                        item.get("date_added"),
+                        item.get("date_modified"),
+                        date_year,
+                        date_normalized,
                     ),
                 )
-                self.conn.execute(
-                    """
-                    DELETE FROM attachments_fts
-                    WHERE rowid = (SELECT rowid FROM attachments WHERE attachment_key = ?)
-                    """,
+                rowid_row = self.conn.execute(
+                    "SELECT rowid FROM attachments WHERE attachment_key = ?",
                     (item["attachment_key"],),
+                ).fetchone()
+                self.conn.execute(
+                    "DELETE FROM attachments_fts WHERE rowid = ?",
+                    (rowid_row["rowid"],),
+                )
+                creators_text, collections_text, tags_text = _biblio_fts_text(
+                    creators_json, collections_json, tags_json
                 )
                 self.conn.execute(
-                    """
-                    INSERT INTO attachments_fts(
-                        rowid, attachment_key, parent_key, relative_path, title,
-                        abstract, date_value, url, classification, source_quality
-                    )
-                    SELECT
-                        rowid, attachment_key, parent_key, relative_path, title,
-                        abstract, date_value, url, classification, source_quality
-                    FROM attachments
-                    WHERE attachment_key = ?
-                    """,
-                    (item["attachment_key"],),
+                    _ATTACHMENTS_FTS_INSERT_SQL,
+                    (
+                        rowid_row["rowid"],
+                        item["attachment_key"],
+                        item.get("parent_key"),
+                        item.get("relative_path"),
+                        item.get("title"),
+                        item.get("abstract"),
+                        item.get("date"),
+                        item.get("url"),
+                        item["classification"],
+                        item.get("source_quality", "unknown"),
+                        creators_text,
+                        collections_text,
+                        tags_text,
+                        item.get("publication_title"),
+                        item.get("doi"),
+                    ),
                 )
                 count += 1
         return count
@@ -1074,12 +1462,8 @@ class StateLedger:
         classification: str | None = None,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
-        query = """
-            SELECT attachment_key, parent_key, content_type, relative_path,
-                   title, abstract, date_value, url, classification,
-                   source_quality, reasons_json, file_path, file_exists,
-                   file_size, file_mtime, metadata_json, content_fingerprint,
-                   scan_status, first_seen_at, last_seen_at, updated_at
+        query = f"""
+            SELECT {_ATTACHMENT_SELECT_COLUMNS}
             FROM attachments
         """
         params: list[Any] = []
@@ -1095,12 +1479,8 @@ class StateLedger:
 
     def get_attachment(self, attachment_key: str) -> dict[str, Any] | None:
         row = self.conn.execute(
-            """
-            SELECT attachment_key, parent_key, content_type, relative_path,
-                   title, abstract, date_value, url, classification,
-                   source_quality, reasons_json, file_path, file_exists,
-                   file_size, file_mtime, metadata_json, content_fingerprint,
-                   scan_status, first_seen_at, last_seen_at, updated_at
+            f"""
+            SELECT {_ATTACHMENT_SELECT_COLUMNS}
             FROM attachments
             WHERE attachment_key = ?
             """,
@@ -1114,41 +1494,127 @@ class StateLedger:
         *,
         classification: str | None = None,
         limit: int = 10,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        authors: list[str] | None = None,
+        collections: list[str] | None = None,
+        tags: list[str] | None = None,
+        item_type: str | None = None,
+        publication_title: str | None = None,
+        doi: str | None = None,
+        attachment_keys: list[str] | None = None,
+        sort_by: str = "score",
+        sort_order: str = "desc",
+        match_mode: str = "all",
     ) -> list[dict[str, Any]]:
-        """Direct metadata search over scanned Zotero shadow results.
+        """Metadata search with a text path and a pure-filter path.
 
-        Uses a standalone FTS5 index when available and falls back to the
-        original parameterized LIKE search if FTS5 is unavailable or returns no
-        results. This keeps the API stable while avoiding full-table scans.
+        * Text path (query has usable terms): FTS5 ``MATCH`` (LIKE fallback) to
+          gather candidate keys, then structured filters are applied, then
+          sorting/truncation. ``sort_by="bm25"`` is only honoured here.
+        * Pure-filter path (empty query but at least one filter or
+          ``attachment_keys``): structured SQL over ``attachments`` /
+          ``attachment_collections`` without touching FTS.
+        * Empty query and no filters returns ``[]`` (never scans the library).
+
+        ``collections`` filters exclusively through ``attachment_collections``
+        (values are collection keys). ``date_from`` / ``date_to`` compare against
+        ``date_normalized``; dirty, unnormalized dates may be missed.
         """
 
-        terms = [term.casefold() for term in query.split() if term.strip()]
-        if not terms:
+        if sort_by not in _METADATA_SORT_FIELDS:
+            raise ValueError(f"invalid sort_by: {sort_by}")
+        if sort_order not in {"asc", "desc"}:
+            raise ValueError(f"invalid sort_order: {sort_order}")
+
+        from ..search.query_parser import build_fts_query, parse_query, scoring_terms
+
+        plan = parse_query(query, match_mode=match_mode)
+        terms = scoring_terms(plan)
+        has_query = not plan.is_empty
+        filters = _MetadataFilters(
+            classification=classification,
+            date_from=date_from,
+            date_to=date_to,
+            authors=[a for a in (authors or []) if a and a.strip()],
+            collections=[c for c in (collections or []) if c and c.strip()],
+            tags=[t for t in (tags or []) if t and t.strip()],
+            item_type=item_type,
+            publication_title=publication_title,
+            doi=doi,
+            attachment_keys=None if attachment_keys is None else list(attachment_keys),
+        )
+        has_filters = filters.has_any()
+
+        if not has_query and not has_filters:
             return []
 
-        def _load_rows_from_attachments(keys: list[str]) -> list[sqlite3.Row]:
-            if not keys:
-                return []
-            where = f"attachment_key IN ({','.join('?' for _ in keys)})"
-            params: list[Any] = list(keys)
-            if classification is not None:
-                where += " AND classification = ?"
-                params.append(classification)
-            sql = f"""
-                SELECT attachment_key, parent_key, content_type, relative_path,
-                       title, abstract, date_value, url, classification,
-                       source_quality, reasons_json, file_path, file_exists,
-                       file_size, file_mtime, metadata_json, content_fingerprint,
-                       scan_status, first_seen_at, last_seen_at, updated_at
-                FROM attachments
-                WHERE {where}
-                LIMIT ?
-            """
-            params.append(limit * 10)
-            return self.conn.execute(sql, params).fetchall()
+        bm25_scores: dict[str, float] = {}
+        candidate_keys: list[str] | None = None
 
+        if has_query:
+            want_bm25 = sort_by == "bm25"
+            candidate_keys, bm25_scores = self._fts_candidate_keys(
+                build_fts_query(plan), terms, limit=limit, want_bm25=want_bm25
+            )
+            if not candidate_keys:
+                # FTS failed (None) or returned no matches ([]). Fall back to a
+                # LIKE candidate scan so substring recall matches the historic
+                # behaviour; bm25 scoring is unavailable on this path.
+                candidate_keys = self._like_candidate_keys(terms, filters, limit=limit)
+                bm25_scores = {}
+        else:
+            # Pure-filter path cannot use bm25; fall back to date_added desc.
+            if sort_by == "bm25":
+                sort_by = "date_added"
+                sort_order = "desc"
+
+        rows = self._load_filtered_attachments(filters, candidate_keys=candidate_keys)
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            item = decode_attachment_row(row)
+            if not _passes_python_filters(item, filters):
+                continue
+            if sort_by == "bm25":
+                item["score"] = bm25_scores.get(item["attachment_key"], 0.0)
+            else:
+                item["score"] = metadata_match_score(item, terms)
+            results.append(item)
+
+        _sort_metadata_results(results, sort_by=sort_by, sort_order=sort_order)
+        return results[:limit]
+
+    def _fts_candidate_keys(
+        self,
+        fts_query: str,
+        terms: list[str],
+        *,
+        limit: int,
+        want_bm25: bool,
+    ) -> tuple[list[str] | None, dict[str, float]]:
+        """Return candidate keys from FTS (and bm25 scores) or ``None`` on error.
+
+        bm25 is exposed larger-is-better by negating SQLite's ``bm25()`` (which
+        returns smaller-is-better values).
+        """
+
+        if not fts_query:
+            return [], {}
         try:
-            fts_query = _build_fts5_query(terms)
+            if want_bm25:
+                rows = self.conn.execute(
+                    """
+                    SELECT attachment_key, bm25(attachments_fts) AS rank
+                    FROM attachments_fts
+                    WHERE attachments_fts MATCH ?
+                    ORDER BY rank
+                    LIMIT ?
+                    """,
+                    (fts_query, max(limit * 10, limit)),
+                ).fetchall()
+                keys = [row["attachment_key"] for row in rows]
+                scores = {row["attachment_key"]: -float(row["rank"]) for row in rows}
+                return keys, scores
             rows = self.conn.execute(
                 """
                 SELECT attachment_key
@@ -1156,29 +1622,22 @@ class StateLedger:
                 WHERE attachments_fts MATCH ?
                 LIMIT ?
                 """,
-                (fts_query, limit * 10),
+                (fts_query, max(limit * 10, limit)),
             ).fetchall()
-            attachment_keys = [row["attachment_key"] for row in rows]
-            if attachment_keys:
-                like_rows = _load_rows_from_attachments(attachment_keys)
-                results = []
-                for row in like_rows:
-                    item = dict(row)
-                    reasons_json = item.pop("reasons_json")
-                    metadata_json = item.pop("metadata_json")
-                    item["file_exists"] = bool(row["file_exists"])
-                    item["reasons"] = json.loads(reasons_json)
-                    item["metadata"] = json.loads(metadata_json)
-                    item["score"] = metadata_match_score(item, terms)
-                    results.append(item)
-                results.sort(key=lambda item: (item["score"], item.get("title") or ""), reverse=True)
-                return results[:limit]
+            return [row["attachment_key"] for row in rows], {}
         except sqlite3.Error:
             logger.exception("FTS5 metadata search failed; falling back to LIKE")
+            return None, {}
 
-        # Original LIKE fallback.
-        where_parts = []
-        params: list[Any] = []
+    def _like_candidate_keys(
+        self,
+        terms: list[str],
+        filters: "_MetadataFilters",
+        *,
+        limit: int,
+    ) -> list[str]:
+        if not terms:
+            return []
         searchable_columns = (
             "attachment_key",
             "parent_key",
@@ -1189,38 +1648,177 @@ class StateLedger:
             "url",
             "classification",
             "source_quality",
+            "publication_title",
+            "doi",
         )
+        where_parts = []
+        params: list[Any] = []
         for term in terms:
             like = f"%{term}%"
-            per_term = " OR ".join(f"lower(coalesce({column}, '')) LIKE ?" for column in searchable_columns)
+            per_term = " OR ".join(
+                f"lower(coalesce({column}, '')) LIKE ?" for column in searchable_columns
+            )
             where_parts.append(f"({per_term})")
             params.extend([like] * len(searchable_columns))
-        if classification is not None:
-            where_parts.append("classification = ?")
-            params.append(classification)
+        sql = f"SELECT attachment_key FROM attachments WHERE {' AND '.join(where_parts)} LIMIT ?"
+        params.append(max(limit * 20, limit))
+        rows = self.conn.execute(sql, params).fetchall()
+        return [row["attachment_key"] for row in rows]
 
-        query_sql = f"""
-            SELECT attachment_key, parent_key, content_type, relative_path,
-                   title, abstract, date_value, url, classification,
-                   source_quality, reasons_json, file_path, file_exists,
-                   file_size, file_mtime, metadata_json, content_fingerprint,
-                   scan_status, first_seen_at, last_seen_at, updated_at
-            FROM attachments
-            WHERE {' AND '.join(where_parts)}
+    def _load_filtered_attachments(
+        self,
+        filters: "_MetadataFilters",
+        *,
+        candidate_keys: list[str] | None,
+    ) -> list[sqlite3.Row]:
+        where: list[str] = []
+        params: list[Any] = []
+        if candidate_keys is not None:
+            if not candidate_keys:
+                return []
+            placeholders = ",".join("?" for _ in candidate_keys)
+            where.append(f"attachment_key IN ({placeholders})")
+            params.extend(candidate_keys)
+        if filters.attachment_keys is not None:
+            if not filters.attachment_keys:
+                return []
+            placeholders = ",".join("?" for _ in filters.attachment_keys)
+            where.append(f"attachment_key IN ({placeholders})")
+            params.extend(filters.attachment_keys)
+        if filters.classification is not None:
+            where.append("classification = ?")
+            params.append(filters.classification)
+        if filters.item_type is not None:
+            where.append("lower(coalesce(item_type, '')) = ?")
+            params.append(filters.item_type.casefold())
+        if filters.publication_title is not None:
+            where.append("lower(coalesce(publication_title, '')) LIKE ?")
+            params.append(f"%{filters.publication_title.casefold()}%")
+        if filters.doi is not None:
+            where.append("lower(coalesce(doi, '')) LIKE ?")
+            params.append(f"%{filters.doi.casefold()}%")
+        if filters.date_from is not None:
+            where.append("date_normalized IS NOT NULL AND date_normalized >= ?")
+            params.append(_date_bound(filters.date_from, upper=False))
+        if filters.date_to is not None:
+            where.append("date_normalized IS NOT NULL AND date_normalized <= ?")
+            params.append(_date_bound(filters.date_to, upper=True))
+        if filters.collections:
+            placeholders = ",".join("?" for _ in filters.collections)
+            where.append(
+                f"attachment_key IN (SELECT attachment_key FROM attachment_collections "
+                f"WHERE collection_key IN ({placeholders}))"
+            )
+            params.extend(filters.collections)
+
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+        # Cap the scan so a pure-filter path cannot materialize the whole table
+        # when Python-side author/tag filtering still needs to run afterwards.
+        sql = f"SELECT {_ATTACHMENT_SELECT_COLUMNS} FROM attachments {where_sql} LIMIT ?"
+        params.append(_METADATA_SCAN_CAP)
+        return self.conn.execute(sql, params).fetchall()
+
+    def upsert_collections(self, collections: Iterable[dict[str, Any]]) -> int:
+        count = 0
+        with self.conn:
+            for collection in collections:
+                library_id = collection.get("library_id")
+                self.conn.execute(
+                    """
+                    INSERT INTO zotero_collections(
+                        collection_key, collection_name, parent_collection_key, library_id
+                    )
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(collection_key) DO UPDATE SET
+                        collection_name = excluded.collection_name,
+                        parent_collection_key = excluded.parent_collection_key,
+                        library_id = excluded.library_id
+                    """,
+                    (
+                        collection["collection_key"],
+                        collection.get("collection_name") or "",
+                        collection.get("parent_collection_key"),
+                        int(library_id) if library_id is not None else None,
+                    ),
+                )
+                count += 1
+        return count
+
+    def replace_attachment_collections(
+        self, attachment_key: str, collection_keys: Iterable[str]
+    ) -> None:
+        keys = sorted({k for k in collection_keys if k})
+        with self.conn:
+            self.conn.execute(
+                "DELETE FROM attachment_collections WHERE attachment_key = ?",
+                (attachment_key,),
+            )
+            for collection_key in keys:
+                self.conn.execute(
+                    """
+                    INSERT OR IGNORE INTO attachment_collections(attachment_key, collection_key)
+                    VALUES (?, ?)
+                    """,
+                    (attachment_key, collection_key),
+                )
+
+    def list_ledger_collections(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT collection_key, collection_name, parent_collection_key, library_id
+            FROM zotero_collections
+            ORDER BY collection_name, collection_key
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def attachment_keys_for_collections(self, collection_keys: Iterable[str]) -> list[str]:
+        keys = sorted({k for k in collection_keys if k})
+        if not keys:
+            return []
+        placeholders = ",".join("?" for _ in keys)
+        rows = self.conn.execute(
+            f"""
+            SELECT DISTINCT attachment_key
+            FROM attachment_collections
+            WHERE collection_key IN ({placeholders})
+            ORDER BY attachment_key
+            """,
+            keys,
+        ).fetchall()
+        return [row["attachment_key"] for row in rows]
+
+    def prune_collections(self, present_collection_keys: Iterable[str]) -> int:
+        keys = sorted({k for k in present_collection_keys if k})
+        with self.conn:
+            if not keys:
+                cursor = self.conn.execute("DELETE FROM zotero_collections")
+                return int(cursor.rowcount)
+            placeholders = ",".join("?" for _ in keys)
+            cursor = self.conn.execute(
+                f"DELETE FROM zotero_collections WHERE collection_key NOT IN ({placeholders})",
+                keys,
+            )
+            return int(cursor.rowcount)
+
+    def prune_attachment_collections(self, present_attachment_keys: Iterable[str]) -> int:
+        """Drop association rows for attachments no longer present in a full scan.
+
+        ``mark_absent_attachments_deleted`` never touches attachment_collections,
+        so the scanner must prune stale associations explicitly.
         """
-        rows = self.conn.execute(query_sql, params).fetchall()
-        results = []
-        for row in rows:
-            item = dict(row)
-            reasons_json = item.pop("reasons_json")
-            metadata_json = item.pop("metadata_json")
-            item["file_exists"] = bool(row["file_exists"])
-            item["reasons"] = json.loads(reasons_json)
-            item["metadata"] = json.loads(metadata_json)
-            item["score"] = metadata_match_score(item, terms)
-            results.append(item)
-        results.sort(key=lambda item: (item["score"], item.get("title") or ""), reverse=True)
-        return results[:limit]
+
+        keys = sorted({k for k in present_attachment_keys if k})
+        with self.conn:
+            if not keys:
+                cursor = self.conn.execute("DELETE FROM attachment_collections")
+                return int(cursor.rowcount)
+            placeholders = ",".join("?" for _ in keys)
+            cursor = self.conn.execute(
+                f"DELETE FROM attachment_collections WHERE attachment_key NOT IN ({placeholders})",
+                keys,
+            )
+            return int(cursor.rowcount)
 
     def add_scan_report(self, summary: dict[str, Any], job_id: str | None = None) -> None:
         with self.conn:
@@ -1714,14 +2312,22 @@ class StateLedger:
         *,
         chunk_type: str | None = None,
         limit: int = 10,
+        sort_by: str = "score",
+        match_mode: str = "all",
     ) -> list[dict[str, Any]]:
-        terms = [term.casefold() for term in query.split() if term.strip()]
-        if not terms:
+        if sort_by not in {"score", "bm25"}:
+            raise ValueError(f"invalid sort_by: {sort_by}")
+
+        from ..search.query_parser import build_fts_query, parse_query, scoring_terms
+
+        plan = parse_query(query, match_mode=match_mode)
+        terms = scoring_terms(plan)
+        if plan.is_empty:
             return []
 
-        def _load_chunks_by_ids(chunk_ids: list[str]) -> list[sqlite3.Row]:
+        def _load_chunks_by_ids(chunk_ids: list[str]) -> dict[str, sqlite3.Row]:
             if not chunk_ids:
-                return []
+                return {}
             where = f"chunk_id IN ({','.join('?' for _ in chunk_ids)})"
             params: list[Any] = list(chunk_ids)
             if chunk_type is not None:
@@ -1735,32 +2341,62 @@ class StateLedger:
                 WHERE {where}
                 LIMIT ?
             """
-            params.append(limit * 10)
-            return self.conn.execute(sql, params).fetchall()
+            params.append(max(limit * 10, limit))
+            return {row["chunk_id"]: row for row in self.conn.execute(sql, params).fetchall()}
 
         try:
-            fts_query = _build_fts5_query(terms)
-            rows = self.conn.execute(
-                """
-                SELECT chunk_id
-                FROM chunks_fts
-                WHERE chunks_fts MATCH ?
-                LIMIT ?
-                """,
-                (fts_query, limit * 10),
-            ).fetchall()
-            chunk_ids = [row["chunk_id"] for row in rows]
-            if chunk_ids:
-                like_rows = _load_chunks_by_ids(chunk_ids)
-                results = [decode_chunk_row(row) for row in like_rows]
-                for item in results:
-                    item["score"] = chunk_match_score(item, terms)
-                results.sort(key=lambda item: (item["score"], item["document_id"], -item["chunk_index"]), reverse=True)
-                return results[:limit]
+            fts_query = build_fts_query(plan)
+            if fts_query:
+                if sort_by == "bm25":
+                    fts_rows = self.conn.execute(
+                        """
+                        SELECT chunk_id, bm25(chunks_fts) AS rank
+                        FROM chunks_fts
+                        WHERE chunks_fts MATCH ?
+                        ORDER BY rank
+                        LIMIT ?
+                        """,
+                        (fts_query, max(limit * 10, limit)),
+                    ).fetchall()
+                    bm25_scores = {row["chunk_id"]: -float(row["rank"]) for row in fts_rows}
+                    chunk_ids = [row["chunk_id"] for row in fts_rows]
+                else:
+                    fts_rows = self.conn.execute(
+                        """
+                        SELECT chunk_id
+                        FROM chunks_fts
+                        WHERE chunks_fts MATCH ?
+                        LIMIT ?
+                        """,
+                        (fts_query, max(limit * 10, limit)),
+                    ).fetchall()
+                    bm25_scores = {}
+                    chunk_ids = [row["chunk_id"] for row in fts_rows]
+                if chunk_ids:
+                    by_id = _load_chunks_by_ids(chunk_ids)
+                    results = []
+                    for chunk_id in chunk_ids:
+                        row = by_id.get(chunk_id)
+                        if row is None:
+                            continue
+                        item = decode_chunk_row(row)
+                        if sort_by == "bm25":
+                            item["score"] = bm25_scores.get(chunk_id, 0.0)
+                        else:
+                            item["score"] = chunk_match_score(item, terms)
+                        results.append(item)
+                    if sort_by == "bm25":
+                        results.sort(key=lambda item: item["score"], reverse=True)
+                    else:
+                        results.sort(
+                            key=lambda item: (item["score"], item["document_id"], -item["chunk_index"]),
+                            reverse=True,
+                        )
+                    return results[:limit]
         except sqlite3.Error:
             logger.exception("FTS5 fulltext search failed; falling back to LIKE")
 
-        # Original LIKE fallback.
+        # LIKE fallback (bm25 is unavailable without FTS; degrade to chunk score).
         where_parts = []
         params: list[Any] = []
         for term in terms:
@@ -1912,10 +2548,52 @@ def attachment_fingerprint(item: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _creators_text(item: dict[str, Any]) -> str:
+    creators = item.get("creators")
+    if isinstance(creators, list):
+        return " ".join(str(name) for name in creators if name)
+    return ""
+
+
+def _tags_text(item: dict[str, Any]) -> str:
+    tags = item.get("tags")
+    if isinstance(tags, list):
+        return " ".join(str(tag) for tag in tags if tag)
+    return ""
+
+
+def _collections_text(item: dict[str, Any]) -> str:
+    collections = item.get("collections")
+    if isinstance(collections, list):
+        names = []
+        for element in collections:
+            if isinstance(element, dict):
+                name = element.get("collection_name")
+                if name:
+                    names.append(str(name))
+            elif element:
+                names.append(str(element))
+        return " ".join(names)
+    return ""
+
+
 def metadata_match_score(item: dict[str, Any], terms: list[str]) -> float:
+    # Scoring uses derived plain-text fields (never raw JSON strings) so author
+    # names, tag labels, and collection names contribute without matching JSON
+    # punctuation noise like ``["``.
+    derived = {
+        "creators_text": _creators_text(item),
+        "tags_text": _tags_text(item),
+        "collections_text": _collections_text(item),
+    }
     weighted_fields = (
         ("title", 5.0),
+        ("doi", 5.0),
+        ("creators_text", 4.0),
+        ("publication_title", 3.0),
+        ("tags_text", 3.0),
         ("abstract", 2.0),
+        ("collections_text", 1.5),
         ("relative_path", 1.5),
         ("url", 1.0),
         ("date_value", 1.0),
@@ -1924,7 +2602,7 @@ def metadata_match_score(item: dict[str, Any], terms: list[str]) -> float:
     )
     score = 0.0
     for field, weight in weighted_fields:
-        value = str(item.get(field) or "").casefold()
+        value = str(derived.get(field, item.get(field)) or "").casefold()
         for term in terms:
             if term in value:
                 score += weight
@@ -1983,7 +2661,23 @@ def decode_attachment_row(row: sqlite3.Row) -> dict[str, Any]:
     item["file_exists"] = bool(row["file_exists"])
     item["reasons"] = json.loads(reasons_json)
     item["metadata"] = json.loads(metadata_json)
+    # Expose bibliographic list columns as parsed Python lists. The raw *_json
+    # columns are dropped from the returned dict to keep callers on structured
+    # data instead of JSON strings.
+    item["creators"] = _load_json_list(item.pop("creators_json", None))
+    item["collections"] = _load_json_list(item.pop("collections_json", None))
+    item["tags"] = _load_json_list(item.pop("tags_json", None))
     return item
+
+
+def _load_json_list(raw: Any) -> list[Any]:
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return data if isinstance(data, list) else []
 
 
 def decode_normalized_artifact_row(row: sqlite3.Row | None) -> dict[str, Any] | None:

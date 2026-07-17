@@ -47,13 +47,42 @@ def scan_shadow_to_ledger(
         # Persist scan results as a checkpointed review queue. MinerU and Qwen
         # providers are deliberately not invoked during scanning.
         ledger.upsert_attachments(records)
+        # Sync Zotero collection definitions and the per-attachment associations
+        # that back exact collection filtering. Collections are stored both as
+        # display JSON on the attachment (via upsert_attachments) and as the
+        # authoritative attachment_collections rows written here.
+        shadow_collections = shadow.list_collections()
+        ledger.upsert_collections(
+            [
+                {
+                    "collection_key": collection.collection_key,
+                    "collection_name": collection.collection_name,
+                    "parent_collection_key": collection.parent_collection_key,
+                    "library_id": collection.library_id,
+                }
+                for collection in shadow_collections
+            ]
+        )
+        for item in classified:
+            ledger.replace_attachment_collections(
+                item.attachment.attachment_key,
+                [
+                    collection.get("collection_key", "")
+                    for collection in item.attachment.collections
+                ],
+            )
         # A complete scan is authoritative for attachment presence. Limited
         # scans are diagnostics only and must not mark unscanned rows deleted.
         deleted_count = 0
         if limit is None:
-            deleted_count = ledger.mark_absent_attachments_deleted(
-                item.attachment.attachment_key for item in classified
+            present_keys = [item.attachment.attachment_key for item in classified]
+            deleted_count = ledger.mark_absent_attachments_deleted(present_keys)
+            # mark_absent_attachments_deleted does not touch collection tables,
+            # so prune stale collection definitions and associations explicitly.
+            ledger.prune_collections(
+                collection.collection_key for collection in shadow_collections
             )
+            ledger.prune_attachment_collections(present_keys)
         summary = dict(Counter(item.classification for item in classified))
         if deleted_count:
             summary["deleted"] = deleted_count

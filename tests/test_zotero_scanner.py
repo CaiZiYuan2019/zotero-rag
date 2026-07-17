@@ -25,7 +25,11 @@ def build_scanner_fixture_db(path: Path) -> None:
             """
             CREATE TABLE items (
                 itemID INTEGER PRIMARY KEY,
-                key TEXT NOT NULL
+                key TEXT NOT NULL,
+                itemTypeID INTEGER,
+                dateAdded TEXT,
+                dateModified TEXT,
+                libraryID INTEGER
             );
             CREATE TABLE itemAttachments (
                 itemID INTEGER PRIMARY KEY,
@@ -46,9 +50,67 @@ def build_scanner_fixture_db(path: Path) -> None:
                 valueID INTEGER PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE itemTypes (
+                itemTypeID INTEGER PRIMARY KEY,
+                typeName TEXT NOT NULL
+            );
+            CREATE TABLE creators (
+                creatorID INTEGER PRIMARY KEY,
+                firstName TEXT,
+                lastName TEXT,
+                fieldMode INTEGER
+            );
+            CREATE TABLE creatorTypes (
+                creatorTypeID INTEGER PRIMARY KEY,
+                creatorType TEXT NOT NULL
+            );
+            CREATE TABLE itemCreators (
+                itemID INTEGER NOT NULL,
+                creatorID INTEGER NOT NULL,
+                creatorTypeID INTEGER NOT NULL,
+                orderIndex INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE collections (
+                collectionID INTEGER PRIMARY KEY,
+                collectionName TEXT NOT NULL,
+                parentCollectionID INTEGER,
+                libraryID INTEGER,
+                key TEXT
+            );
+            CREATE TABLE collectionItems (
+                collectionID INTEGER NOT NULL,
+                itemID INTEGER NOT NULL,
+                orderIndex INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE tags (
+                tagID INTEGER PRIMARY KEY,
+                name TEXT NOT NULL
+            );
+            CREATE TABLE itemTags (
+                itemID INTEGER NOT NULL,
+                tagID INTEGER NOT NULL,
+                type INTEGER NOT NULL DEFAULT 0
+            );
             """
         )
         conn.executemany("INSERT INTO fields(fieldID, fieldName) VALUES (?, ?)", FIELD_ROWS)
+        conn.executemany(
+            "INSERT INTO itemTypes(itemTypeID, typeName) VALUES (?, ?)",
+            [(1, "journalArticle"), (2, "attachment")],
+        )
+        conn.execute("INSERT INTO creatorTypes(creatorTypeID, creatorType) VALUES (1, 'author')")
+        conn.execute("INSERT INTO creators(creatorID, firstName, lastName, fieldMode) VALUES (1, 'Ada', 'Lovelace', 0)")
+        conn.execute("INSERT INTO itemCreators(itemID, creatorID, creatorTypeID, orderIndex) VALUES (1, 1, 1, 0)")
+        conn.executemany(
+            "INSERT INTO collections(collectionID, collectionName, parentCollectionID, libraryID, key) VALUES (?, ?, ?, ?, ?)",
+            [
+                (1, "Papers", None, 1, "COLLPAPERS"),
+                (2, "Subfolder", 1, 1, "COLLSUB"),
+            ],
+        )
+        conn.execute("INSERT INTO collectionItems(collectionID, itemID, orderIndex) VALUES (2, 1, 0)")
+        conn.execute("INSERT INTO tags(tagID, name) VALUES (1, 'primary')")
+        conn.execute("INSERT INTO itemTags(itemID, tagID, type) VALUES (1, 1, 0)")
         conn.executemany(
             "INSERT INTO items(itemID, key) VALUES (?, ?)",
             [
@@ -244,6 +306,56 @@ class ZoteroScannerTests(unittest.TestCase):
                 self.assertEqual("deleted", attachments["ATTNORM"]["classification"])
                 self.assertEqual(5, report.scanned)
                 self.assertEqual(1, report.summary["deleted"])
+            finally:
+                ledger.close()
+
+    def test_scan_persists_biblio_and_collections_without_touching_metadata(self) -> None:
+        with workspace_tmpdir("zotero-scan-") as root:
+            shadow_db, storage_dir = self.build_fixture(root)
+            ledger = StateLedger(root / "state.sqlite")
+            try:
+                scan_shadow_to_ledger(shadow_db, storage_dir, ledger)
+
+                record = ledger.get_attachment("ATTNORM")
+                self.assertEqual(["Ada Lovelace"], record["creators"])
+                self.assertEqual(["primary"], record["tags"])
+                self.assertEqual(1, len(record["collections"]))
+                self.assertEqual("COLLSUB", record["collections"][0]["collection_key"])
+                # Bibliographic data must never leak into metadata_json.
+                self.assertEqual({}, record["metadata"])
+
+                collections = ledger.list_ledger_collections()
+                self.assertEqual(2, len(collections))
+                self.assertEqual(
+                    ["ATTNORM"], ledger.attachment_keys_for_collections(["COLLSUB"])
+                )
+                # Child-only filter should not return the parent's partition.
+                self.assertEqual([], ledger.attachment_keys_for_collections(["COLLPAPERS"]))
+            finally:
+                ledger.close()
+
+    def test_biblio_only_change_keeps_scan_status_unchanged(self) -> None:
+        with workspace_tmpdir("zotero-scan-") as root:
+            shadow_db, storage_dir = self.build_fixture(root)
+            ledger = StateLedger(root / "state.sqlite")
+            try:
+                scan_shadow_to_ledger(shadow_db, storage_dir, ledger)
+
+                # Change only bibliographic data (a tag) in the shadow DB.
+                conn = sqlite3.connect(shadow_db)
+                try:
+                    conn.execute("INSERT INTO tags(tagID, name) VALUES (2, 'extra')")
+                    conn.execute("INSERT INTO itemTags(itemID, tagID, type) VALUES (1, 2, 0)")
+                    conn.commit()
+                finally:
+                    conn.close()
+
+                scan_shadow_to_ledger(shadow_db, storage_dir, ledger)
+                record = ledger.get_attachment("ATTNORM")
+                # New tag was written, but biblio is excluded from the content
+                # fingerprint so scan_status stays unchanged.
+                self.assertIn("extra", record["tags"])
+                self.assertEqual("unchanged", record["scan_status"])
             finally:
                 ledger.close()
 

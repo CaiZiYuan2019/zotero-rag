@@ -54,6 +54,17 @@ class FulltextSearchTests(unittest.TestCase):
                 self.assertEqual("images/img001.png", image_hits[0]["images"][0]["file_ref"])
                 with self.assertRaises(RuntimeError):
                     fulltext_search(ledger, "workflow", rerank=True)
+
+                bm25_hits = fulltext_search(
+                    ledger,
+                    "reproducible workflow",
+                    chunk_type="text",
+                    consumer="llm_text",
+                    sort_by="bm25",
+                )
+                self.assertTrue(bm25_hits)
+                scores = [hit["score"] for hit in bm25_hits]
+                self.assertEqual(scores, sorted(scores, reverse=True))
             finally:
                 ledger.close()
 

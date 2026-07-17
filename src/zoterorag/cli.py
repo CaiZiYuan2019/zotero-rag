@@ -33,8 +33,21 @@ from .pipeline import (
 )
 from .providers import build_qwen_embedding_provider, provider_readiness
 from .review import explain_attachment_review
-from .runtime import config_as_public_dict, copy_zotero_shadow, initialize_runtime, scan_zotero_shadow
-from .search import fulltext_search, metadata_search, normalize_query_image
+from .runtime import (
+    config_as_public_dict,
+    copy_zotero_shadow,
+    initialize_runtime,
+    resync_metadata,
+    scan_zotero_shadow,
+)
+from .search import (
+    fulltext_search,
+    get_collection_tree,
+    list_collections,
+    metadata_search,
+    normalize_query_image,
+    search_by_collection,
+)
 from .search.results import RerankNotSupportedError
 from .zotero import ZoteroShadow
 
@@ -188,6 +201,17 @@ def build_parser() -> argparse.ArgumentParser:
     search_metadata.add_argument("--limit", type=int, default=10)
     search_metadata.add_argument("--consumer", default="llm_text", choices=("manual", "llm_text", "llm_multimodal"))
     search_metadata.add_argument("--rerank", action="store_true")
+    search_metadata.add_argument("--date-from", default=None)
+    search_metadata.add_argument("--date-to", default=None)
+    search_metadata.add_argument("--author", action="append", default=None, dest="authors", help="Filter by author substring (repeatable).")
+    search_metadata.add_argument("--collection", action="append", default=None, dest="collections", help="Filter by collection key (repeatable).")
+    search_metadata.add_argument("--tag", action="append", default=None, dest="tags", help="Filter by tag (repeatable, exact).")
+    search_metadata.add_argument("--item-type", default=None)
+    search_metadata.add_argument("--publication-title", default=None)
+    search_metadata.add_argument("--doi", default=None)
+    search_metadata.add_argument("--sort-by", default="score", choices=("score", "bm25", "date", "date_added", "title"))
+    search_metadata.add_argument("--sort-order", default="desc", choices=("asc", "desc"))
+    search_metadata.add_argument("--match-mode", default="all", choices=("all", "any"))
 
     search_fulltext = sub.add_parser("search-fulltext", help="Search normalized fulltext chunks without embeddings.")
     search_fulltext.add_argument("query")
@@ -196,6 +220,26 @@ def build_parser() -> argparse.ArgumentParser:
     search_fulltext.add_argument("--consumer", default="llm_text", choices=("manual", "llm_text", "llm_multimodal"))
     search_fulltext.add_argument("--image-return", default="none", choices=("file_ref", "base64", "none"))
     search_fulltext.add_argument("--rerank", action="store_true")
+    search_fulltext.add_argument("--sort-by", default="score", choices=("score", "bm25"))
+    search_fulltext.add_argument("--match-mode", default="all", choices=("all", "any"))
+
+    list_collections_parser = sub.add_parser("list-collections", help="List Zotero collections synced into the ledger.")
+    list_collections_parser.add_argument("--tree", action="store_true", help="Return a nested collection tree instead of a flat list.")
+
+    search_by_collection_parser = sub.add_parser("search-by-collection", help="Search or list attachments within a Zotero collection.")
+    search_by_collection_parser.add_argument("collection_key")
+    search_by_collection_parser.add_argument("--query", default=None)
+    search_by_collection_parser.add_argument("--include-children", action="store_true")
+    search_by_collection_parser.add_argument("--limit", type=int, default=10)
+    search_by_collection_parser.add_argument("--consumer", default="llm_text", choices=("manual", "llm_text", "llm_multimodal"))
+    search_by_collection_parser.add_argument("--sort-by", default="score", choices=("score", "bm25", "date", "date_added", "title"))
+    search_by_collection_parser.add_argument("--sort-order", default="desc", choices=("asc", "desc"))
+
+    resync = sub.add_parser("resync-metadata", help="Rescan Zotero shadow into the ledger (metadata + collections + FTS only).")
+    resync.add_argument("--no-refresh-shadow", action="store_true", help="Reuse the existing shadow DB without recopying Zotero.")
+    resync.add_argument("--rebuild-fts", action="store_true", help="Force a full DROP/rebuild of attachments_fts.")
+    resync.add_argument("--limit", type=int, default=None)
+    resync.add_argument("--shadow-timeout-seconds", type=float, default=30.0)
 
     backup = sub.add_parser("backup", help="Create and inspect ZoteroRAG runtime backups.")
     backup_sub = backup.add_subparsers(dest="backup_command", required=True)
@@ -557,8 +601,22 @@ def main(argv: list[str] | None = None) -> int:
                     limit=args.limit,
                     consumer=args.consumer,
                     rerank=args.rerank,
+                    date_from=args.date_from,
+                    date_to=args.date_to,
+                    authors=args.authors,
+                    collections=args.collections,
+                    tags=args.tags,
+                    item_type=args.item_type,
+                    publication_title=args.publication_title,
+                    doi=args.doi,
+                    sort_by=args.sort_by,
+                    sort_order=args.sort_order,
+                    match_mode=args.match_mode,
                 )
             except RerankNotSupportedError as exc:
+                emit({"ok": False, "error": str(exc)})
+                return 1
+            except ValueError as exc:
                 emit({"ok": False, "error": str(exc)})
                 return 1
             emit({"results": results})
@@ -574,11 +632,54 @@ def main(argv: list[str] | None = None) -> int:
                     consumer=args.consumer,
                     image_return=args.image_return,
                     rerank=args.rerank,
+                    sort_by=args.sort_by,
+                    match_mode=args.match_mode,
                 )
             except RerankNotSupportedError as exc:
                 emit({"ok": False, "error": str(exc)})
                 return 1
+            except ValueError as exc:
+                emit({"ok": False, "error": str(exc)})
+                return 1
             emit({"results": results})
+            return 0
+
+        if args.command == "list-collections":
+            if args.tree:
+                emit({"collections": get_collection_tree(ledger)})
+            else:
+                emit({"collections": list_collections(ledger)})
+            return 0
+
+        if args.command == "search-by-collection":
+            try:
+                results = search_by_collection(
+                    ledger,
+                    args.collection_key,
+                    query=args.query,
+                    include_children=args.include_children,
+                    limit=args.limit,
+                    consumer=args.consumer,
+                    sort_by=args.sort_by,
+                    sort_order=args.sort_order,
+                )
+            except (RerankNotSupportedError, ValueError) as exc:
+                emit({"ok": False, "error": str(exc)})
+                return 1
+            emit({"results": results})
+            return 0
+
+        if args.command == "resync-metadata":
+            emit(
+                resync_metadata(
+                    config,
+                    ledger,
+                    refresh_shadow=not args.no_refresh_shadow,
+                    rebuild_fts=args.rebuild_fts,
+                    limit=args.limit,
+                    shadow_timeout_seconds=args.shadow_timeout_seconds,
+                )
+            )
             return 0
 
         if args.command == "backup":

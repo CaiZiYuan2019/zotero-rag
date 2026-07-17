@@ -23,8 +23,15 @@ from ..pipeline import (
 )
 from ..providers import build_qwen_embedding_provider, provider_readiness
 from ..review import explain_attachment_review
-from ..runtime import config_as_public_dict, initialize_runtime, scan_zotero_shadow
-from ..search import fulltext_search, metadata_search, normalize_query_image
+from ..runtime import config_as_public_dict, initialize_runtime, resync_metadata, scan_zotero_shadow
+from ..search import (
+    fulltext_search,
+    get_collection_tree,
+    list_collections,
+    metadata_search,
+    normalize_query_image,
+    search_by_collection,
+)
 from .security import AccessDenied, verify_api_access
 
 try:
@@ -53,6 +60,17 @@ def _clamp_int(value: Any, default: int, max_value: int) -> int:
 def _client_error(status_code: int = 400) -> HTTPException:
     """Return a generic HTTP error to avoid leaking internal details."""
     return HTTPException(status_code=status_code, detail="invalid request")
+
+
+def _as_str_list(value: Any) -> list[str] | None:
+    """Coerce a JSON scalar/list into a list of strings (or None)."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value if item is not None]
+    return [str(value)]
 
 
 def _find_project_root(start: Path) -> Path:
@@ -244,6 +262,18 @@ def create_app(config_path: str | Path = "config/config.toml") -> Any:
             shadow_timeout_seconds=float(payload.get("shadow_timeout_seconds", 30.0)),
         )
 
+    @app.post("/resync-metadata", dependencies=[Depends(require_access)])
+    def resync_metadata_endpoint(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = payload or {}
+        return resync_metadata(
+            config,
+            ledger,
+            refresh_shadow=bool(payload.get("refresh_shadow", True)),
+            rebuild_fts=bool(payload.get("rebuild_fts", False)),
+            limit=payload.get("limit"),
+            shadow_timeout_seconds=float(payload.get("shadow_timeout_seconds", 30.0)),
+        )
+
     @app.post("/ingest/start", dependencies=[Depends(require_access)])
     def ingest_start(payload: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = payload or {}
@@ -388,11 +418,55 @@ def create_app(config_path: str | Path = "config/config.toml") -> Any:
             return {
                 "results": metadata_search(
                     ledger,
-                    query=str(payload["query"]),
+                    query=str(payload.get("query", "")),
                     classification=payload.get("classification"),
                     limit=_clamp_int(payload.get("limit", payload.get("top_k", 10)), 10, MAX_TOP_K),
                     consumer=str(payload.get("consumer", "llm_text")),
                     rerank=bool(payload.get("rerank", False)),
+                    date_from=payload.get("date_from"),
+                    date_to=payload.get("date_to"),
+                    authors=_as_str_list(payload.get("authors")),
+                    collections=_as_str_list(payload.get("collections")),
+                    tags=_as_str_list(payload.get("tags")),
+                    item_type=payload.get("item_type"),
+                    publication_title=payload.get("publication_title"),
+                    doi=payload.get("doi"),
+                    sort_by=str(payload.get("sort_by", "score")),
+                    sort_order=str(payload.get("sort_order", "desc")),
+                    match_mode=str(payload.get("match_mode", "all")),
+                )
+            }
+        except (KeyError, ValueError):
+            raise _client_error(400) from None
+        except NotImplementedError as exc:
+            raise HTTPException(status_code=501, detail=str(exc)) from exc
+
+    @app.get("/search/collections", dependencies=[Depends(require_access)])
+    def search_collections_get(tree: bool = False) -> dict[str, Any]:
+        if tree:
+            return {"collections": get_collection_tree(ledger)}
+        return {"collections": list_collections(ledger)}
+
+    @app.post("/search/collections", dependencies=[Depends(require_access)])
+    def search_collections_post(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = payload or {}
+        if bool(payload.get("tree", False)):
+            return {"collections": get_collection_tree(ledger)}
+        return {"collections": list_collections(ledger)}
+
+    @app.post("/search/by-collection", dependencies=[Depends(require_access)])
+    def search_by_collection_endpoint(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return {
+                "results": search_by_collection(
+                    ledger,
+                    str(payload["collection_key"]),
+                    query=payload.get("query"),
+                    include_children=bool(payload.get("include_children", False)),
+                    limit=_clamp_int(payload.get("limit", payload.get("top_k", 10)), 10, MAX_TOP_K),
+                    consumer=str(payload.get("consumer", "llm_text")),
+                    sort_by=str(payload.get("sort_by", "score")),
+                    sort_order=str(payload.get("sort_order", "desc")),
                 )
             }
         except (KeyError, ValueError):
@@ -412,6 +486,8 @@ def create_app(config_path: str | Path = "config/config.toml") -> Any:
                     consumer=str(payload.get("consumer", "llm_text")),
                     image_return=str(payload.get("image_return", "none")),
                     rerank=bool(payload.get("rerank", False)),
+                    sort_by=str(payload.get("sort_by", "score")),
+                    match_mode=str(payload.get("match_mode", "all")),
                 )
             }
         except (KeyError, ValueError):

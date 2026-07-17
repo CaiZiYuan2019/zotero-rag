@@ -88,6 +88,44 @@ def scan_zotero_shadow(
     }
 
 
+def resync_metadata(
+    config: AppConfig,
+    ledger: StateLedger,
+    *,
+    refresh_shadow: bool = True,
+    rebuild_fts: bool = False,
+    limit: int | None = None,
+    shadow_timeout_seconds: float = 30.0,
+) -> dict[str, Any]:
+    """Refresh Zotero bibliographic metadata + collections into the ledger.
+
+    This only writes to ``state.sqlite`` and the FTS index; it never triggers
+    MinerU extraction or embedding. ``rebuild_fts`` forces a full drop/rebuild
+    of ``attachments_fts`` and a complete backfill.
+    """
+
+    if refresh_shadow:
+        copy_zotero_shadow(config, ledger, timeout_seconds=shadow_timeout_seconds)
+    report = scan_shadow_to_ledger(
+        shadow_db=config.paths.shadow_db,
+        storage_dir=config.paths.zotero_storage,
+        ledger=ledger,
+        limit=limit,
+    )
+    fts_rows = None
+    if rebuild_fts:
+        fts_rows = ledger.rebuild_attachments_fts(force=True)
+    result = {
+        "shadow_db": str(config.paths.shadow_db),
+        "scanned": report.scanned,
+        "summary": report.summary,
+        "rebuilt_fts": bool(rebuild_fts),
+    }
+    if fts_rows is not None:
+        result["attachments_fts_rows"] = fts_rows
+    return result
+
+
 def config_as_public_dict(config: AppConfig) -> dict[str, Any]:
     """Return config details safe for status output.
 

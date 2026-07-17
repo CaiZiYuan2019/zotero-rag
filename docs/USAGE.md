@@ -196,8 +196,11 @@ zoterorag --config path/to/config.toml <command>
 | `review list/include/exclude/explain` | 人工审核管理 | 无 |
 | `attachments` | 列出附件扫描结果 | 无 |
 | `documents list/show` | 查看文档记录 | 无 |
-| `search-metadata` | 元数据搜索 | 无 |
-| `search-fulltext` | 全文搜索 | 无 |
+| `search-metadata` | 元数据搜索（作者/年份/集合/BM25 等） | 无 |
+| `search-fulltext` | 全文搜索（短语/前缀/BM25） | 无 |
+| `list-collections` | 列出已同步的 Zotero 集合 | 无 |
+| `search-by-collection` | 在指定集合（文件夹）内检索 | 无 |
+| `resync-metadata` | 增量回填书目元数据/集合/FTS（不重跑 MinerU/嵌入） | 无 |
 | `search-vector` | 向量搜索 | 指定 `qwen3vl` 时 |
 | `backup create/list/verify/restore` | 备份管理 | 无 |
 | `extract dry-run/jobs/recovery-plan` | 提取作业管理 | `dry-run`(真实) |
@@ -466,30 +469,103 @@ zoterorag models activate --profile qwen3vl_cloud_2560_multimodal --mode multimo
 
 ## 5. 检索接口
 
-### 5.1 元数据搜索（无需 embedding）
+检索面相互独立：元数据 / 全文 / 向量互不自动回退或混合。需要交叉验证时由调用方分别查询。  
+`score` 一律**越大越相关**（含 `sort_by=bm25`；内部对 FTS5 `bm25()` 取负）。
+
+首次使用新元数据能力前，建议同步一次书目与集合（只改 `state.sqlite` / FTS，不触发 MinerU 或嵌入）：
 
 ```bash
-# 按标题/作者/摘要/DOI/期刊/标签搜索
+# 复用现有影子库并重建 attachments_fts
+zoterorag resync-metadata --no-refresh-shadow --rebuild-fts
+
+# 若需从当前 Zotero 重新复制影子库再扫描
+zoterorag resync-metadata --rebuild-fts
+```
+
+### 5.1 元数据搜索（无需 embedding）
+
+FTS5 覆盖：title、authors、abstract、DOI、publication_title、tags、collections、url、date、keys 等。  
+默认排序为自定义加权分（`sort_by=score`）；可选 BM25。
+
+```bash
+# 基础关键词（AND；大小写不敏感）
 zoterorag search-metadata "transformer attention"
 
 # 限定分类
 zoterorag search-metadata "CRISPR" --classification included_auto
+
+# 作者 + 年份范围 + 集合过滤（collection 填 list-collections 得到的 key）
+zoterorag search-metadata "Vater" \
+  --author Vater \
+  --date-from 1997 --date-to 1997 \
+  --collection 26TP7I8G \
+  --limit 20
+
+# BM25 排序（越大越好）
+zoterorag search-metadata "glutaraldehyde" --collection 26TP7I8G --sort-by bm25
+
+# 查询语法：短语 / 前缀 / OR；空查询 + 过滤器走纯过滤路径
+zoterorag search-metadata "\"organ of Corti\"" --collection 26TP7I8G
+zoterorag search-metadata "glutar*" --match-mode any --sort-by bm25
+zoterorag search-metadata "" --author Nakajima --date-from 1971 --date-to 1971
 ```
 
-搜索字段：title, authors, date, year, DOI, abstractNote, publicationTitle, url, tags, collections
+常用参数：
 
-### 5.2 全文搜索（无需 embedding）
+| 参数 | 说明 |
+|------|------|
+| `--author` | 作者子串过滤（可重复） |
+| `--collection` | 集合 key 过滤（可重复；走关联表，不是 JSON LIKE） |
+| `--tag` / `--item-type` / `--doi` / `--publication-title` | 精确或字段过滤 |
+| `--date-from` / `--date-to` | 优先按规范化日期比较（脏日期可能漏召） |
+| `--sort-by` | `score`（默认）/ `bm25` / `date` / `date_added` / `title` |
+| `--sort-order` | `asc` / `desc` |
+| `--match-mode` | `all`（默认 AND）/ `any`（OR） |
+
+**注意：** 方法学词汇（如戊二醛）常不在标题/摘要中，元数据可能 0 命中，应改用全文检索；极短词（如 `GA`）易命中 GABA 等噪声，且可能落到 LIKE 回退导致 `bm25` 分数为 0——此时用 `sort-by score` 或改用完整词 `glutaraldehyde`。
+
+### 5.2 集合（文件夹）分区检索
 
 ```bash
-# SQLite LIKE 搜索标准化 chunk 文本
-zoterorag search-fulltext "pollen tube guidance"
+# 列出已同步集合
+zoterorag list-collections
+zoterorag list-collections --tree
 
-# 限定 chunk 类型
-zoterorag search-fulltext "LUREs" --chunk-type text
-zoterorag search-fulltext "figure 3" --chunk-type image
+# 在集合内搜索（默认不含子集合）
+zoterorag search-by-collection 26TP7I8G --query "Vater 1997" --limit 20
+zoterorag search-by-collection 26TP7I8G --query "glutaraldehyde" --sort-by bm25
+
+# 含子集合；无 query 时按过滤器列出该分区附件
+zoterorag search-by-collection 26TP7I8G --include-children --query "bat"
+zoterorag search-by-collection 26TP7I8G --limit 50
 ```
 
-### 5.3 向量搜索
+集合过滤只使用 `attachment_collections` 关联表；同一文献可同时属于多个集合。
+
+### 5.3 全文搜索（无需 embedding）
+
+在已标准化 chunk 上检索；支持与元数据相同的查询预处理（短语/前缀/OR）及 `sort-by bm25`。
+
+```bash
+zoterorag search-fulltext "pollen tube guidance"
+zoterorag search-fulltext "LUREs" --chunk-type text
+zoterorag search-fulltext "figure 3" --chunk-type image
+
+# 方法学术语更适合全文；BM25 对比默认加权分
+zoterorag search-fulltext "glutaraldehyde" --chunk-type text --sort-by bm25 --limit 10
+zoterorag search-fulltext "戊二醛" --chunk-type text --sort-by score
+zoterorag search-fulltext "\"glutaraldehyde fixation\"" --match-mode all --sort-by bm25
+```
+
+| 参数 | 说明 |
+|------|------|
+| `--chunk-type` | `text` / `image` |
+| `--sort-by` | `score`（默认）/ `bm25` |
+| `--match-mode` | `all` / `any` |
+
+FTS 无命中时会回退 LIKE（保持历史子串召回）；该回退路径无 BM25，会降级为自定义分。
+
+### 5.4 向量搜索
 
 **文本搜索（纯文字检索）：**
 
@@ -541,7 +617,7 @@ zoterorag search-vector "similar to this diagram" \
   --max-image-bytes 524288
 ```
 
-### 5.4 Consumer 与 Image Return 规则
+### 5.5 Consumer 与 Image Return 规则
 
 | consumer | 含义 | 图片行为 |
 |----------|------|---------|
@@ -633,10 +709,13 @@ zoterorag serve --check
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |------|------|------|------|
-| POST | `/search/metadata` | 有 | 元数据搜索 |
-| POST | `/search/fulltext` | 有 | 全文搜索 |
+| POST | `/search/metadata` | 有 | 元数据搜索（作者/日期/集合/BM25/`match_mode` 等） |
+| GET/POST | `/search/collections` | 有 | 列出集合（`tree=true` 返回树） |
+| POST | `/search/by-collection` | 有 | 集合内搜索（`include_children` 默认 false） |
+| POST | `/search/fulltext` | 有 | 全文搜索（`sort_by`/`match_mode`） |
 | POST | `/search/text` | 有 | 文本向量搜索 |
 | POST | `/search/multimodal` | 有 | 多模态向量搜索 |
+| POST | `/resync-metadata` | 有 | 回填书目元数据与 FTS（可选 `rebuild_fts`） |
 
 #### 备份
 
@@ -677,7 +756,28 @@ curl http://127.0.0.1:8765/health
 curl -H "Authorization: Bearer $ZOTERORAG_API_TOKEN" \
   http://127.0.0.1:8765/status
 
-# 文本搜索
+# 元数据 + 集合 + BM25
+curl -X POST http://127.0.0.1:8765/search/metadata \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "glutaraldehyde",
+    "collections": ["26TP7I8G"],
+    "sort_by": "bm25",
+    "limit": 10
+  }'
+
+# 集合内搜索
+curl -X POST http://127.0.0.1:8765/search/by-collection \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "collection_key": "26TP7I8G",
+    "query": "Vater 1997",
+    "limit": 20
+  }'
+
+# 文本向量搜索
 curl -X POST http://127.0.0.1:8765/search/text \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
@@ -722,7 +822,9 @@ curl -X POST http://127.0.0.1:8765/ingest/start \
 |--------|------|---------|
 | `zotero_rag_status` | 运行时状态和进度 | N/A |
 | `zotero_rag_list_models` | 列出 embedding 模型 | N/A |
-| `zotero_rag_metadata_search` | 元数据搜索 | 强制无图片 |
+| `zotero_rag_metadata_search` | 元数据搜索（作者/年份/集合/BM25 等） | 强制无图片 |
+| `zotero_rag_list_collections` | 列出 Zotero 集合（可选树） | N/A |
+| `zotero_rag_search_collection` | 在指定集合内搜索/列出 | 强制无图片 |
 | `zotero_rag_search_text` | 多源文本搜索（元数据+全文+向量） | 强制无图片 |
 | `zotero_rag_search_multimodal` | 多模态向量搜索 | 默认无图片 |
 | `zotero_rag_get_document` | 获取文档详情 | 默认无图片 |
@@ -738,8 +840,9 @@ curl -X POST http://127.0.0.1:8765/ingest/start \
 
 此工具同时查询三个来源并标记出处：
 - **metadata** — Zotero 条目元数据（标题/作者/摘要）
-- **fulltext** — 标准化全文 chunk（SQLite LIKE）
+- **fulltext** — 标准化全文 chunk（FTS5，失败时 LIKE 回退）
 - **text_vector** — 文本向量搜索（embedding API）
+
 
 每个结果标注 `retrieval_source` 字段。
 
@@ -880,6 +983,8 @@ zoterorag backup create --mode full --out data/backups/
 
 ```bash
 zoterorag scan                         # 检测新增/变更
+# 若只需刷新作者/集合/标签等到 state（不重建向量）
+zoterorag resync-metadata --rebuild-fts
 zoterorag ingest start --mode incremental --execute
 ```
 

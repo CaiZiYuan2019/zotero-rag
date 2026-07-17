@@ -1,11 +1,18 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import shutil
 import sqlite3
 import time
 import uuid
+
+
+def _split_concat(value: str | None) -> list[str]:
+    """Split a GROUP_CONCAT('|') aggregate into stripped, non-empty parts."""
+    if not value:
+        return []
+    return [part.strip() for part in value.split("|") if part.strip()]
 
 
 @dataclass(frozen=True)
@@ -18,6 +25,22 @@ class ZoteroAttachment:
     abstract: str | None
     date: str | None
     url: str | None
+    authors: list[str] = field(default_factory=list)
+    collections: list[dict[str, str]] = field(default_factory=list)
+    tags: list[str] = field(default_factory=list)
+    item_type: str | None = None
+    publication_title: str | None = None
+    doi: str | None = None
+    date_added: str | None = None
+    date_modified: str | None = None
+
+
+@dataclass(frozen=True)
+class ZoteroCollection:
+    collection_key: str
+    collection_name: str
+    parent_collection_key: str | None
+    library_id: int | None
 
 
 class ShadowCopyTimeout(TimeoutError):
@@ -134,6 +157,12 @@ class ZoteroShadow:
         self.conn.close()
 
     def list_attachments(self, limit: int | None = None) -> list[ZoteroAttachment]:
+        # Multi-valued fields (authors/collections/tags) are aggregated in
+        # correlated subqueries so they cannot fan out the driving row into a
+        # cartesian product. GROUP_CONCAT uses "|" because author names and
+        # collection names routinely contain commas. Collections/tags/creators
+        # attach to the parent item when present, falling back to the
+        # attachment's own item id for orphan attachments.
         query = """
             SELECT
                 p.key AS parent_key,
@@ -143,10 +172,64 @@ class ZoteroShadow:
                 titlev.value AS title,
                 absv.value AS abstract,
                 datev.value AS date,
-                urlv.value AS url
+                urlv.value AS url,
+                pubv.value AS publication_title,
+                doiv.value AS doi,
+                it.typeName AS item_type,
+                COALESCE(p.dateAdded, a.dateAdded) AS date_added,
+                COALESCE(p.dateModified, a.dateModified) AS date_modified,
+                (
+                    SELECT GROUP_CONCAT(nm, '|') FROM (
+                        SELECT TRIM(COALESCE(cr.firstName, '') || ' ' || COALESCE(cr.lastName, '')) AS nm
+                        FROM itemCreators ic
+                        JOIN creators cr ON ic.creatorID = cr.creatorID
+                        JOIN creatorTypes ct ON ic.creatorTypeID = ct.creatorTypeID
+                        WHERE ic.itemID = COALESCE(p.itemID, a.itemID)
+                          AND ct.creatorType = 'author'
+                        ORDER BY ic.orderIndex
+                    )
+                ) AS authors,
+                (
+                    SELECT GROUP_CONCAT(ck, '|') FROM (
+                        SELECT c.key AS ck
+                        FROM collectionItems ci
+                        JOIN collections c ON ci.collectionID = c.collectionID
+                        WHERE ci.itemID = COALESCE(p.itemID, a.itemID)
+                        ORDER BY c.key
+                    )
+                ) AS collection_keys,
+                (
+                    SELECT GROUP_CONCAT(cn, '|') FROM (
+                        SELECT c.collectionName AS cn
+                        FROM collectionItems ci
+                        JOIN collections c ON ci.collectionID = c.collectionID
+                        WHERE ci.itemID = COALESCE(p.itemID, a.itemID)
+                        ORDER BY c.key
+                    )
+                ) AS collection_names,
+                (
+                    SELECT GROUP_CONCAT(pk, '|') FROM (
+                        SELECT COALESCE(pc.key, '') AS pk
+                        FROM collectionItems ci
+                        JOIN collections c ON ci.collectionID = c.collectionID
+                        LEFT JOIN collections pc ON c.parentCollectionID = pc.collectionID
+                        WHERE ci.itemID = COALESCE(p.itemID, a.itemID)
+                        ORDER BY c.key
+                    )
+                ) AS collection_parents,
+                (
+                    SELECT GROUP_CONCAT(tn, '|') FROM (
+                        SELECT t.name AS tn
+                        FROM itemTags itg
+                        JOIN tags t ON itg.tagID = t.tagID
+                        WHERE itg.itemID = COALESCE(p.itemID, a.itemID)
+                        ORDER BY t.name
+                    )
+                ) AS tags
             FROM itemAttachments ia
             JOIN items a ON ia.itemID = a.itemID
             LEFT JOIN items p ON ia.parentItemID = p.itemID
+            LEFT JOIN itemTypes it ON p.itemTypeID = it.itemTypeID
             LEFT JOIN itemData title ON COALESCE(p.itemID, a.itemID) = title.itemID
                 AND title.fieldID = (SELECT fieldID FROM fields WHERE fieldName = 'title')
             LEFT JOIN itemDataValues titlev ON title.valueID = titlev.valueID
@@ -159,6 +242,12 @@ class ZoteroShadow:
             LEFT JOIN itemData url ON COALESCE(p.itemID, a.itemID) = url.itemID
                 AND url.fieldID = (SELECT fieldID FROM fields WHERE fieldName = 'url')
             LEFT JOIN itemDataValues urlv ON url.valueID = urlv.valueID
+            LEFT JOIN itemData pub ON COALESCE(p.itemID, a.itemID) = pub.itemID
+                AND pub.fieldID = (SELECT fieldID FROM fields WHERE fieldName = 'publicationTitle')
+            LEFT JOIN itemDataValues pubv ON pub.valueID = pubv.valueID
+            LEFT JOIN itemData doi ON COALESCE(p.itemID, a.itemID) = doi.itemID
+                AND doi.fieldID = (SELECT fieldID FROM fields WHERE fieldName = 'DOI')
+            LEFT JOIN itemDataValues doiv ON doi.valueID = doiv.valueID
             ORDER BY a.itemID
         """
         params: tuple[int, ...] = ()
@@ -166,16 +255,69 @@ class ZoteroShadow:
             query += " LIMIT ?"
             params = (limit,)
         rows = self.conn.execute(query, params).fetchall()
+        return [self._row_to_attachment(row) for row in rows]
+
+    @staticmethod
+    def _row_to_attachment(row: sqlite3.Row) -> ZoteroAttachment:
+        keys = _split_concat(row["collection_keys"])
+        names = _split_concat(row["collection_names"])
+        # collection_parents keeps empty slots so it cannot be filtered with the
+        # non-empty splitter; align it positionally with keys/names instead.
+        raw_parents = (row["collection_parents"] or "").split("|")
+        collections: list[dict[str, str]] = []
+        for idx, ckey in enumerate(keys):
+            name = names[idx] if idx < len(names) else ""
+            parent = raw_parents[idx].strip() if idx < len(raw_parents) else ""
+            collections.append(
+                {
+                    "collection_key": ckey,
+                    "collection_name": name,
+                    "parent_collection_key": parent or None,
+                }
+            )
+        return ZoteroAttachment(
+            parent_key=row["parent_key"],
+            attachment_key=row["attachment_key"],
+            content_type=row["content_type"],
+            relative_path=row["relative_path"],
+            title=row["title"],
+            abstract=row["abstract"],
+            date=row["date"],
+            url=row["url"],
+            authors=_split_concat(row["authors"]),
+            collections=collections,
+            tags=_split_concat(row["tags"]),
+            item_type=row["item_type"],
+            publication_title=row["publication_title"],
+            doi=row["doi"],
+            date_added=row["date_added"],
+            date_modified=row["date_modified"],
+        )
+
+    def list_collections(self) -> list[ZoteroCollection]:
+        """Return every Zotero collection definition for full ledger sync.
+
+        Collection definitions are read once here rather than expanded on each
+        attachment row so the shadow aggregate query stays cheap.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT
+                c.key AS collection_key,
+                c.collectionName AS collection_name,
+                pc.key AS parent_collection_key,
+                c.libraryID AS library_id
+            FROM collections c
+            LEFT JOIN collections pc ON c.parentCollectionID = pc.collectionID
+            ORDER BY c.key
+            """
+        ).fetchall()
         return [
-            ZoteroAttachment(
-                parent_key=row["parent_key"],
-                attachment_key=row["attachment_key"],
-                content_type=row["content_type"],
-                relative_path=row["relative_path"],
-                title=row["title"],
-                abstract=row["abstract"],
-                date=row["date"],
-                url=row["url"],
+            ZoteroCollection(
+                collection_key=row["collection_key"],
+                collection_name=row["collection_name"],
+                parent_collection_key=row["parent_collection_key"],
+                library_id=row["library_id"],
             )
             for row in rows
         ]

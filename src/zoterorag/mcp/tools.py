@@ -8,7 +8,14 @@ from ..db import StateLedger
 from ..documents import get_document
 from ..embeddings import search_vector_index
 from ..models import list_embedding_model_catalog
-from ..search import fulltext_search, metadata_search, normalize_query_image
+from ..search import (
+    fulltext_search,
+    get_collection_tree,
+    list_collections,
+    metadata_search,
+    normalize_query_image,
+    search_by_collection,
+)
 from ..search.results import RerankNotSupportedError, ensure_rerank_disabled
 
 
@@ -64,26 +71,85 @@ def zotero_rag_list_models(context: McpToolContext) -> dict[str, Any]:
 def zotero_rag_metadata_search(
     context: McpToolContext,
     *,
-    query: str,
+    query: str = "",
     classification: str | None = None,
     top_k: int = 10,
     rerank: bool = False,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    authors: list[str] | None = None,
+    collections: list[str] | None = None,
+    tags: list[str] | None = None,
+    item_type: str | None = None,
+    publication_title: str | None = None,
+    doi: str | None = None,
+    sort_by: str = "score",
+    sort_order: str = "desc",
+    match_mode: str = "all",
 ) -> dict[str, Any]:
     try:
         ensure_rerank_disabled(rerank)
     except RerankNotSupportedError as exc:
         return {"results": [], "warnings": [str(exc)]}
-    return {
-        "results": metadata_search(
+    try:
+        results = metadata_search(
             context.ledger,
             query=query,
             classification=classification,
             limit=top_k,
             consumer="llm_text",
             rerank=False,
-        ),
-        "warnings": [],
-    }
+            date_from=date_from,
+            date_to=date_to,
+            authors=authors,
+            collections=collections,
+            tags=tags,
+            item_type=item_type,
+            publication_title=publication_title,
+            doi=doi,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            match_mode=match_mode,
+        )
+    except ValueError as exc:
+        return {"results": [], "warnings": [str(exc)]}
+    return {"results": results, "warnings": []}
+
+
+def zotero_rag_list_collections(
+    context: McpToolContext,
+    *,
+    tree: bool = False,
+) -> dict[str, Any]:
+    if tree:
+        return {"collections": get_collection_tree(context.ledger)}
+    return {"collections": list_collections(context.ledger)}
+
+
+def zotero_rag_search_collection(
+    context: McpToolContext,
+    *,
+    collection_key: str,
+    query: str | None = None,
+    include_children: bool = False,
+    top_k: int = 10,
+    sort_by: str = "score",
+    sort_order: str = "desc",
+) -> dict[str, Any]:
+    try:
+        results = search_by_collection(
+            context.ledger,
+            collection_key,
+            query=query,
+            include_children=include_children,
+            limit=top_k,
+            consumer="llm_text",
+            sort_by=sort_by,
+            sort_order=sort_order,
+        )
+    except ValueError as exc:
+        return {"results": [], "warnings": [str(exc)]}
+    return {"results": results, "warnings": []}
 
 
 def zotero_rag_search_text(

@@ -53,6 +53,17 @@ class ClassifiedAttachment:
             "file_exists": self.file_exists,
             "file_size": self.file_size,
             "file_mtime": self.file_mtime,
+            # Bibliographic fields live in dedicated columns. metadata_json stays
+            # an empty object so attachment_fingerprint() (which hashes metadata)
+            # never flips scan_status for biblio-only changes.
+            "authors": list(self.attachment.authors),
+            "collections": [dict(item) for item in self.attachment.collections],
+            "tags": list(self.attachment.tags),
+            "item_type": self.attachment.item_type,
+            "publication_title": self.attachment.publication_title,
+            "doi": self.attachment.doi,
+            "date_added": self.attachment.date_added,
+            "date_modified": self.attachment.date_modified,
             "metadata": {},
         }
 
