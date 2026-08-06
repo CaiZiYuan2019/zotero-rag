@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import logging
 import unittest
 from unittest.mock import MagicMock, patch
 
+from tests._support import workspace_tmpdir
 from zoterorag.index.lancedb_vector import (
     LanceDBVectorStore,
     _build_profile_name_predicate,
@@ -157,3 +159,108 @@ class LanceDBVectorStoreBehaviorTests(unittest.TestCase):
             self.assertEqual(
                 0, store.copy_active_records_to_version(index_version="v2")
             )
+
+
+class LanceDBVersionCleanupTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.mock_db = MagicMock()
+        clear_lancedb_cache()
+        self.meta_table = MagicMock()
+        arrow = MagicMock()
+        arrow.to_pylist.return_value = [{"profile_name": "p1", "active_version": "v1"}]
+        self.meta_table.to_arrow.return_value = arrow
+        self.mock_db.open_table.return_value = self.meta_table
+
+    def _store(self, tmpdir) -> LanceDBVectorStore:
+        lancedb = MagicMock()
+        lancedb.connect.return_value = self.mock_db
+        with patch("zoterorag.index.lancedb_vector._import_lancedb", return_value=lancedb):
+            return LanceDBVectorStore(tmpdir / "vectors", profile_name="p1", dimension=3)
+
+    def test_publish_drops_superseded_table(self) -> None:
+        with workspace_tmpdir("lancedb-publish-drop-") as tmpdir:
+            store = self._store(tmpdir)
+            store._table_cache["vectors_v1"] = object()
+            store.publish_version("v2")
+
+            self.mock_db.drop_table.assert_called_once_with("vectors_v1")
+            self.assertNotIn("vectors_v1", store._table_cache)
+            self.meta_table.delete.assert_called_once()
+            self.meta_table.add.assert_called_once()
+
+    def test_publish_same_version_does_not_drop(self) -> None:
+        with workspace_tmpdir("lancedb-publish-same-") as tmpdir:
+            store = self._store(tmpdir)
+            # Meta reports "v1" active; republishing "v1" must not drop it.
+            store.publish_version("v1")
+
+            self.mock_db.drop_table.assert_not_called()
+
+    def test_publish_drop_failure_only_warns(self) -> None:
+        self.mock_db.drop_table.side_effect = RuntimeError("disk full")
+        with workspace_tmpdir("lancedb-publish-dropfail-") as tmpdir:
+            store = self._store(tmpdir)
+            with self.assertLogs("zoterorag.index.lancedb_vector", level=logging.WARNING) as cm:
+                store.publish_version("v2")
+
+            self.assertTrue(any("vectors_v1" in message for message in cm.output), cm.output)
+
+    def test_publish_missing_superseded_table_is_noop(self) -> None:
+        self.mock_db.drop_table.side_effect = FileNotFoundError("vectors_v1")
+        with workspace_tmpdir("lancedb-publish-dropmissing-") as tmpdir:
+            store = self._store(tmpdir)
+            store.publish_version("v2")  # must not raise
+
+    def test_delete_version_guards_active_and_drops_orphan(self) -> None:
+        self.mock_db.table_names.return_value = ["vectors_v1", "vectors_orphan", "vector_meta"]
+        with workspace_tmpdir("lancedb-delete-version-") as tmpdir:
+            store = self._store(tmpdir)
+            with self.assertRaises(ValueError):
+                store.delete_version("v1")
+            self.assertEqual(1, store.delete_version("orphan"))
+            self.mock_db.drop_table.assert_called_once_with("vectors_orphan")
+            self.assertEqual(0, store.delete_version("ghost"))
+
+    def test_list_versions_filters_meta_and_unrelated_tables(self) -> None:
+        self.mock_db.table_names.return_value = ["vectors_b", "vector_meta", "vectors_a", "snapshots"]
+        with workspace_tmpdir("lancedb-list-versions-") as tmpdir:
+            store = self._store(tmpdir)
+            self.assertEqual(["a", "b"], store.list_versions())
+
+    def _set_active_version(self, version: str) -> None:
+        arrow = MagicMock()
+        arrow.to_pylist.return_value = [{"profile_name": "p1", "active_version": version}]
+        self.meta_table.to_arrow.return_value = arrow
+
+    def test_version_is_active_with_digit_leading_version(self) -> None:
+        # sha256 batch hashes start with a digit ~62% of the time; the
+        # sanitized table name (v_1abc) must still match the active version.
+        self._set_active_version("1abc")
+        with workspace_tmpdir("lancedb-active-digit-") as tmpdir:
+            store = self._store(tmpdir)
+            self.assertTrue(store.version_is_active("1abc"))
+            self.assertTrue(store.version_is_active("v_1abc"))
+            self.assertFalse(store.version_is_active("v_9xyz"))
+
+    def test_delete_version_guard_with_sanitized_active_name(self) -> None:
+        self._set_active_version("1abc")
+        self.mock_db.table_names.return_value = ["vectors_v_1abc", "vectors_orphan"]
+        with workspace_tmpdir("lancedb-guard-digit-") as tmpdir:
+            store = self._store(tmpdir)
+            # list_versions() yields the table-derived name; the guard must
+            # still recognize it as the active version and refuse.
+            with self.assertRaises(ValueError):
+                store.delete_version("v_1abc")
+            self.mock_db.drop_table.assert_not_called()
+
+    def test_prune_skip_logic_with_digit_leading_active(self) -> None:
+        self._set_active_version("1abc")
+        self.mock_db.table_names.return_value = ["vectors_v_1abc", "vectors_orphan"]
+        with workspace_tmpdir("lancedb-prune-digit-") as tmpdir:
+            store = self._store(tmpdir)
+            for version in store.list_versions():
+                if store.version_is_active(version):
+                    continue
+                store.delete_version(version)
+            # Only the orphan table is dropped; the active table survives.
+            self.mock_db.drop_table.assert_called_once_with("vectors_orphan")

@@ -48,6 +48,11 @@ def extractor_cache_key(
     return hashlib.sha256(encoded).hexdigest()
 
 
+# Assumed page count when the real count cannot be read (e.g. PyMuPDF
+# unavailable). Drives a conservative poll budget of 500*6+30 = 3030s.
+UNKNOWN_PAGE_COUNT_FALLBACK = 500
+
+
 def recommended_mineru_timeout_seconds(selected_page_count: int) -> int:
     """Conservative MinerU timeout.
 

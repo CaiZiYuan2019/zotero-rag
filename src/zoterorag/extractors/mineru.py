@@ -142,13 +142,15 @@ class MinerUProvider:
         self.retry_backoff_factor = retry_backoff_factor
         self.retry_jitter = retry_jitter
 
+    # Individual HTTP calls must fail fast: MinerU reports progress via
+    # polling, so long waits belong in the poll loop, not in request timeouts.
+    # The per-job ``timeout_seconds`` option is the overall poll budget only
+    # (see ExtractionManager._resume_poll) and must not inflate these values.
     def _request_timeout_seconds(self, options: dict[str, Any] | None = None) -> int | float:
-        options_timeout = int((options or {}).get("timeout_seconds", 0) or 0)
-        return max(self.request_timeout_seconds, options_timeout) if options_timeout > 0 else self.request_timeout_seconds
+        return self.request_timeout_seconds
 
     def _transfer_timeout_seconds(self, options: dict[str, Any] | None = None) -> int | float:
-        options_timeout = int((options or {}).get("timeout_seconds", 0) or 0)
-        return max(self.transfer_timeout_seconds, options_timeout) if options_timeout > 0 else self.transfer_timeout_seconds
+        return self.transfer_timeout_seconds
 
     def _is_retryable_exception(self, exc: BaseException) -> bool:
         if isinstance(exc, (TimeoutError, OSError)):

@@ -17,6 +17,7 @@ from ..normalize.merge_extract_segments import (
 from ..pdf_pages import get_pdf_page_count
 from ..search.results import RerankNotSupportedError
 from ..extractors.segments import compute_page_segments
+from ..extractors.cache import UNKNOWN_PAGE_COUNT_FALLBACK
 from ..config.settings import ExtractConfig
 
 
@@ -720,9 +721,15 @@ def _execute_extract_stage(
 
     if not should_split:
         _progress("  extract: submitting...")
+        # selected_page_count feeds the persisted per-job poll budget
+        # (pages*6+30). Passing 1 for an unsplit PDF would persist a 36s
+        # budget that prematurely fails resumed polls and causes costly
+        # full-PDF resubmissions; use the real count when known and a
+        # conservative upper guess when PyMuPDF could not read the pages.
         request = ExtractionRequest(
             input_file=Path(file_path),
             attachment_key=attachment_key,
+            selected_page_count=total_pages if total_pages is not None else UNKNOWN_PAGE_COUNT_FALLBACK,
         )
         result = extract_manager.ensure_extraction(request)
         result = _drive_extraction_to_completion(result, extract_manager)

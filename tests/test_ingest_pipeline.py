@@ -247,16 +247,19 @@ class IngestPipelineTests(unittest.TestCase):
                 self.assertEqual("extract:pending", plan["documents"][0]["next_stage"])
                 self.assertEqual("completed_artifact_not_downloaded", plan["documents"][0]["stages"][0]["reason"])
 
-                result = start_ingest_job(
-                    ledger,
-                    zotero_key="ATT_RECOV",
-                    include_multimodal=False,
-                    execute=True,
-                    extract_manager=extract_manager,
-                    extract_cache_dir=tmpdir / "extract_cache",
-                    normalized_dir=tmpdir / "normalized",
-                    vector_store_dir=tmpdir / "vectors",
-                )
+                # Pin the page count so the ingest-side cache key matches the
+                # job created above with the 1-page default request.
+                with patch("zoterorag.pipeline.ingest.get_pdf_page_count", return_value=1):
+                    result = start_ingest_job(
+                        ledger,
+                        zotero_key="ATT_RECOV",
+                        include_multimodal=False,
+                        execute=True,
+                        extract_manager=extract_manager,
+                        extract_cache_dir=tmpdir / "extract_cache",
+                        normalized_dir=tmpdir / "normalized",
+                        vector_store_dir=tmpdir / "vectors",
+                    )
 
                 self.assertEqual("completed", result["job"]["status"])
                 self.assertEqual(1, len(result["executed"]))
@@ -411,16 +414,19 @@ class IngestPipelineTests(unittest.TestCase):
                     cache_dir=tmpdir / "extract_cache",
                     provider=provider,
                 )
-                result = start_ingest_job(
-                    ledger,
-                    zotero_key="ATT_RUN",
-                    include_multimodal=False,
-                    execute=True,
-                    extract_manager=extract_manager,
-                    extract_cache_dir=tmpdir / "extract_cache",
-                    normalized_dir=tmpdir / "normalized",
-                    vector_store_dir=tmpdir / "vectors",
-                )
+                # Pin the page count to 1 so the ingest-side cache key matches
+                # the seeded running job (which used the 1-page timeout).
+                with patch("zoterorag.pipeline.ingest.get_pdf_page_count", return_value=1):
+                    result = start_ingest_job(
+                        ledger,
+                        zotero_key="ATT_RUN",
+                        include_multimodal=False,
+                        execute=True,
+                        extract_manager=extract_manager,
+                        extract_cache_dir=tmpdir / "extract_cache",
+                        normalized_dir=tmpdir / "normalized",
+                        vector_store_dir=tmpdir / "vectors",
+                    )
 
                 self.assertEqual("completed", result["job"]["status"])
                 self.assertEqual(1, len(result["executed"]))
@@ -618,6 +624,88 @@ class IngestPipelineTests(unittest.TestCase):
                     if job.get("attachment_key") == "ATT_NOSPLIT"
                 ]
                 self.assertEqual(1, len(jobs))
+            finally:
+                ledger.close()
+
+    def test_single_job_passes_real_page_count_to_poll_budget(self) -> None:
+        with workspace_tmpdir("ingest-nosplit-pages-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                seed_profiles(ledger)
+                attachment = build_attachment_with_file(tmpdir, "ATT_PAGES", title="Known Pages Paper")
+                ledger.upsert_attachments([attachment])
+
+                extract_manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=MarkdownStubExtractorProvider(),
+                )
+                extract_config = ExtractConfig(split_large_pdfs=False, max_pages_per_extraction=200)
+
+                with patch("zoterorag.pipeline.ingest.get_pdf_page_count", return_value=250):
+                    result = start_ingest_job(
+                        ledger,
+                        zotero_key="ATT_PAGES",
+                        include_multimodal=False,
+                        execute=True,
+                        extract_manager=extract_manager,
+                        extract_cache_dir=tmpdir / "extract_cache",
+                        normalized_dir=tmpdir / "normalized",
+                        vector_store_dir=tmpdir / "vectors",
+                        extract_config=extract_config,
+                    )
+
+                self.assertEqual("completed", result["job"]["status"])
+                jobs = [
+                    job for job in ledger.list_extract_jobs(limit=None)
+                    if job.get("attachment_key") == "ATT_PAGES"
+                ]
+                self.assertEqual(1, len(jobs))
+                options = (jobs[0].get("payload") or {}).get("options") or {}
+                # 250 known pages -> 250*6+30, not the old 1-page 36s budget.
+                self.assertEqual(250 * 6 + 30, options.get("timeout_seconds"))
+            finally:
+                ledger.close()
+
+    def test_single_job_unknown_page_count_uses_conservative_fallback(self) -> None:
+        with workspace_tmpdir("ingest-nosplit-unknown-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                seed_profiles(ledger)
+                attachment = build_attachment_with_file(tmpdir, "ATT_NOPAGES", title="Unknown Pages Paper")
+                ledger.upsert_attachments([attachment])
+
+                extract_manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=MarkdownStubExtractorProvider(),
+                )
+                extract_config = ExtractConfig(split_large_pdfs=False, max_pages_per_extraction=200)
+
+                with patch("zoterorag.pipeline.ingest.get_pdf_page_count", return_value=None):
+                    result = start_ingest_job(
+                        ledger,
+                        zotero_key="ATT_NOPAGES",
+                        include_multimodal=False,
+                        execute=True,
+                        extract_manager=extract_manager,
+                        extract_cache_dir=tmpdir / "extract_cache",
+                        normalized_dir=tmpdir / "normalized",
+                        vector_store_dir=tmpdir / "vectors",
+                        extract_config=extract_config,
+                    )
+
+                self.assertEqual("completed", result["job"]["status"])
+                jobs = [
+                    job for job in ledger.list_extract_jobs(limit=None)
+                    if job.get("attachment_key") == "ATT_NOPAGES"
+                ]
+                self.assertEqual(1, len(jobs))
+                options = (jobs[0].get("payload") or {}).get("options") or {}
+                # Unknown page count -> conservative 500-page budget (3030s)
+                # instead of the 36s budget that caused premature resume
+                # failures and full-PDF resubmissions.
+                self.assertEqual(500 * 6 + 30, options.get("timeout_seconds"))
             finally:
                 ledger.close()
 

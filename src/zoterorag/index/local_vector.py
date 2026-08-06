@@ -318,11 +318,20 @@ class LocalVectorStore:
 
         Writers can stage a full rebuild under a fresh `index_version`; readers
         keep using the previous version until this metadata row is committed.
+
+        The superseded version is deleted in the same transaction: old
+        versions are never read after the switch, and keeping them made disk
+        usage grow without bound (every incremental index staged a full copy).
         """
 
         with self._file_lock:
             with self._lock:
                 with self.conn:
+                    row = self.conn.execute(
+                        "SELECT active_version FROM vector_meta WHERE profile_name = ?",
+                        (self.profile_name,),
+                    ).fetchone()
+                    previous = str(row["active_version"]) if row is not None else "legacy"
                     self.conn.execute(
                         """
                         INSERT INTO vector_meta(profile_name, active_version, updated_at)
@@ -333,6 +342,14 @@ class LocalVectorStore:
                         """,
                         (self.profile_name, index_version),
                     )
+                    # Guard: re-publishing the already-active version (e.g. a
+                    # crash-recovery re-embed with the same batch hash) must
+                    # not delete the active version itself.
+                    if previous != index_version:
+                        self.conn.execute(
+                            "DELETE FROM vectors WHERE profile_name = ? AND index_version = ?",
+                            (self.profile_name, previous),
+                        )
 
     def active_version(self) -> str:
         row = self.conn.execute(
@@ -340,6 +357,46 @@ class LocalVectorStore:
             (self.profile_name,),
         ).fetchone()
         return str(row["active_version"]) if row is not None else "legacy"
+
+    def list_versions(self) -> list[str]:
+        """All version names that still have rows for this profile."""
+
+        rows = self.conn.execute(
+            "SELECT DISTINCT index_version FROM vectors WHERE profile_name = ?",
+            (self.profile_name,),
+        ).fetchall()
+        return sorted(str(row["index_version"]) for row in rows)
+
+    def version_is_active(self, index_version: str) -> bool:
+        """Whether `index_version` refers to the currently active version."""
+
+        return index_version == self.active_version()
+
+    def delete_version(self, index_version: str) -> int:
+        """Delete every row of a non-active version (used by `vectors prune`)."""
+
+        with self._file_lock:
+            with self._lock:
+                if self.version_is_active(index_version):
+                    raise ValueError(f"cannot delete the active version {index_version!r}")
+                with self.conn:
+                    cursor = self.conn.execute(
+                        "DELETE FROM vectors WHERE profile_name = ? AND index_version = ?",
+                        (self.profile_name, index_version),
+                    )
+                    return int(cursor.rowcount)
+
+    def vacuum(self) -> None:
+        """Reclaim pages freed by deletions (used by `vectors prune --vacuum`).
+
+        VACUUM cannot run inside a transaction, so this intentionally avoids
+        the ``with self.conn`` transaction wrapper. Run it only while no
+        indexing job is active.
+        """
+
+        with self._file_lock:
+            with self._lock:
+                self.conn.execute("VACUUM")
 
     def search(
         self,

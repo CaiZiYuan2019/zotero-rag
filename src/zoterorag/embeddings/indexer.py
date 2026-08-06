@@ -303,6 +303,88 @@ def vector_index_counts(vector_path: Path, *, profile_name: str, dimension: int,
         store.close()
 
 
+def prune_vector_index_versions(
+    *,
+    ledger: StateLedger,
+    vector_store_dir: str | Path,
+    profile_name: str,
+    vacuum: bool = False,
+) -> dict[str, Any]:
+    """Delete every non-active vector version for a profile (one-time reclaim).
+
+    ``publish_version`` already deletes the directly superseded version, but
+    versions orphaned by crashes (and everything written before that cleanup
+    existed) linger. This removes them. Safety rails: the registered
+    ``active_version`` must match the store's own metadata, and the active
+    version must be non-empty, so a corrupt registration aborts the prune.
+    Run this only while no indexing job is active for the profile: pruning
+    concurrently with an in-flight index could delete the version being
+    staged, so a running embedding batch aborts the prune.
+    """
+
+    profiles = {profile["name"]: profile for profile in ledger.list_embedding_profiles()}
+    profile = profiles.get(profile_name)
+    if profile is None:
+        raise ValueError(f"profile_not_found:{profile_name}")
+    running_batches = ledger.list_embedding_batches(profile_name=profile_name, status="running")
+    if running_batches:
+        raise ValueError(
+            f"{len(running_batches)} embedding batch(es) still running for {profile_name}; "
+            "finish or recover them before pruning"
+        )
+    resolved_backend, vector_path = _resolve_registered_vector_store(
+        ledger,
+        vector_store_dir=vector_store_dir,
+        profile_name=profile_name,
+        fallback_backend=str(profile.get("backend", "lancedb")),
+    )
+    registered = next(
+        (index for index in ledger.list_vector_indexes() if index["profile_name"] == profile_name),
+        None,
+    )
+    store = open_vector_store(
+        vector_path,
+        profile_name=profile_name,
+        dimension=int(profile["dimension"]),
+        backend=resolved_backend,
+    )
+    try:
+        active_version = store.active_version()
+        registered_active = str((registered or {}).get("active_version") or "legacy")
+        if registered is None:
+            raise ValueError(f"vector_index_not_registered:{profile_name}")
+        if registered_active != active_version:
+            raise ValueError(
+                f"active_version mismatch: ledger={registered_active!r} store={active_version!r}; "
+                "run `vectors verify` before pruning"
+            )
+        counts = store.counts(index_version=active_version)
+        if int(counts["chunks"]) <= 0:
+            raise ValueError(f"active version {active_version!r} is empty; refusing to prune")
+        versions = store.list_versions()
+        removed: dict[str, int] = {}
+        for version in versions:
+            # Compare via the store: LanceDB table names are sanitized
+            # irreversibly, so raw string equality can miss the active one.
+            if store.version_is_active(version):
+                continue
+            removed[version] = store.delete_version(version)
+        vacuumed = False
+        if vacuum and hasattr(store, "vacuum"):
+            store.vacuum()
+            vacuumed = True
+        return {
+            "profile_name": profile_name,
+            "backend": resolved_backend,
+            "active_version": active_version,
+            "kept_versions": [active_version],
+            "removed_versions": removed,
+            "vacuumed": vacuumed,
+        }
+    finally:
+        store.close()
+
+
 def search_vector_index(
     *,
     ledger: StateLedger,

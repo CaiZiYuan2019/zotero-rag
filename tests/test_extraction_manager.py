@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import itertools
 import json
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 import uuid
 
 from tests._support import workspace_tmpdir
@@ -12,6 +14,7 @@ from zoterorag.extractors import (
     ExtractionManager,
     ExtractionRequest,
     ExtractorKeyPool,
+    MinerUAPIError,
     MinerUProvider,
     recommended_mineru_timeout_seconds,
 )
@@ -306,7 +309,7 @@ class ExtractionManagerTests(unittest.TestCase):
             finally:
                 ledger.close()
 
-    def test_recommended_timeout_is_passed_to_mineru_provider(self) -> None:
+    def test_recommended_timeout_is_poll_budget_not_http_timeout(self) -> None:
         with workspace_tmpdir("extract-timeout-") as tmpdir:
             source = tmpdir / "paper.pdf"
             source.write_bytes(b"%PDF-1.4 fake body")
@@ -323,7 +326,7 @@ class ExtractionManagerTests(unittest.TestCase):
                     ),
                     key_pool=ExtractorKeyPool([ApiKeyRef(alias="mineru_a", secret="secret-a")]),
                 )
-                manager.ensure_extraction(
+                result = manager.ensure_extraction(
                     ExtractionRequest(
                         input_file=source,
                         attachment_key="ATTACH1",
@@ -331,9 +334,15 @@ class ExtractionManagerTests(unittest.TestCase):
                         selected_page_count=2,
                     )
                 )
-                expected_timeout = 2 * 6 + 30  # recommended_mineru_timeout_seconds(2)
-                self.assertEqual(expected_timeout, client.posts[0]["timeout"])
-                self.assertEqual(expected_timeout, client.puts[0]["timeout"])
+                # MinerU progress is tracked by polling: individual HTTP calls
+                # must fail fast with the provider defaults instead of waiting
+                # for the whole per-job poll budget.
+                self.assertEqual(30, client.posts[0]["timeout"])
+                self.assertEqual(30, client.puts[0]["timeout"])
+                # The recommended budget is still persisted as the poll budget.
+                expected_budget = 2 * 6 + 30  # recommended_mineru_timeout_seconds(2)
+                persisted_options = (result.job.get("payload") or {}).get("options") or {}
+                self.assertEqual(expected_budget, persisted_options.get("timeout_seconds"))
             finally:
                 ledger.close()
 
@@ -445,7 +454,66 @@ class FailingSubmitProvider:
         raise AssertionError("download should not be called")
 
 
+class AlwaysRunningPollProvider:
+    name = "always-running"
+    version = "0"
+
+    def fingerprint(self, input_file, options_hash: str) -> str:
+        return "always-running"
+
+    def submit(self, input_file, options_hash: str, *, options=None, api_key=None) -> ExtractJobState:
+        raise AssertionError("submit should not be called")
+
+    def poll(self, external_job_id: str, *, api_key=None, options=None) -> ExtractJobState:
+        return ExtractJobState(external_job_id=external_job_id, state="running")
+
+    def download(self, external_job_id, output_dir, *, api_key=None, source_pdf=None, options=None) -> ExtractArtifact:
+        raise AssertionError("download should not be called")
+
+
 class ExtractionManagerResumeTests(unittest.TestCase):
+    def test_resume_poll_deadline_never_below_manager_default(self) -> None:
+        """A job persisted with the old 1-page budget (36s) must not be failed
+        prematurely on resume; the manager-level default wins as the floor."""
+        with workspace_tmpdir("extract-resume-deadline-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=AlwaysRunningPollProvider(),
+                    poll_interval_seconds=0.0,
+                )
+                job_id = str(uuid.uuid4())
+                ledger.upsert_extract_job(
+                    {
+                        "job_id": job_id,
+                        "attachment_key": "ATT1",
+                        "pdf_sha256": "a" * 64,
+                        "selected_pages": "",
+                        "cache_key": "cache-tiny-budget",
+                        "provider": "always-running",
+                        "provider_version": "0",
+                        "options_hash": "options",
+                        "api_key_alias": "stub_stub",
+                        "external_job_id": "batch-tiny-budget",
+                        "state": "running",
+                        "local_stage": "poll",
+                        "payload": {"options": {"timeout_seconds": 36}},
+                    }
+                )
+                ticks = itertools.count(start=0.0, step=10000.0)
+                with patch("time.monotonic", side_effect=lambda: next(ticks)):
+                    with self.assertRaises(MinerUAPIError) as ctx:
+                        manager.resume_extraction(job_id)
+                # The 36s persisted budget would have raised almost
+                # immediately; the manager default (21600s) must be the floor.
+                self.assertIn("21600s", str(ctx.exception))
+                job = ledger.get_extract_job(job_id=job_id)
+                self.assertEqual("failed_retryable", job["state"])
+            finally:
+                ledger.close()
+
     def test_resume_poll_completes_and_downloads_artifact(self) -> None:
         with workspace_tmpdir("extract-resume-poll-") as tmpdir:
             source = tmpdir / "paper.pdf"

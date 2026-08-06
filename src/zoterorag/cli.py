@@ -11,7 +11,7 @@ from .api.server import serve_api, validate_serve_access
 from .diagnostics import run_runtime_diagnostics
 from .documents import get_document, list_documents
 from .embeddings import index_normalized_document, search_vector_index
-from .embeddings.indexer import require_embedding_profile, select_profile
+from .embeddings.indexer import prune_vector_index_versions, require_embedding_profile, select_profile
 from .extractors import (
     ExtractionManager,
     ExtractionRequest,
@@ -135,6 +135,16 @@ def build_parser() -> argparse.ArgumentParser:
     vectors_sub.add_parser("list")
     vectors_verify = vectors_sub.add_parser("verify")
     vectors_verify.add_argument("--profile", required=True)
+    vectors_prune = vectors_sub.add_parser(
+        "prune",
+        help="Delete non-active vector versions to reclaim disk (run a backup first).",
+    )
+    vectors_prune.add_argument("--profile", required=True)
+    vectors_prune.add_argument(
+        "--vacuum",
+        action="store_true",
+        help="Also VACUUM sqlite-local stores to shrink the file on disk.",
+    )
 
     jobs = sub.add_parser("jobs", help="Inspect pipeline jobs and progress events.")
     jobs_sub = jobs.add_subparsers(dest="jobs_command", required=True)
@@ -467,6 +477,19 @@ def main(argv: list[str] | None = None) -> int:
             result = verify_vector_index(ledger, args.profile)
             emit(result.to_dict())
             return 0 if result.ok else 1
+        if args.command == "vectors" and args.vectors_command == "prune":
+            try:
+                result = prune_vector_index_versions(
+                    ledger=ledger,
+                    vector_store_dir=config.paths.vector_store_dir,
+                    profile_name=args.profile,
+                    vacuum=args.vacuum,
+                )
+            except (FileNotFoundError, ImportError, ValueError) as exc:
+                emit({"ok": False, "error": str(exc)})
+                return 1
+            emit({"ok": True, **result})
+            return 0
 
         if args.command == "jobs":
             if args.jobs_command == "list":

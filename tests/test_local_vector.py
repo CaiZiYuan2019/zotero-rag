@@ -30,6 +30,92 @@ def _upsert_worker(path: str, profile_name: str, start: int, count: int) -> None
         store.close()
 
 
+class LocalVectorStoreVersionCleanupTests(unittest.TestCase):
+    def _record(self, doc: str, chunk: str, vector: list[float]) -> VectorRecord:
+        return VectorRecord(
+            record_id=f"p1:{chunk}",
+            document_id=doc,
+            chunk_id=chunk,
+            vector=vector,
+            text=f"text {chunk}",
+            modality="text",
+        )
+
+    def test_publish_deletes_superseded_version(self) -> None:
+        with workspace_tmpdir("local-vector-prune-") as tmpdir:
+            store = LocalVectorStore(tmpdir / "vectors.sqlite", profile_name="p1", dimension=3)
+            try:
+                store.upsert([self._record("DOCA", "c1", [1.0, 0.0, 0.0])], index_version="v1")
+                store.publish_version("v1")
+                store.copy_active_records_to_version(index_version="v2", exclude_document_ids=[])
+                store.upsert([self._record("DOCB", "c2", [0.0, 1.0, 0.0])], index_version="v2")
+                store.publish_version("v2")
+
+                self.assertEqual(["v2"], store.list_versions())
+                hits = store.search([1.0, 0.0, 0.0], top_k=10)
+                self.assertEqual({"c1", "c2"}, {hit["chunk_id"] for hit in hits})
+                self.assertEqual(2, store.counts()["chunks"])
+            finally:
+                store.close()
+
+    def test_publish_same_version_keeps_active_rows(self) -> None:
+        with workspace_tmpdir("local-vector-republish-") as tmpdir:
+            store = LocalVectorStore(tmpdir / "vectors.sqlite", profile_name="p1", dimension=3)
+            try:
+                store.upsert([self._record("DOCA", "c1", [1.0, 0.0, 0.0])], index_version="v1")
+                store.publish_version("v1")
+                # Crash-recovery re-embed republishes the same batch hash; the
+                # guard must not delete the active version itself.
+                store.publish_version("v1")
+
+                self.assertEqual(["v1"], store.list_versions())
+                self.assertEqual(1, store.counts()["chunks"])
+            finally:
+                store.close()
+
+    def test_first_publish_clears_legacy_rows(self) -> None:
+        with workspace_tmpdir("local-vector-legacy-") as tmpdir:
+            store = LocalVectorStore(tmpdir / "vectors.sqlite", profile_name="p1", dimension=3)
+            try:
+                store.upsert([self._record("DOCA", "c1", [1.0, 0.0, 0.0])])
+                store.copy_active_records_to_version(index_version="v1", exclude_document_ids=[])
+                store.publish_version("v1")
+
+                self.assertEqual(["v1"], store.list_versions())
+                hits = store.search([1.0, 0.0, 0.0], top_k=10)
+                self.assertEqual(["c1"], [hit["chunk_id"] for hit in hits])
+            finally:
+                store.close()
+
+    def test_delete_version_refuses_active(self) -> None:
+        with workspace_tmpdir("local-vector-del-active-") as tmpdir:
+            store = LocalVectorStore(tmpdir / "vectors.sqlite", profile_name="p1", dimension=3)
+            try:
+                store.upsert([self._record("DOCA", "c1", [1.0, 0.0, 0.0])], index_version="v1")
+                store.publish_version("v1")
+
+                with self.assertRaises(ValueError):
+                    store.delete_version("v1")
+                self.assertEqual(1, store.counts()["chunks"])
+            finally:
+                store.close()
+
+    def test_delete_version_removes_orphan(self) -> None:
+        with workspace_tmpdir("local-vector-del-orphan-") as tmpdir:
+            store = LocalVectorStore(tmpdir / "vectors.sqlite", profile_name="p1", dimension=3)
+            try:
+                store.upsert([self._record("DOCA", "c1", [1.0, 0.0, 0.0])], index_version="v1")
+                store.publish_version("v1")
+                # Simulate a crash-interrupted staged version left behind.
+                store.upsert([self._record("DOCB", "c2", [0.0, 1.0, 0.0])], index_version="orphan")
+                self.assertEqual(["orphan", "v1"], store.list_versions())
+
+                self.assertEqual(1, store.delete_version("orphan"))
+                self.assertEqual(["v1"], store.list_versions())
+            finally:
+                store.close()
+
+
 class LocalVectorStoreTests(unittest.TestCase):
     def test_search_skips_corrupt_vector_json(self) -> None:
         with workspace_tmpdir("local-vector-corrupt-") as tmpdir:

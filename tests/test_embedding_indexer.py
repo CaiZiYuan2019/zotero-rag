@@ -627,3 +627,152 @@ class FailingProvider:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VectorIndexPruneTests(unittest.TestCase):
+    def _seed_store_and_ledger(self, tmpdir: Path, *, active_version: str = "v1", active_chunks: int = 1):
+        from zoterorag.index.local_vector import LocalVectorStore, VectorRecord
+
+        ledger = StateLedger(tmpdir / "state.sqlite")
+        ledger.upsert_embedding_profiles(
+            [
+                EmbeddingProfile(
+                    name="p_text",
+                    provider="stub",
+                    model="stub",
+                    dimension=3,
+                    modality="text",
+                    enabled=True,
+                    default_for_text=True,
+                    backend="sqlite-local",
+                ),
+            ]
+        )
+        vector_path = tmpdir / "vectors" / "p_text.sqlite"
+        store = LocalVectorStore(vector_path, profile_name="p_text", dimension=3)
+        if active_chunks:
+            store.upsert(
+                [
+                    VectorRecord(
+                        record_id="p1:c1",
+                        document_id="DOCA",
+                        chunk_id="c1",
+                        vector=[1.0, 0.0, 0.0],
+                        text="alpha",
+                        modality="text",
+                    )
+                ],
+                index_version="v1",
+            )
+        store.publish_version("v1")
+        # A crash-interrupted staged version left behind as an orphan.
+        store.upsert(
+            [
+                VectorRecord(
+                    record_id="p1:c2",
+                    document_id="DOCB",
+                    chunk_id="c2",
+                    vector=[0.0, 1.0, 0.0],
+                    text="beta",
+                    modality="text",
+                )
+            ],
+            index_version="orphan",
+        )
+        store.close()
+        ledger.register_vector_index(
+            profile_name="p_text",
+            backend="sqlite-local",
+            path=vector_path,
+            document_count=active_chunks,
+            chunk_count=active_chunks,
+            active=True,
+            active_version=active_version,
+        )
+        return ledger, vector_path
+
+    def test_prune_removes_non_active_versions_and_vacuums(self) -> None:
+        from zoterorag.embeddings.indexer import prune_vector_index_versions
+        from zoterorag.index.local_vector import LocalVectorStore
+
+        with workspace_tmpdir("vector-prune-") as tmpdir:
+            ledger, vector_path = self._seed_store_and_ledger(tmpdir)
+            try:
+                result = prune_vector_index_versions(
+                    ledger=ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="p_text",
+                    vacuum=True,
+                )
+                self.assertEqual(["v1"], result["kept_versions"])
+                self.assertEqual({"orphan": 1}, result["removed_versions"])
+                self.assertTrue(result["vacuumed"])
+
+                store = LocalVectorStore(vector_path, profile_name="p_text", dimension=3)
+                try:
+                    self.assertEqual(["v1"], store.list_versions())
+                    self.assertEqual(1, store.counts()["chunks"])
+                finally:
+                    store.close()
+            finally:
+                ledger.close()
+
+    def test_prune_aborts_on_active_version_mismatch(self) -> None:
+        from zoterorag.embeddings.indexer import prune_vector_index_versions
+
+        with workspace_tmpdir("vector-prune-mismatch-") as tmpdir:
+            ledger, _ = self._seed_store_and_ledger(tmpdir, active_version="stale-registration")
+            try:
+                with self.assertRaises(ValueError) as ctx:
+                    prune_vector_index_versions(
+                        ledger=ledger,
+                        vector_store_dir=tmpdir / "vectors",
+                        profile_name="p_text",
+                    )
+                self.assertIn("mismatch", str(ctx.exception))
+            finally:
+                ledger.close()
+
+    def test_prune_aborts_when_active_version_empty(self) -> None:
+        from zoterorag.embeddings.indexer import prune_vector_index_versions
+
+        with workspace_tmpdir("vector-prune-empty-") as tmpdir:
+            ledger, _ = self._seed_store_and_ledger(tmpdir, active_chunks=0)
+            try:
+                with self.assertRaises(ValueError) as ctx:
+                    prune_vector_index_versions(
+                        ledger=ledger,
+                        vector_store_dir=tmpdir / "vectors",
+                        profile_name="p_text",
+                    )
+                self.assertIn("empty", str(ctx.exception))
+            finally:
+                ledger.close()
+
+    def test_prune_aborts_with_running_embedding_batch(self) -> None:
+        from zoterorag.embeddings.indexer import prune_vector_index_versions
+
+        with workspace_tmpdir("vector-prune-running-") as tmpdir:
+            ledger, _ = self._seed_store_and_ledger(tmpdir)
+            try:
+                ledger.upsert_embedding_batch(
+                    batch_hash="running-batch",
+                    profile_name="p_text",
+                    profile_hash="hash",
+                    document_id="DOCX",
+                    chunk_type="text",
+                    chunk_count=1,
+                    status="running",
+                    provider="stub",
+                    model="stub",
+                    payload={},
+                )
+                with self.assertRaises(ValueError) as ctx:
+                    prune_vector_index_versions(
+                        ledger=ledger,
+                        vector_store_dir=tmpdir / "vectors",
+                        profile_name="p_text",
+                    )
+                self.assertIn("running", str(ctx.exception))
+            finally:
+                ledger.close()

@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import threading
+import warnings
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -138,7 +139,13 @@ class LanceDBVectorStore:
         return len(rows_to_copy)
 
     def publish_version(self, index_version: str) -> None:
-        """Atomically switch to a completed version."""
+        """Atomically switch to a completed version.
+
+        The superseded version's table is dropped after the switch: old
+        versions are never read once inactive, and keeping every staged
+        ``vectors_{batch_hash}`` table made disk usage grow without bound.
+        """
+        previous = self.active_version()
         self._ensure_meta_table()
         meta_table = self._db.open_table("vector_meta")
         # Delete old row for this profile, then add the new one.
@@ -147,6 +154,62 @@ class LanceDBVectorStore:
         meta_table.add(
             [{"profile_name": self.profile_name, "active_version": index_version}]
         )
+        # Guard: re-publishing the already-active version (e.g. a
+        # crash-recovery re-embed with the same batch hash) must not drop
+        # the active table itself.
+        if previous != index_version:
+            self._drop_version_table(previous)
+
+    def _drop_version_table(self, index_version: str) -> None:
+        """Drop a superseded version table; failures only leave an orphan."""
+        table_name = _table_name(index_version)
+        try:
+            self._db.drop_table(table_name)
+        except Exception as exc:
+            if _is_table_missing(exc):
+                return
+            # Cleanup failure must not fail the indexing run; the orphan
+            # table can be reclaimed later via `vectors prune`.
+            logger.warning(
+                "failed to drop superseded vector table %s: %s", table_name, exc
+            )
+            return
+        self._table_cache.pop(table_name, None)
+
+    def list_versions(self) -> list[str]:
+        """Version names derived from existing ``vectors_*`` tables.
+
+        Names are table-name derivatives: ``_table_name`` is not reversible
+        (digit-leading versions get a ``v_`` prefix), so compare versions
+        through :meth:`version_is_active` rather than raw string equality.
+        """
+
+        return sorted(
+            name[len("vectors_") :]
+            for name in _all_table_names(self._db)
+            if name.startswith("vectors_")
+        )
+
+    def version_is_active(self, index_version: str) -> bool:
+        """Whether `index_version` maps to the currently active table.
+
+        Compares in table-name space because ``_table_name`` sanitizes
+        version names irreversibly (e.g. digit-leading batch hashes).
+        """
+
+        return _table_name(index_version) == _table_name(self.active_version())
+
+    def delete_version(self, index_version: str) -> int:
+        """Drop the table of a non-active version (used by `vectors prune`)."""
+
+        if self.version_is_active(index_version):
+            raise ValueError(f"cannot delete the active version {index_version!r}")
+        table_name = _table_name(index_version)
+        if table_name not in _all_table_names(self._db):
+            return 0
+        self._db.drop_table(table_name)
+        self._table_cache.pop(table_name, None)
+        return 1
 
     def active_version(self) -> str:
         try:
@@ -395,6 +458,36 @@ def _table_name(index_version: str) -> str:
     if safe and safe[0].isdigit():
         safe = "v_" + safe
     return f"vectors_{safe}" if safe else "vectors_legacy"
+
+
+def _all_table_names(db: Any) -> list[str]:
+    """Fetch every table name; LanceDB paginates (``table_names`` defaults to
+    ``limit=10``), so a single call silently truncates large databases.
+
+    Pagination uses ``start_after`` semantics: the token is the last name of
+    the previous page over the sorted table names. ``table_names`` is used
+    instead of the newer ``list_tables`` because it exists across the whole
+    supported lancedb range (>=0.18); its DeprecationWarning on >=0.33 is
+    suppressed locally.
+    """
+
+    names: list[str] = []
+    page_token: str | None = None
+    while True:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            try:
+                batch = list(db.table_names(page_token=page_token, limit=1000))
+            except TypeError:
+                # Older lancedb without pagination args returns all names.
+                return list(db.table_names())
+        if not batch:
+            break
+        names.extend(batch)
+        if len(batch) < 1000:
+            break
+        page_token = batch[-1]
+    return names
 
 
 def _record_to_row(

@@ -1,5 +1,5 @@
 from .base import ExtractArtifact, ExtractJobState, ExtractorProvider, StubExtractorProvider
-from .cache import extractor_cache_key, recommended_mineru_timeout_seconds, stable_options_hash
+from .cache import UNKNOWN_PAGE_COUNT_FALLBACK, extractor_cache_key, recommended_mineru_timeout_seconds, stable_options_hash
 from .key_pool import ApiKeyRef, ExtractorKeyPool
 from .manager import ExtractionManager, ExtractionRequest, ExtractionResult
 from .mineru import MinerUAPIError, MinerUProvider
@@ -18,6 +18,7 @@ __all__ = [
     "MinerUAPIError",
     "MinerUProvider",
     "StubExtractorProvider",
+    "UNKNOWN_PAGE_COUNT_FALLBACK",
     "build_extract_recovery_plan",
     "classify_extract_job",
     "extractor_cache_key",

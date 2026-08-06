@@ -171,8 +171,13 @@ LanceDB 后端更重：`copy_active_records_to_version`（`index/lancedb_vector.
 ## 六、第二轮决策记录（2026-08-05 当日拍板）
 
 1. **建库首要任务（立即执行）**：修复 ① LanceDB/向量库体积无界膨胀（审查#19/R14）与 ② MinerU 超时重复扣费（审查#10）。**保留现有串行逻辑，不做并发等大改动。**
-2. **向量库修复方式**：最小修改原则，候选机制为「双槽乒乓」或「publish 成功后立即清理旧版本」，不大动代码结构与 staged→publish 原子语义。已派只读子代理核查全路径（重点是 reused_existing_embedding 跳过逻辑是否依赖旧版本存在）后确认最终方案，再请用户批准实施。
-3. **MinerU 修复方式（用户已指定）**：页数未知时用保守默认值（不再默认 1 页）；`_resume_poll` 的 deadline 取合理值（不低于 manager 级默认）；页数已知时正确传递 `selected_page_count`。
+2. **向量库修复方式（已定稿并实施）**：最小修改原则。经只读子代理全路径核查确认：复用跳过逻辑（`indexer.py:99-113`）只依赖 ledger `embedding_batches` 状态 + active 版本 metadata，与被取代旧版本是否存在无关 → 选定「**publish 成功后同事务删除直接前任版本**」（两后端 `publish_version` 内实现 + `previous != index_version` 守卫），否决双槽乒乓（波及 ledger 语义/diagnostics/verification/测试，违背最小修改）。配套新增 `vectors prune --profile NAME [--vacuum]` CLI 做一次性存量清理（含 active 一致性/非空前置校验）。
+3. **MinerU 修复方式（已定稿并实施，含用户调整）**：① `ingest.py` 单篇路径页数已知传 `total_pages`、未知传保守默认 500 页（`UNKNOWN_PAGE_COUNT_FALLBACK`，→ 预算 3030s）；② `_resume_poll` deadline 取 `max(job预算, manager级21600s)`；③ **用户调整**：HTTP 单次请求超时与轮询预算解耦——MinerU/PaddleOCR 均为轮询进度机制，长等待只能发生在 poll 循环，`mineru.py` 删除 options 超时对 HTTP 超时的放大，单次请求固定 60s/300s 快速失败。
 4. **引用核查（方向 B）定位调整**：LLM 使用成本**不设限**，效果优先——每个引用处开一个 subagent 复核也可接受（还覆盖引用与上下文文意的配合判断）。认可 LLM 是当前最优方案；可叠加的增强：解析 docx 中 Zotero 插件域数据精确定位引用、增加「文献存真性核查」（被引文献是否真实存在）。定位为**本项目的补充/插件**，后续单独立项设计，不进当前修复批次。
 5. **GUI**：暂缓，后续再议（原第四节方案保留备查）。
 6. 优先级表相应调整：第 1 位 = 向量库膨胀修复 + MinerU 超时修复（本次）；嵌入/抽取并发提速顺延至其后；其余排序不变。
+
+### 实施后记（2026-08-05 修复批次落地时补记）
+
+- **M1（已知一次性副作用，用户知情）**：MinerU HTTP 超时与轮询预算解耦后，extract job 的 `options_hash` 发生变化，升级后**首个在途 extract job 会因 hash 不匹配被一次性重提**（重提不重复扣费之外的损失仅为一次重新 submit；后续 job 均用新 hash，不再受影响）。
+- **LanceDB `table_names()` 分页 bug（实跑发现并修复）**：首次对真实 profile 跑 `vectors prune` 时只清掉 9 张孤儿表——原因是 lancedb 的 `table_names()` 默认 `limit=10` 分页，`list_versions()`/`delete_version()` 只拿到第一页。修复：新增 `_all_table_names()` 分页辅助（`start_after` 语义、页大小 1000、本地抑制 0.33 的 DeprecationWarning、兼容无分页参数的旧版 lancedb），两处调用点改走该辅助。修复后 15 孤儿表的分页演练与真实 profile 清理均验证通过。

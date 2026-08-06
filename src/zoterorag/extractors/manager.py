@@ -346,9 +346,15 @@ class ExtractionManager:
             raise RuntimeError("cannot poll extract job without external_job_id")
         options = (job.get("payload") or {}).get("options") or {}
 
-        # Honor the per-job timeout from the original submission; fall back to
-        # the manager-level default when it is missing.
-        poll_timeout_seconds = float(options.get("timeout_seconds", self.poll_timeout_seconds))
+        # Honor the per-job timeout from the original submission as a poll
+        # budget, but never below the manager-level default: jobs persisted
+        # with a tiny budget (e.g. an unknown page count falling back to a
+        # 1-page estimate) must not be failed prematurely on resume, which
+        # would trigger a costly full-PDF resubmission.
+        poll_timeout_seconds = max(
+            float(options.get("timeout_seconds", 0) or 0),
+            self.poll_timeout_seconds,
+        )
         poll_deadline = time.monotonic() + poll_timeout_seconds
 
         polled = self.provider.poll(str(external_job_id), api_key=api_key_secret, options=options)
