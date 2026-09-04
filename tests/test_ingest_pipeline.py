@@ -187,6 +187,160 @@ class IngestPipelineTests(unittest.TestCase):
             finally:
                 ledger.close()
 
+    # ------------------------------------------------------------------
+    # M7: resume --execute takes over a job and actually runs it
+    # ------------------------------------------------------------------
+
+    def _resume_execute(self, ledger, tmpdir, job_id, **overrides):
+        kwargs = dict(
+            execute=True,
+            extract_manager=ExtractionManager(
+                ledger=ledger,
+                cache_dir=tmpdir / "extract_cache",
+                provider=MarkdownStubExtractorProvider(),
+            ),
+            extract_cache_dir=tmpdir / "extract_cache",
+            normalized_dir=tmpdir / "normalized",
+            vector_store_dir=tmpdir / "vectors",
+        )
+        kwargs.update(overrides)
+        return resume_ingest_job(ledger, job_id, **kwargs)
+
+    def test_resume_execute_runs_paused_job(self) -> None:
+        with workspace_tmpdir("ingest-resume-execute-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                seed_profiles(ledger)
+                attachment = build_attachment_with_file(tmpdir, "ATT_RESUME", title="Resume Paper")
+                ledger.upsert_attachments([attachment])
+                result = start_ingest_job(ledger, zotero_key="ATT_RESUME", include_multimodal=False)
+                job_id = result["job"]["job_id"]
+                pause_ingest_job(ledger, job_id, reason="test pause")
+
+                resumed = self._resume_execute(ledger, tmpdir, job_id)
+
+                self.assertEqual("completed", resumed["job"]["status"])
+                self.assertEqual(1, len(resumed["executed"]))
+                self.assertEqual("done", ledger.get_checkpoint("ATT_RESUME", "extract")["status"])
+                self.assertEqual("indexed", ledger.get_checkpoint("ATT_RESUME", "embed:text-profile")["status"])
+                resume_events = [e for e in resumed["job"]["events"] if e["stage"] == "resume"]
+                self.assertEqual("running", resume_events[-1]["status"])
+            finally:
+                ledger.close()
+
+    def test_resume_execute_takes_over_stale_running_job(self) -> None:
+        """M7+M10: the crash-recovery chain — sweep marks the dead job
+        interrupted, then the same job_id is resumed and executed."""
+        with workspace_tmpdir("ingest-resume-stale-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                seed_profiles(ledger)
+                attachment = build_attachment_with_file(tmpdir, "ATT_CRASH", title="Crashed Paper")
+                ledger.upsert_attachments([attachment])
+                job_id = ledger.create_job(
+                    "ingest",
+                    {"mode": "incremental", "zotero_key": "ATT_CRASH", "include_multimodal": False},
+                )
+                ledger.set_job_status(job_id, "running")  # dead-process residue
+
+                resumed = self._resume_execute(ledger, tmpdir, job_id)
+
+                self.assertEqual(job_id, resumed["job"]["job_id"])
+                self.assertEqual("completed", resumed["job"]["status"])
+                self.assertEqual("indexed", ledger.get_checkpoint("ATT_CRASH", "embed:text-profile")["status"])
+                stages = [e["stage"] for e in resumed["job"]["events"]]
+                self.assertIn("lifecycle", stages)  # runner-lock sweep
+                self.assertIn("resume", stages)
+                lifecycle = next(e for e in resumed["job"]["events"] if e["stage"] == "lifecycle")
+                self.assertEqual({"previous_status": "running"}, lifecycle["payload"])
+            finally:
+                ledger.close()
+
+    def test_resume_execute_rejects_completed_job(self) -> None:
+        with workspace_tmpdir("ingest-resume-completed-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                seed_profiles(ledger)
+                attachment = build_attachment_with_file(tmpdir, "ATT_DONE_JOB", title="Done Paper")
+                ledger.upsert_attachments([attachment])
+                result = start_ingest_job(
+                    ledger,
+                    zotero_key="ATT_DONE_JOB",
+                    include_multimodal=False,
+                    execute=True,
+                    extract_manager=ExtractionManager(
+                        ledger=ledger,
+                        cache_dir=tmpdir / "extract_cache",
+                        provider=MarkdownStubExtractorProvider(),
+                    ),
+                    extract_cache_dir=tmpdir / "extract_cache",
+                    normalized_dir=tmpdir / "normalized",
+                    vector_store_dir=tmpdir / "vectors",
+                )
+                job_id = result["job"]["job_id"]
+                with self.assertRaises(ValueError) as ctx:
+                    self._resume_execute(ledger, tmpdir, job_id)
+                self.assertIn("is completed;", str(ctx.exception))
+            finally:
+                ledger.close()
+
+    def test_resume_execute_from_completed_with_errors(self) -> None:
+        """P2: completed_with_errors is resumable — failed documents are
+        re-planned and executed."""
+        with workspace_tmpdir("ingest-resume-cwe-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                seed_profiles(ledger)
+                attachment = build_attachment_with_file(tmpdir, "ATT_CWE", title="Retry Paper")
+                ledger.upsert_attachments([attachment])
+                job_id = ledger.create_job(
+                    "ingest",
+                    {"mode": "incremental", "zotero_key": "ATT_CWE", "include_multimodal": False},
+                )
+                ledger.set_job_status(job_id, "completed_with_errors")
+
+                resumed = self._resume_execute(ledger, tmpdir, job_id)
+
+                self.assertEqual(job_id, resumed["job"]["job_id"])
+                self.assertEqual("completed", resumed["job"]["status"])
+                self.assertEqual("indexed", ledger.get_checkpoint("ATT_CWE", "embed:text-profile")["status"])
+            finally:
+                ledger.close()
+
+    def test_resume_execute_requires_dependencies(self) -> None:
+        with workspace_tmpdir("ingest-resume-deps-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                seed_profiles(ledger)
+                seed_attachments(ledger)
+                result = start_ingest_job(ledger, zotero_key="ATT_NEW", include_multimodal=False)
+                job_id = result["job"]["job_id"]
+                with self.assertRaises(ValueError):
+                    resume_ingest_job(ledger, job_id, execute=True)
+                # No ledger mutation happened: still planned, no resume event.
+                job = ledger.get_job(job_id)
+                self.assertEqual("planned", job["status"])
+                self.assertEqual([], [e for e in job["events"] if e["stage"] == "resume"])
+            finally:
+                ledger.close()
+
+    def test_resume_execute_blocked_when_runner_lock_held(self) -> None:
+        from zoterorag.pipeline.runner import acquire_runner_lock
+
+        with workspace_tmpdir("ingest-resume-locked-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                seed_profiles(ledger)
+                seed_attachments(ledger)
+                result = start_ingest_job(ledger, zotero_key="ATT_NEW", include_multimodal=False)
+                job_id = result["job"]["job_id"]
+                with acquire_runner_lock(ledger):
+                    with self.assertRaises(RuntimeError):
+                        self._resume_execute(ledger, tmpdir, job_id)
+                self.assertEqual("planned", ledger.get_job(job_id)["status"])
+            finally:
+                ledger.close()
+
     def test_execute_ingest_end_to_end_with_stub(self) -> None:
         with workspace_tmpdir("ingest-execute-e2e-") as tmpdir:
             ledger = StateLedger(tmpdir / "state.sqlite")

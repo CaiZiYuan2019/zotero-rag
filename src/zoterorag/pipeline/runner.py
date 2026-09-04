@@ -1,8 +1,8 @@
 """Cross-process runner mutual exclusion and stale-run detection (M10).
 
-Both pipeline entry points (``start_ingest_job`` / ``start_reembed_job``),
-whether reached via CLI or the API server, acquire the same runner lock
-before creating and executing a job. Holding the lock for the entire run
+All pipeline entry points (``start_ingest_job`` / ``start_reembed_job`` and
+``resume_ingest_job --execute``), whether reached via CLI or the API server,
+acquire the same runner lock before creating or taking over a job. Holding the lock for the entire run
 gives an exact liveness signal: if the lock is free, any job still marked
 ``created``/``running`` in the ledger belongs to a dead process and is swept
 to ``interrupted`` automatically; if the lock is held, a live runner exists

@@ -173,6 +173,12 @@ def build_parser() -> argparse.ArgumentParser:
     ingest_resume = ingest_sub.add_parser("resume")
     ingest_resume.add_argument("job_id")
     ingest_resume.add_argument("--reason", default="manual resume")
+    ingest_resume.add_argument(
+        "--execute",
+        action="store_true",
+        help="M7: actually execute the resumed plan (extract -> normalize -> embed) instead of only re-planning.",
+    )
+    ingest_resume.add_argument("--env", default=".env", help="Env file for API keys when executing.")
     ingest_cancel = ingest_sub.add_parser("cancel")
     ingest_cancel.add_argument("job_id")
     ingest_cancel.add_argument("--reason", default="manual cancel")
@@ -544,9 +550,30 @@ def main(argv: list[str] | None = None) -> int:
                     return 1
             if args.ingest_command == "resume":
                 try:
-                    emit(resume_ingest_job(ledger, args.job_id, reason=args.reason))
+                    kwargs: dict[str, Any] = dict(job_id=args.job_id, reason=args.reason, execute=args.execute)
+                    if args.execute:
+                        # M7: same execution dependency wiring as `ingest start`.
+                        from .providers import build_mineru_provider
+
+                        resolved_env = _resolve_env_path(args.env, project_root)
+                        key_pool = ExtractorKeyPool.from_env_file(resolved_env)
+                        provider = build_mineru_provider(resolved_env)
+                        kwargs["extract_manager"] = ExtractionManager(
+                            ledger=ledger,
+                            cache_dir=config.paths.extract_cache_dir,
+                            provider=provider,
+                            key_pool=key_pool,
+                        )
+                        kwargs["extract_cache_dir"] = config.paths.extract_cache_dir
+                        kwargs["normalized_dir"] = config.paths.normalized_dir
+                        kwargs["vector_store_dir"] = config.paths.vector_store_dir
+                        kwargs["extract_config"] = config.extract
+                    emit(resume_ingest_job(ledger, **kwargs))
                     return 0
-                except (KeyError, ValueError) as exc:
+                except RerankNotSupportedError as exc:
+                    emit({"ok": False, "error": str(exc)})
+                    return 1
+                except (KeyError, FileNotFoundError, ValueError, RuntimeError) as exc:
                     emit({"ok": False, "error": str(exc)})
                     return 1
             if args.ingest_command == "cancel":

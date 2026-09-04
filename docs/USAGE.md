@@ -378,10 +378,11 @@ zoterorag jobs show --job-id <JOB_ID>
 
 **恢复方式：**
 
-- `zoterorag ingest resume --job-id <JOB_ID>`：在原 job 上继续执行，checkpoint 会跳过已完成的文档。
+- `zoterorag ingest resume --job-id <JOB_ID>`：只重建计划（job 置回 planned），不执行。
+- `zoterorag ingest resume --job-id <JOB_ID> --execute`：在原 job 上接管并真正执行，checkpoint 会跳过已完成的文档。可从 planned / paused / interrupted / failed / completed_with_errors 状态恢复；已 completed / cancelled 的 job 请改用 `ingest start`。
 - 重新 `zoterorag ingest start --execute`：创建一个新 job，但已写入 checkpoint 的文档不会重复处理，也不会重复调用已完成的 API。
 
-**注意：** `ingest start` 的并发守卫只阻止 `status='running'` 的作业。`interrupted` 或 `failed` 不会阻止新建 job，因此如果旧 job 没 resume，直接重新 start 也是安全的。
+**注意：** ingest/reembed 的执行入口共用一把 runner 文件锁（`data/state/ingest_runner.lock`）：锁被持有说明有活进程在跑，新任务会被拒绝；锁空闲时残留的 `created`/`running` job 会被自动标记为 `interrupted`（死进程残留），因此崩溃后直接重新 start 或 resume --execute 都是安全的。
 
 **各阶段恢复策略：**
 

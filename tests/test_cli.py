@@ -5,6 +5,7 @@ import json
 from contextlib import redirect_stdout
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 from tests._support import workspace_tmpdir
 from zoterorag.cli import build_parser, main, _resolve_env_path
@@ -182,6 +183,41 @@ class CliMainTests(unittest.TestCase):
             self.assertEqual(0, rc)
             self.assertEqual("planned", data["job"]["status"])
             self.assertIn("plan", data)
+
+    def test_ingest_resume_execute_wires_dependencies(self) -> None:
+        """M7: `ingest resume --execute` passes execute=True and the execution
+        dependencies through to resume_ingest_job."""
+        with workspace_tmpdir("cli-resume-exec-") as tmpdir:
+            config_path = write_config(tmpdir)
+            (tmpdir / ".env").write_text("MINERU_API_KEY=dummy\n", encoding="utf-8")
+            with patch(
+                "zoterorag.cli.resume_ingest_job",
+                return_value={"job": {"job_id": "JOB1", "status": "completed"}},
+            ) as mock_resume, patch(
+                "zoterorag.providers.build_mineru_provider", return_value=object()
+            ):
+                rc, _ = run_main(
+                    ["--config", str(config_path), "ingest", "resume", "JOB1", "--execute"]
+                )
+            self.assertEqual(0, rc)
+            kwargs = mock_resume.call_args.kwargs
+            self.assertEqual("JOB1", kwargs["job_id"])
+            self.assertTrue(kwargs["execute"])
+            self.assertIn("extract_manager", kwargs)
+            self.assertIn("extract_cache_dir", kwargs)
+            self.assertIn("vector_store_dir", kwargs)
+
+    def test_ingest_resume_without_execute_stays_plan_only(self) -> None:
+        with workspace_tmpdir("cli-resume-plan-") as tmpdir:
+            config_path = write_config(tmpdir)
+            with patch(
+                "zoterorag.cli.resume_ingest_job",
+                return_value={"job": {"job_id": "JOB1", "status": "planned"}},
+            ) as mock_resume:
+                rc, _ = run_main(["--config", str(config_path), "ingest", "resume", "JOB1"])
+            self.assertEqual(0, rc)
+            self.assertFalse(mock_resume.call_args.kwargs["execute"])
+            self.assertNotIn("extract_manager", mock_resume.call_args.kwargs)
 
     def test_reembed_plan_only(self) -> None:
         with workspace_tmpdir("cli-reembed-") as tmpdir:
