@@ -343,7 +343,7 @@ zoterorag ingest start --zotero-key <KEY> --execute
 
 **执行流程：** extract → normalize → embed(text) → embed(multimodal)
 
-**容错机制：** 单篇文档失败不影响其他文档；最终状态 `completed`（全部成功）或 `completed_with_errors`（部分失败）。
+**容错机制：** 单篇文档失败不影响其他文档；最终状态四态：`completed`（全部成功）、`completed_with_errors`（有硬失败）、`blocked`（无硬失败但有文档的远端提取仍在进行，下轮继续，不产生截断内容）、`failed`（任务级中止，如连续 5 篇同类异常的熔断或意外崩溃）。blocked 的文档不会被归一化/嵌入，不会以残缺分段充全文。
 
 ### 4.3 增量更新
 
@@ -384,7 +384,7 @@ zoterorag jobs show --job-id <JOB_ID>
 **恢复方式：**
 
 - `zoterorag ingest resume --job-id <JOB_ID>`：只重建计划（job 置回 planned），不执行。
-- `zoterorag ingest resume --job-id <JOB_ID> --execute`：在原 job 上接管并真正执行，checkpoint 会跳过已完成的文档。可从 planned / paused / interrupted / failed / completed_with_errors 状态恢复；已 completed / cancelled 的 job 请改用 `ingest start`。
+- `zoterorag ingest resume --job-id <JOB_ID> --execute`：在原 job 上接管并真正执行，checkpoint 会跳过已完成的文档。可从 planned / paused / interrupted / failed / completed_with_errors / blocked 状态恢复；已 completed / cancelled 的 job 请改用 `ingest start`。
 - 重新 `zoterorag ingest start --execute`：创建一个新 job，但已写入 checkpoint 的文档不会重复处理，也不会重复调用已完成的 API。
 
 **注意：** ingest/reembed 的执行入口共用一把 runner 文件锁（`data/state/ingest_runner.lock`）：锁被持有说明有活进程在跑，新任务会被拒绝；锁空闲时残留的 `created`/`running` job 会被自动标记为 `interrupted`（死进程残留），因此崩溃后直接重新 start 或 resume --execute 都是安全的。

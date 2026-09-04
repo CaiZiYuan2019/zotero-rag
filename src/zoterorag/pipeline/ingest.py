@@ -155,6 +155,28 @@ def start_ingest_job(
         )
 
 
+# M9: abort the whole run after this many consecutive failures of the same
+# exception class (e.g. a revoked API key failing every document).
+CIRCUIT_BREAKER_CONSECUTIVE_FAILURES = 5
+
+
+def _track_circuit_breaker(
+    exc: BaseException, *, kind: str | None, streak: int
+) -> tuple[str | None, int, bool]:
+    """Update the consecutive-same-class failure streak.
+
+    Returns (kind, streak, tripped). A different exception class resets the
+    streak to 1 — only an unbroken run of identical failures indicates a
+    systemic problem worth aborting the job for.
+    """
+    exc_kind = exc.__class__.__name__
+    if exc_kind == kind:
+        streak += 1
+    else:
+        kind, streak = exc_kind, 1
+    return kind, streak, streak >= CIRCUIT_BREAKER_CONSECUTIVE_FAILURES
+
+
 def _execute_ingest_documents(
     ledger: StateLedger,
     *,
@@ -170,7 +192,8 @@ def _execute_ingest_documents(
 
     Expects the job to already be in "running" state and the runner lock to
     be held by the caller. Writes the terminal status (completed /
-    completed_with_errors / interrupted / failed) before returning/raising.
+    completed_with_errors / blocked / interrupted / failed) before
+    returning/raising.
     """
     extract_cache_dir = Path(extract_cache_dir)
     normalized_dir = Path(normalized_dir)
@@ -181,6 +204,14 @@ def _execute_ingest_documents(
     executed: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    # M9 circuit breaker: consecutive failures sharing the same exception
+    # class almost always mean a systemic problem (e.g. a revoked API key
+    # fails 100% of documents). Abort the run as "failed" instead of
+    # burning through every document and reporting completed_with_errors.
+    breaker_kind: str | None = None
+    breaker_streak = 0
+    breaker_tripped = False
 
     try:
         total = len(plan["documents"])
@@ -204,8 +235,28 @@ def _execute_ingest_documents(
                     vector_store_dir=vector_store_dir,
                     extract_config=extract_config,
                 )
-                executed.append(result)
-                _progress("  -> done\n")
+                if result.get("blocked"):
+                    # Not a failure: remote extraction is still running and
+                    # the next run resumes it. Intentionally resets the
+                    # breaker streak — a slow remote is not a systemic fault.
+                    blocked.append(result)
+                    breaker_kind = None
+                    breaker_streak = 0
+                    _progress("  -> blocked (extract incomplete; will resume next run)\n")
+                    ledger.add_event(
+                        JobEvent(
+                            job_id=job_id,
+                            stage="document_blocked",
+                            status="blocked",
+                            message=f"{document['document_id']}: extract incomplete; will resume next run",
+                            payload={"document_id": document["document_id"], "blocked_stage": result.get("blocked_stage")},
+                        )
+                    )
+                else:
+                    executed.append(result)
+                    breaker_kind = None
+                    breaker_streak = 0
+                    _progress("  -> done\n")
             except (FileNotFoundError, ValueError, RuntimeError, RerankNotSupportedError) as exc:
                 failed.append({"document": document, "error": str(exc)})
                 _progress(f"  -> FAILED: {exc}\n")
@@ -218,6 +269,11 @@ def _execute_ingest_documents(
                         payload={"document": document, "error": str(exc)},
                     )
                 )
+                breaker_kind, breaker_streak, breaker_tripped = _track_circuit_breaker(
+                    exc, kind=breaker_kind, streak=breaker_streak
+                )
+                if breaker_tripped:
+                    break
             except Exception as exc:
                 # Catch-all: a single misbehaving document must not abort the job.
                 error_text = traceback.format_exc()
@@ -232,16 +288,60 @@ def _execute_ingest_documents(
                         payload={"document": document, "error": str(exc), "traceback": error_text},
                     )
                 )
+                breaker_kind, breaker_streak, breaker_tripped = _track_circuit_breaker(
+                    exc, kind=breaker_kind, streak=breaker_streak
+                )
+                if breaker_tripped:
+                    break
 
-        final_status = "completed" if not failed else "completed_with_errors"
-        _progress(f"\n=== {final_status}: {len(executed)} ok, {len(skipped)} skipped, {len(failed)} failed ===\n")
+        if breaker_tripped:
+            final_status = "failed"
+            _progress(
+                f"\n=== circuit breaker: aborting after {breaker_streak} consecutive "
+                f"{breaker_kind} failures ===\n"
+            )
+            ledger.add_event(
+                JobEvent(
+                    job_id=job_id,
+                    stage="circuit_breaker",
+                    status="failed",
+                    message=(
+                        f"aborting after {breaker_streak} consecutive {breaker_kind} failures; "
+                        "likely a systemic problem (check API keys/quota)"
+                    ),
+                    payload={
+                        "error_kind": breaker_kind,
+                        "consecutive_failures": breaker_streak,
+                        "processed": len(executed) + len(blocked) + len(failed),
+                        "remaining": total - len(executed) - len(blocked) - len(failed) - len(skipped),
+                    },
+                )
+            )
+        elif failed:
+            final_status = "completed_with_errors"
+        elif blocked:
+            final_status = "blocked"
+        else:
+            final_status = "completed"
+        _progress(
+            f"\n=== {final_status}: {len(executed)} ok, {len(skipped)} skipped, "
+            f"{len(blocked)} blocked, {len(failed)} failed ===\n"
+        )
         ledger.add_event(
             JobEvent(
                 job_id=job_id,
                 stage="complete",
                 status=final_status,
-                message=f"indexed {len(executed)} documents; skipped {len(skipped)}; failed {len(failed)}",
-                payload={"indexed": len(executed), "skipped": len(skipped), "failed": len(failed)},
+                message=(
+                    f"indexed {len(executed)} documents; skipped {len(skipped)}; "
+                    f"blocked {len(blocked)}; failed {len(failed)}"
+                ),
+                payload={
+                    "indexed": len(executed),
+                    "skipped": len(skipped),
+                    "blocked": len(blocked),
+                    "failed": len(failed),
+                },
             )
         )
         ledger.set_job_status(job_id, final_status)
@@ -250,6 +350,7 @@ def _execute_ingest_documents(
             "plan": plan,
             "executed": executed,
             "skipped": skipped,
+            "blocked": blocked,
             "failed": failed,
         }
 
@@ -311,7 +412,9 @@ def pause_ingest_job(ledger: StateLedger, job_id: str, *, reason: str = "manual 
 # M7: states from which `resume --execute` may take over execution.
 # "completed" and "cancelled" are terminal decisions; "created"/"running" are
 # handled by the runner-lock sweep (a stale one becomes "interrupted" first).
-RESUMABLE_EXECUTION_STATES = {"planned", "paused", "interrupted", "failed", "completed_with_errors"}
+# M9: "blocked" (remote extraction still running) is resumable — the next run
+# continues polling the same remote batches (M2).
+RESUMABLE_EXECUTION_STATES = {"planned", "paused", "interrupted", "failed", "completed_with_errors", "blocked"}
 
 
 def resume_ingest_job(
@@ -721,7 +824,13 @@ def _execute_document_stages(
     vector_store_dir: Path,
     extract_config: ExtractConfig,
 ) -> dict[str, Any]:
-    """Execute pending stages for a single document, resuming from checkpoints."""
+    """Execute pending stages for a single document, resuming from checkpoints.
+
+    M9: stage outcomes are propagated. When extraction ends "blocked" (remote
+    batches still running), normalize/embed are short-circuited so an
+    incomplete extraction is never normalized (silent content truncation),
+    and the returned dict carries blocked=True for the main loop's accounting.
+    """
 
     attachment_key = document["attachment_key"]
     document_id = document["document_id"]
@@ -732,7 +841,7 @@ def _execute_document_stages(
             continue
 
         if stage_name == "extract":
-            _execute_extract_stage(
+            outcome = _execute_extract_stage(
                 ledger=ledger,
                 job_id=job_id,
                 attachment_key=attachment_key,
@@ -741,6 +850,14 @@ def _execute_document_stages(
                 extract_cache_dir=extract_cache_dir,
                 extract_config=extract_config,
             )
+            if outcome == "blocked":
+                return {
+                    "attachment_key": attachment_key,
+                    "document_id": document_id,
+                    "title": document.get("title"),
+                    "blocked": True,
+                    "blocked_stage": "extract",
+                }
         elif stage_name == "normalize":
             _execute_normalize_stage(
                 ledger=ledger,
@@ -776,14 +893,23 @@ def _execute_extract_stage(
     extract_manager: Any,
     extract_cache_dir: Path,
     extract_config: ExtractConfig,
-) -> None:
-    """Run MinerU extraction for one attachment, splitting large PDFs into segments."""
+) -> str:
+    """Run MinerU extraction for one attachment, splitting large PDFs into segments.
+
+    M9: returns "done" when a complete extraction artifact is checkpointed, or
+    "blocked" when remote batches are still running and the checkpoint records
+    the blocked state. Hard errors still raise (the caller counts them as
+    document failures).
+    """
 
     from ..extractors.manager import ExtractionRequest
 
     extract_stage = next((s for s in document["stages"] if s["stage"] == "extract"), None)
     if extract_stage is None or extract_stage["status"] not in {"pending", "blocked"}:
-        return
+        # Unreachable via _execute_document_stages (it pre-filters the same
+        # statuses); keep the exit explicit so the return contract has no
+        # implicit None.
+        return "done"
 
     attachment = ledger.get_attachment(attachment_key)
     if attachment is None:
@@ -826,15 +952,15 @@ def _execute_extract_stage(
                 extract_cache_dir=extract_cache_dir,
                 merged_artifact_dir=merged_artifact_dir,
             )
-        else:
-            _checkpoint_segment_blocked(
-                ledger=ledger,
-                job_id=job_id,
-                attachment_key=attachment_key,
-                segment_jobs=segment_jobs,
-                segment_job_ids=segment_job_ids,
-            )
-        return
+            return "done"
+        _checkpoint_segment_blocked(
+            ledger=ledger,
+            job_id=job_id,
+            attachment_key=attachment_key,
+            segment_jobs=segment_jobs,
+            segment_job_ids=segment_job_ids,
+        )
+        return "blocked"
 
     total_pages = get_pdf_page_count(file_path)
     should_split = (
@@ -857,13 +983,12 @@ def _execute_extract_stage(
         )
         result = extract_manager.ensure_extraction(request)
         result = _drive_extraction_to_completion(result, extract_manager)
-        _checkpoint_single_extract_result(
+        return _checkpoint_single_extract_result(
             ledger=ledger,
             job_id=job_id,
             attachment_key=attachment_key,
             result=result,
         )
-        return
 
     segments = compute_page_segments(total_pages, extract_config.max_pages_per_extraction)
     _progress(f"  extract: splitting PDF into {len(segments)} segments (pages={total_pages})...")
@@ -910,7 +1035,7 @@ def _execute_extract_stage(
             segment_jobs=segment_jobs,
             segment_job_ids=[job["job_id"] for job in segment_jobs],
         )
-        return
+        return "blocked"
 
     _merge_and_checkpoint_segments(
         ledger=ledger,
@@ -920,6 +1045,7 @@ def _execute_extract_stage(
         extract_cache_dir=extract_cache_dir,
         merged_artifact_dir=merged_artifact_dir,
     )
+    return "done"
 
 
 def _drive_extraction_to_completion(result: Any, extract_manager: Any) -> Any:
@@ -1014,7 +1140,12 @@ def _checkpoint_single_extract_result(
     job_id: str,
     attachment_key: str,
     result: Any,
-) -> None:
+) -> str:
+    """Persist the extract checkpoint for a single-PDF extraction.
+
+    M9: returns "blocked" when the extract job is not done yet (the caller
+    short-circuits normalize/embed), "done" otherwise.
+    """
     _progress(f"  extract: {result.job['state']} (cache_hit={result.cache_hit})")
 
     if result.job["state"] not in DONE_EXTRACT_STATES:
@@ -1043,7 +1174,7 @@ def _checkpoint_single_extract_result(
                 },
             )
         )
-        return
+        return "blocked"
 
     ledger.checkpoint(
         attachment_key,
@@ -1070,6 +1201,7 @@ def _checkpoint_single_extract_result(
             },
         )
     )
+    return "done"
 
 
 def _checkpoint_segment_blocked(
@@ -1125,6 +1257,22 @@ def _execute_normalize_stage(
     extract_job: dict[str, Any] | None = None
     segment_job_ids: list[str] | None = None
     extract_checkpoint = ledger.get_checkpoint(attachment_key, "extract")
+    if (
+        extract_checkpoint is not None
+        and extract_checkpoint.get("status") != "done"
+        and extract_checkpoint.get("payload", {}).get("segment_job_ids")
+    ):
+        # M9 guard: a segmented extraction whose checkpoint never reached
+        # "done" (crash between segment completion and merge) must NOT fall
+        # through to the fallback below — it would pick any single downloaded
+        # segment fragment and normalize it as the full text (silent content
+        # truncation). Fail loudly instead; the extract stage re-runs and
+        # completes the merge on the next ingest.
+        raise ValueError(
+            f"segmented extraction for {attachment_key} is incomplete "
+            f"(extract checkpoint status={extract_checkpoint.get('status')}); "
+            "run extraction first"
+        )
     if extract_checkpoint is not None and extract_checkpoint.get("status") == "done":
         shared_job_id = extract_checkpoint.get("payload", {}).get("extract_job_id")
         if shared_job_id:

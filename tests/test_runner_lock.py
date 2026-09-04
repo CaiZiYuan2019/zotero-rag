@@ -45,6 +45,7 @@ class CreateJobIfNoActiveTests(unittest.TestCase):
                 for status in (
                     "completed",
                     "completed_with_errors",
+                    "blocked",
                     "failed",
                     "interrupted",
                     "cancelled",

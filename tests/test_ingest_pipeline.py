@@ -22,6 +22,31 @@ from zoterorag.pipeline import (
     resume_ingest_job,
     start_ingest_job,
 )
+from zoterorag.pipeline.ingest import (
+    CIRCUIT_BREAKER_CONSECUTIVE_FAILURES,
+    _execute_normalize_stage,
+    _track_circuit_breaker,
+)
+
+
+class CircuitBreakerUnitTests(unittest.TestCase):
+    def test_streak_grows_only_for_same_error_class(self) -> None:
+        kind, streak, tripped = _track_circuit_breaker(ValueError("a"), kind=None, streak=0)
+        self.assertEqual(("ValueError", 1, False), (kind, streak, tripped))
+        kind, streak, tripped = _track_circuit_breaker(ValueError("b"), kind=kind, streak=streak)
+        self.assertEqual(("ValueError", 2, False), (kind, streak, tripped))
+        # A different class restarts the streak at 1.
+        kind, streak, tripped = _track_circuit_breaker(FileNotFoundError("c"), kind=kind, streak=streak)
+        self.assertEqual(("FileNotFoundError", 1, False), (kind, streak, tripped))
+
+    def test_trips_at_threshold(self) -> None:
+        kind, streak, tripped = None, 0, False
+        for _ in range(CIRCUIT_BREAKER_CONSECUTIVE_FAILURES - 1):
+            kind, streak, tripped = _track_circuit_breaker(RuntimeError("x"), kind=kind, streak=streak)
+            self.assertFalse(tripped)
+        kind, streak, tripped = _track_circuit_breaker(RuntimeError("x"), kind=kind, streak=streak)
+        self.assertTrue(tripped)
+        self.assertEqual(CIRCUIT_BREAKER_CONSECUTIVE_FAILURES, streak)
 
 
 class IngestPipelineTests(unittest.TestCase):
@@ -801,6 +826,204 @@ class IngestPipelineTests(unittest.TestCase):
 
                 self.assertEqual("completed", result2["job"]["status"])
                 self.assertIsNotNone(ledger.get_normalized_artifact("ATT_SPLIT_RESUME"))
+            finally:
+                ledger.close()
+
+    def test_split_segments_blocked_while_remote_running_and_resume_finishes(self) -> None:
+        """M9: a split PDF whose segments are still running remotely ends the
+        run as blocked — never normalized from a fragment — and resume
+        --execute finishes it once the remote batches complete."""
+        with workspace_tmpdir("ingest-split-blocked-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                seed_profiles(ledger)
+                attachment = build_attachment_with_file(tmpdir, "ATT_BLOCKED", title="Blocked Paper")
+                ledger.upsert_attachments([attachment])
+
+                class PendingSegmentProvider(MarkdownStubExtractorProvider):
+                    def submit(
+                        self,
+                        input_file: Path,
+                        options_hash: str,
+                        *,
+                        options: dict[str, Any] | None = None,
+                        api_key: str | None = None,
+                    ) -> ExtractJobState:
+                        page_ranges = (options or {}).get("page_ranges", "")
+                        if page_ranges == "1-200":
+                            return ExtractJobState(external_job_id="seg1", state="completed")
+                        return ExtractJobState(external_job_id="seg2", state="running")
+
+                    def poll(
+                        self,
+                        external_job_id: str,
+                        *,
+                        api_key: str | None = None,
+                        options: dict[str, Any] | None = None,
+                    ) -> ExtractJobState:
+                        if external_job_id == "seg1":
+                            return ExtractJobState(external_job_id=external_job_id, state="completed")
+                        # Segment 2 never completes within the (zeroed) budget.
+                        return ExtractJobState(external_job_id=external_job_id, state="running")
+
+                extract_manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=PendingSegmentProvider(),
+                    poll_interval_seconds=0.0,
+                )
+                extract_config = ExtractConfig(split_large_pdfs=True, max_pages_per_extraction=200)
+
+                # A zero poll budget trips the M2 timeout on the first check;
+                # the round stands down (no exception) and the job stays running.
+                with patch("zoterorag.pipeline.ingest.get_pdf_page_count", return_value=250):
+                    with patch.object(ExtractionManager, "_poll_budget_seconds", return_value=0.0):
+                        result = start_ingest_job(
+                            ledger,
+                            zotero_key="ATT_BLOCKED",
+                            include_multimodal=False,
+                            execute=True,
+                            extract_manager=extract_manager,
+                            extract_cache_dir=tmpdir / "extract_cache",
+                            normalized_dir=tmpdir / "normalized",
+                            vector_store_dir=tmpdir / "vectors",
+                            extract_config=extract_config,
+                        )
+
+                self.assertEqual("blocked", result["job"]["status"])
+                self.assertEqual(1, len(result["blocked"]))
+                self.assertEqual(0, len(result["failed"]))
+                checkpoint = ledger.get_checkpoint("ATT_BLOCKED", "extract")
+                self.assertEqual("blocked", checkpoint["status"])
+                # Short-circuit: normalize/embed never ran on the incomplete
+                # split, so no fragment could be normalized as full text.
+                self.assertIsNone(ledger.get_checkpoint("ATT_BLOCKED", "normalize"))
+                self.assertIsNone(ledger.get_normalized_artifact("ATT_BLOCKED"))
+
+                segment_job_ids = checkpoint["payload"]["segment_job_ids"]
+                seg2_job = ledger.get_extract_job(job_id=segment_job_ids[1])
+                # M2: the batch id survived the timeout; the job is resumable.
+                self.assertEqual("running", seg2_job["state"])
+                self.assertEqual("seg2", seg2_job["external_job_id"])
+
+                # Segment 2 completes remotely (completed, not downloaded, so
+                # the resume path downloads and merges it for real).
+                ledger.set_extract_job_state(
+                    seg2_job["job_id"],
+                    state="completed",
+                    local_stage="download",
+                    external_job_id=seg2_job["external_job_id"],
+                )
+
+                job_id = result["job"]["job_id"]
+                with patch("zoterorag.pipeline.ingest.get_pdf_page_count", return_value=250):
+                    result2 = resume_ingest_job(
+                        ledger,
+                        job_id,
+                        execute=True,
+                        extract_manager=extract_manager,
+                        extract_cache_dir=tmpdir / "extract_cache",
+                        normalized_dir=tmpdir / "normalized",
+                        vector_store_dir=tmpdir / "vectors",
+                        extract_config=extract_config,
+                    )
+
+                self.assertEqual("completed", result2["job"]["status"])
+                self.assertEqual("done", ledger.get_checkpoint("ATT_BLOCKED", "extract")["status"])
+                self.assertIsNotNone(ledger.get_normalized_artifact("ATT_BLOCKED"))
+            finally:
+                ledger.close()
+
+    def test_circuit_breaker_aborts_on_systemic_failure(self) -> None:
+        """M9: a run of identical failures (here: every file missing) trips
+        the breaker and ends the job as failed instead of grinding through
+        all documents."""
+        with workspace_tmpdir("ingest-breaker-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                seed_profiles(ledger)
+                for index in range(6):
+                    ledger.upsert_attachments(
+                        [
+                            build_attachment(
+                                f"ATT_BRK{index}",
+                                title=f"Broken {index}",
+                                file_exists=False,
+                            )
+                        ]
+                    )
+
+                result = start_ingest_job(
+                    ledger,
+                    include_multimodal=False,
+                    execute=True,
+                    extract_manager=ExtractionManager(
+                        ledger=ledger,
+                        cache_dir=tmpdir / "extract_cache",
+                        provider=MarkdownStubExtractorProvider(),
+                    ),
+                    extract_cache_dir=tmpdir / "extract_cache",
+                    normalized_dir=tmpdir / "normalized",
+                    vector_store_dir=tmpdir / "vectors",
+                    extract_config=ExtractConfig(),
+                )
+
+                self.assertEqual("failed", result["job"]["status"])
+                # The breaker tripped at the threshold; the 6th document was
+                # never attempted.
+                self.assertEqual(5, len(result["failed"]))
+                self.assertEqual(0, len(result["executed"]))
+                events = result["job"].get("events") or []
+                self.assertTrue(any(event["stage"] == "circuit_breaker" for event in events))
+            finally:
+                ledger.close()
+
+    def test_normalize_refuses_segment_fragment_for_incomplete_split(self) -> None:
+        """M9 guard: a segmented extraction whose checkpoint never reached
+        'done' must fail loudly instead of normalizing a single segment
+        fragment as the full text."""
+        with workspace_tmpdir("ingest-fragment-guard-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                seed_profiles(ledger)
+                attachment = build_attachment_with_file(tmpdir, "ATT_FRAG", title="Fragment Paper")
+                ledger.upsert_attachments([attachment])
+
+                # One fully downloaded segment artifact exists on disk…
+                provider = MarkdownStubExtractorProvider()
+                extract_manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=provider,
+                )
+                seg_result = extract_manager.ensure_extraction(
+                    ExtractionRequest(
+                        input_file=Path(attachment["file_path"]),
+                        attachment_key="ATT_FRAG",
+                        selected_pages="1-200",
+                        selected_page_count=200,
+                    )
+                )
+                self.assertEqual("downloaded", seg_result.job["state"])
+                # …but the extract checkpoint says the split is still running
+                # (crash between segment completion and merge).
+                ledger.checkpoint(
+                    "ATT_FRAG",
+                    "extract",
+                    "running",
+                    {"job_id": "old-job", "segment_job_ids": [seg_result.job["job_id"]]},
+                )
+
+                with self.assertRaises(ValueError) as ctx:
+                    _execute_normalize_stage(
+                        ledger=ledger,
+                        job_id="job-x",
+                        attachment_key="ATT_FRAG",
+                        document_id="doc-frag",
+                        document={},
+                        normalized_dir=tmpdir / "normalized",
+                    )
+                self.assertIn("incomplete", str(ctx.exception))
             finally:
                 ledger.close()
 
