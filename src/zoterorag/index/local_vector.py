@@ -351,6 +351,32 @@ class LocalVectorStore:
                             (self.profile_name, previous),
                         )
 
+    def stage_and_publish(
+        self,
+        records: Iterable[VectorRecord],
+        *,
+        index_version: str,
+        exclude_document_ids: Iterable[str] = (),
+    ) -> tuple[int, int, dict[str, int]]:
+        """Run copy -> upsert -> publish as one locked sequence.
+
+        M6: the per-method locks alone serialize each step but not the whole
+        sequence — two writers could still interleave copy/publish and lose
+        each other's staged records. Holding both locks across the sequence
+        closes that window; both locks are recursive, so the per-method
+        acquisition inside nests safely.
+        """
+        records = list(records)
+        with self._file_lock:
+            with self._lock:
+                copied = self.copy_active_records_to_version(
+                    index_version=index_version,
+                    exclude_document_ids=exclude_document_ids,
+                )
+                indexed = self.upsert(records, index_version=index_version)
+                self.publish_version(index_version)
+                return copied, indexed, self.counts(index_version=index_version)
+
     def active_version(self) -> str:
         row = self.conn.execute(
             "SELECT active_version FROM vector_meta WHERE profile_name = ?",

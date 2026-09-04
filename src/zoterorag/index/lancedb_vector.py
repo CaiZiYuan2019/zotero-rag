@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import logging
 import re
@@ -7,6 +8,8 @@ import threading
 import warnings
 from pathlib import Path
 from typing import Any, Iterable
+
+from filelock import FileLock
 
 from .local_vector import VectorRecord, cosine_similarity
 
@@ -48,10 +51,32 @@ class LanceDBVectorStore:
                 _DB_CACHE[cache_key] = db
         self._db = db
         self._table_cache: dict[str, Any] = {}
+        # M6: write-path serialization. The RLock serializes threads sharing
+        # this store instance (filelock contexts are thread-local, so the
+        # FileLock alone would not); the FileLock serializes separate
+        # instances/processes writing the same profile directory. Lock order
+        # (file lock first, then thread lock) matches LocalVectorStore.
+        # Cross-process mutual exclusion holds only when every writer goes
+        # through this store class.
+        self._write_lock = threading.RLock()
+        self._file_lock = FileLock(str(self.path) + ".write.lock")
 
     def close(self) -> None:
         self._table_cache.clear()
         # LanceDB handles cleanup automatically; no explicit close needed.
+        try:
+            self._file_lock.release()
+        except RuntimeError:
+            # Not currently held.
+            pass
+
+    @contextmanager
+    def _write_guard(self):
+        """Hold both write locks; recursive so write methods may nest inside
+        compound operations like :meth:`stage_and_publish`."""
+        with self._file_lock:
+            with self._write_lock:
+                yield
 
     def _delete_records(self, table: Any, record_ids: list[str]) -> None:
         """Delete records by record_id using a literal-safe predicate."""
@@ -65,33 +90,38 @@ class LanceDBVectorStore:
     def upsert(
         self, records: Iterable[VectorRecord], *, index_version: str = "legacy"
     ) -> int:
-        table_name = _table_name(index_version)
-        rows = [
-            _record_to_row(record, index_version, self.profile_name)
-            for record in records
-        ]
-        if not rows:
-            return 0
-        for record in records:
-            if len(record.vector) != self.dimension:
-                raise ValueError(
-                    f"record {record.record_id} has dimension {len(record.vector)}, "
-                    f"expected {self.dimension}"
-                )
-        table = self._ensure_table(table_name, rows)
-        # L8: create the meta table up front on every write path. A missing
-        # vector_meta alongside versioned tables then unambiguously means
-        # external deletion/corruption (see ``active_version``), never a
-        # crash-interrupted first run.
-        self._ensure_meta_table()
-        # LanceDB merge_insert uses record_id as the primary merge key when
-        # the schema declares it. For simplicity we delete-then-add within
-        # the same version table.
-        record_ids = [r["record_id"] for r in rows]
-        self._delete_records(table, record_ids)
-        table.add(rows)
-        self._table_cache[table_name] = table
-        return len(rows)
+        with self._write_guard():
+            # Materialize first: the rows listcomp and the dimension check
+            # below both iterate, which would silently skip the check for
+            # one-shot iterators.
+            records = list(records)
+            table_name = _table_name(index_version)
+            rows = [
+                _record_to_row(record, index_version, self.profile_name)
+                for record in records
+            ]
+            if not rows:
+                return 0
+            for record in records:
+                if len(record.vector) != self.dimension:
+                    raise ValueError(
+                        f"record {record.record_id} has dimension {len(record.vector)}, "
+                        f"expected {self.dimension}"
+                    )
+            table = self._ensure_table(table_name, rows)
+            # L8: create the meta table up front on every write path. A missing
+            # vector_meta alongside versioned tables then unambiguously means
+            # external deletion/corruption (see ``active_version``), never a
+            # crash-interrupted first run.
+            self._ensure_meta_table()
+            # LanceDB merge_insert uses record_id as the primary merge key when
+            # the schema declares it. For simplicity we delete-then-add within
+            # the same version table.
+            record_ids = [r["record_id"] for r in rows]
+            self._delete_records(table, record_ids)
+            table.add(rows)
+            self._table_cache[table_name] = table
+            return len(rows)
 
     def copy_active_records_to_version(
         self,
@@ -100,76 +130,77 @@ class LanceDBVectorStore:
         exclude_document_ids: Iterable[str] = (),
     ) -> int:
         """Stage existing active records under a new version."""
-        # L8: create the meta table up front (see ``upsert``); must precede
-        # the active_version() read below so a crash window never leaves
-        # "no meta + staged table" behind.
-        self._ensure_meta_table()
-        active_version = self.active_version()
-        # H1: the staged version name is deterministic (content batch hash), so
-        # a retry after a crash between staging and publish always reuses the
-        # same name. This guard must run before every early return below:
-        # appending carry-forward rows to a leftover staged table would double
-        # them on every retry, and the leftover rows would survive the later
-        # upsert's delete-then-add (which only deletes the new document's ids).
-        staged_table_name = _table_name(index_version)
-        if staged_table_name in _all_table_names(self._db):
-            # Compare against the active snapshot already fetched above, in
-            # table-name space (``_table_name`` sanitization is irreversible).
-            if staged_table_name == _table_name(active_version):
-                # Re-staging the already-active version (identical content
-                # hash) would append the active rows back onto the active
-                # table; there is nothing to stage.
+        with self._write_guard():
+            # L8: create the meta table up front (see ``upsert``); must precede
+            # the active_version() read below so a crash window never leaves
+            # "no meta + staged table" behind.
+            self._ensure_meta_table()
+            active_version = self.active_version()
+            # H1: the staged version name is deterministic (content batch hash), so
+            # a retry after a crash between staging and publish always reuses the
+            # same name. This guard must run before every early return below:
+            # appending carry-forward rows to a leftover staged table would double
+            # them on every retry, and the leftover rows would survive the later
+            # upsert's delete-then-add (which only deletes the new document's ids).
+            staged_table_name = _table_name(index_version)
+            if staged_table_name in _all_table_names(self._db):
+                # Compare against the active snapshot already fetched above, in
+                # table-name space (``_table_name`` sanitization is irreversible).
+                if staged_table_name == _table_name(active_version):
+                    # Re-staging the already-active version (identical content
+                    # hash) would append the active rows back onto the active
+                    # table; there is nothing to stage.
+                    return 0
+                # Drop strictly: a failed drop must abort the run rather than let
+                # _ensure_table reuse the stale table (or a cached handle to it)
+                # and silently duplicate rows.
+                self._table_cache.pop(staged_table_name, None)
+                try:
+                    self._db.drop_table(staged_table_name)
+                except Exception as exc:
+                    if not _is_table_missing(exc):
+                        raise
+            if not active_version:
                 return 0
-            # Drop strictly: a failed drop must abort the run rather than let
-            # _ensure_table reuse the stale table (or a cached handle to it)
-            # and silently duplicate rows.
-            self._table_cache.pop(staged_table_name, None)
             try:
-                self._db.drop_table(staged_table_name)
+                active_table = self._db.open_table(_table_name(active_version))
             except Exception as exc:
-                if not _is_table_missing(exc):
-                    raise
-        if not active_version:
-            return 0
-        try:
-            active_table = self._db.open_table(_table_name(active_version))
-        except Exception as exc:
-            # Broad because LanceDB raises varying exception types for missing tables.
-            if _is_table_missing(exc):
-                logger.warning(
-                    "active table %s missing for profile %s, nothing to copy",
-                    active_version,
+                # Broad because LanceDB raises varying exception types for missing tables.
+                if _is_table_missing(exc):
+                    logger.warning(
+                        "active table %s missing for profile %s, nothing to copy",
+                        active_version,
+                        self.profile_name,
+                    )
+                    return 0
+                raise
+            excluded = set(exclude_document_ids)
+            all_rows = active_table.to_arrow().to_pylist()
+            rows_to_copy = [
+                _record_to_row(
+                    VectorRecord(
+                        record_id=_strip_version_prefix(
+                            str(row.get("record_id", "")), active_version
+                        ),
+                        document_id=str(row.get("document_id", "")),
+                        chunk_id=str(row.get("chunk_id", "")),
+                        vector=_parse_vector_json(row.get("vector_json", "[]")),
+                        text=str(row.get("text", "")),
+                        modality=str(row.get("modality", "text")),
+                        metadata=_parse_metadata_json(row.get("metadata_json", "{}")),
+                    ),
+                    index_version,
                     self.profile_name,
                 )
+                for row in all_rows
+                if row.get("document_id") not in excluded
+            ]
+            if not rows_to_copy:
                 return 0
-            raise
-        excluded = set(exclude_document_ids)
-        all_rows = active_table.to_arrow().to_pylist()
-        rows_to_copy = [
-            _record_to_row(
-                VectorRecord(
-                    record_id=_strip_version_prefix(
-                        str(row.get("record_id", "")), active_version
-                    ),
-                    document_id=str(row.get("document_id", "")),
-                    chunk_id=str(row.get("chunk_id", "")),
-                    vector=_parse_vector_json(row.get("vector_json", "[]")),
-                    text=str(row.get("text", "")),
-                    modality=str(row.get("modality", "text")),
-                    metadata=_parse_metadata_json(row.get("metadata_json", "{}")),
-                ),
-                index_version,
-                self.profile_name,
-            )
-            for row in all_rows
-            if row.get("document_id") not in excluded
-        ]
-        if not rows_to_copy:
-            return 0
-        table = self._ensure_table(_table_name(index_version), rows_to_copy)
-        table.add(rows_to_copy)
-        self._table_cache[_table_name(index_version)] = table
-        return len(rows_to_copy)
+            table = self._ensure_table(_table_name(index_version), rows_to_copy)
+            table.add(rows_to_copy)
+            self._table_cache[_table_name(index_version)] = table
+            return len(rows_to_copy)
 
     def publish_version(self, index_version: str) -> None:
         """Atomically switch to a completed version.
@@ -178,21 +209,47 @@ class LanceDBVectorStore:
         versions are never read once inactive, and keeping every staged
         ``vectors_{batch_hash}`` table made disk usage grow without bound.
         """
-        previous = self.active_version()
-        meta_table = self._ensure_meta_table()
-        # M5: merge_insert executes as a single transaction. The previous
-        # delete+add pair left a crash window with zero meta rows, which the
-        # old active_version() masked by silently falling back to "legacy".
-        meta_table.merge_insert(
-            "profile_name"
-        ).when_matched_update_all().when_not_matched_insert_all().execute(
-            [{"profile_name": self.profile_name, "active_version": index_version}]
-        )
-        # Guard: re-publishing the already-active version (e.g. a
-        # crash-recovery re-embed with the same batch hash) must not drop
-        # the active table itself.
-        if previous != index_version:
-            self._drop_version_table(previous)
+        with self._write_guard():
+            previous = self.active_version()
+            meta_table = self._ensure_meta_table()
+            # M5: merge_insert executes as a single transaction. The previous
+            # delete+add pair left a crash window with zero meta rows, which the
+            # old active_version() masked by silently falling back to "legacy".
+            meta_table.merge_insert(
+                "profile_name"
+            ).when_matched_update_all().when_not_matched_insert_all().execute(
+                [{"profile_name": self.profile_name, "active_version": index_version}]
+            )
+            # Guard: re-publishing the already-active version (e.g. a
+            # crash-recovery re-embed with the same batch hash) must not drop
+            # the active table itself.
+            if previous != index_version:
+                self._drop_version_table(previous)
+
+    def stage_and_publish(
+        self,
+        records: Iterable[VectorRecord],
+        *,
+        index_version: str,
+        exclude_document_ids: Iterable[str] = (),
+    ) -> tuple[int, int, dict[str, int]]:
+        """Run copy -> upsert -> publish as one locked sequence.
+
+        M6: the three steps must observe a single active-version snapshot.
+        Held separately, two writers (e.g. an ingest and a reembed process)
+        can interleave and the later publisher physically drops the version
+        table the earlier one staged. ``_write_guard`` (and the per-method
+        guards inside) are recursive, so the nesting below is safe.
+        """
+        records = list(records)
+        with self._write_guard():
+            copied = self.copy_active_records_to_version(
+                index_version=index_version,
+                exclude_document_ids=exclude_document_ids,
+            )
+            indexed = self.upsert(records, index_version=index_version)
+            self.publish_version(index_version)
+            return copied, indexed, self.counts(index_version=index_version)
 
     def _drop_version_table(self, index_version: str) -> None:
         """Drop a superseded version table; failures only leave an orphan."""
@@ -236,14 +293,15 @@ class LanceDBVectorStore:
     def delete_version(self, index_version: str) -> int:
         """Drop the table of a non-active version (used by `vectors prune`)."""
 
-        if self.version_is_active(index_version):
-            raise ValueError(f"cannot delete the active version {index_version!r}")
-        table_name = _table_name(index_version)
-        if table_name not in _all_table_names(self._db):
-            return 0
-        self._db.drop_table(table_name)
-        self._table_cache.pop(table_name, None)
-        return 1
+        with self._write_guard():
+            if self.version_is_active(index_version):
+                raise ValueError(f"cannot delete the active version {index_version!r}")
+            table_name = _table_name(index_version)
+            if table_name not in _all_table_names(self._db):
+                return 0
+            self._db.drop_table(table_name)
+            self._table_cache.pop(table_name, None)
+            return 1
 
     def active_version(self) -> str:
         try:

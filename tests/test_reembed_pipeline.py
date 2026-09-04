@@ -48,6 +48,56 @@ class ReembedPipelineTests(unittest.TestCase):
             finally:
                 ledger.close()
 
+    def test_reembed_execute_blocked_by_running_ingest(self) -> None:
+        """M6: a running ingest job must block a new reembed execution."""
+        with workspace_tmpdir("reembed-blocked-ingest-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                seed_profiles(ledger)
+                seed_normalized_document(tmpdir, ledger)
+                running_id = ledger.create_job("ingest", {})
+                ledger.set_job_status(running_id, "running")
+
+                with self.assertRaises(RuntimeError) as ctx:
+                    start_reembed_job(
+                        ledger,
+                        vector_store_dir=tmpdir / "vectors",
+                        profile_name="stub_text",
+                        execute=True,
+                    )
+                self.assertIn("ingest", str(ctx.exception))
+                self.assertEqual([], ledger.list_jobs(kind="reembed"))
+
+                # Plan-only reembed (execute=False) is not blocked.
+                planned = start_reembed_job(
+                    ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="stub_text",
+                    execute=False,
+                )
+                self.assertEqual("planned", planned["job"]["status"])
+            finally:
+                ledger.close()
+
+    def test_reembed_execute_blocked_by_running_reembed(self) -> None:
+        with workspace_tmpdir("reembed-blocked-reembed-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                seed_profiles(ledger)
+                seed_normalized_document(tmpdir, ledger)
+                running_id = ledger.create_job("reembed", {"profile_name": "stub_text"})
+                ledger.set_job_status(running_id, "running")
+
+                with self.assertRaises(RuntimeError):
+                    start_reembed_job(
+                        ledger,
+                        vector_store_dir=tmpdir / "vectors",
+                        profile_name="stub_text",
+                        execute=True,
+                    )
+            finally:
+                ledger.close()
+
     def test_keyboard_interrupt_marks_reembed_job_interrupted(self) -> None:
         """Ctrl+C during reembed execution must leave the job in 'interrupted' state."""
         with workspace_tmpdir("reembed-interrupt-") as tmpdir:

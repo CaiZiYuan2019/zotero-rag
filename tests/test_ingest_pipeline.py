@@ -127,6 +127,66 @@ class IngestPipelineTests(unittest.TestCase):
             finally:
                 ledger.close()
 
+    def test_execute_blocked_by_running_reembed(self) -> None:
+        """M6: a running reembed job must block a new ingest execution."""
+        with workspace_tmpdir("ingest-blocked-reembed-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                seed_profiles(ledger)
+                attachment = build_attachment_with_file(tmpdir, "ATT_BLOCKED", title="Blocked Paper")
+                ledger.upsert_attachments([attachment])
+                extract_manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=MarkdownStubExtractorProvider(),
+                )
+                running_id = ledger.create_job("reembed", {"profile_name": "text-profile"})
+                ledger.set_job_status(running_id, "running")
+
+                with self.assertRaises(RuntimeError) as ctx:
+                    start_ingest_job(
+                        ledger,
+                        execute=True,
+                        extract_manager=extract_manager,
+                        extract_cache_dir=tmpdir / "extract_cache",
+                        normalized_dir=tmpdir / "normalized",
+                        vector_store_dir=tmpdir / "vectors",
+                    )
+                self.assertIn("reembed", str(ctx.exception))
+                # The guard fires before any ingest job is created.
+                self.assertEqual([], ledger.list_jobs(kind="ingest"))
+            finally:
+                ledger.close()
+
+    def test_execute_blocked_by_running_ingest(self) -> None:
+        """M6: the pre-existing same-kind guard still blocks."""
+        with workspace_tmpdir("ingest-blocked-ingest-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                seed_profiles(ledger)
+                attachment = build_attachment_with_file(tmpdir, "ATT_BLOCKED2", title="Blocked Paper 2")
+                ledger.upsert_attachments([attachment])
+                extract_manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=MarkdownStubExtractorProvider(),
+                )
+                running_id = ledger.create_job("ingest", {})
+                ledger.set_job_status(running_id, "running")
+
+                with self.assertRaises(RuntimeError) as ctx:
+                    start_ingest_job(
+                        ledger,
+                        execute=True,
+                        extract_manager=extract_manager,
+                        extract_cache_dir=tmpdir / "extract_cache",
+                        normalized_dir=tmpdir / "normalized",
+                        vector_store_dir=tmpdir / "vectors",
+                    )
+                self.assertIn(running_id, str(ctx.exception))
+            finally:
+                ledger.close()
+
     def test_execute_ingest_end_to_end_with_stub(self) -> None:
         with workspace_tmpdir("ingest-execute-e2e-") as tmpdir:
             ledger = StateLedger(tmpdir / "state.sqlite")

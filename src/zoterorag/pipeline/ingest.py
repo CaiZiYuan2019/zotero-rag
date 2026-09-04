@@ -110,13 +110,16 @@ def start_ingest_job(
 
         # Guard against concurrent ingest execution. Multiple parallel ingest
         # workers race on the same state/vector files and can produce orphaned
-        # LanceDB version tables.
-        active = ledger.list_jobs(kind="ingest", status="running", limit=1)
-        if active:
-            raise RuntimeError(
-                f"an ingest job is already running (job_id={active[0]['job_id']}). "
-                "Wait for it to finish, resume it, or mark it failed before starting a new one."
-            )
+        # LanceDB version tables. M6: ingest and reembed are mutually exclusive
+        # too — both stage and publish full vector versions, and interleaved
+        # publishers physically drop each other's staged version tables.
+        for kind in ("ingest", "reembed"):
+            active = ledger.list_jobs(kind=kind, status="running", limit=1)
+            if active:
+                raise RuntimeError(
+                    f"a {kind} job is already running (job_id={active[0]['job_id']}). "
+                    "Wait for it to finish or mark it failed before starting a new one."
+                )
 
     plan = create_ingest_plan(
         ledger,

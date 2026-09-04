@@ -200,13 +200,13 @@ def index_normalized_document(
         # incremental single-document indexing, carry forward the existing
         # active records for other documents so publishing this batch does not
         # hide previously indexed evidence in the same profile.
-        copied = store.copy_active_records_to_version(
+        # M6: copy -> upsert -> publish runs as one cross-process locked
+        # sequence; two writers must never interleave it.
+        copied, indexed, counts = store.stage_and_publish(
+            records,
             index_version=batch_hash,
             exclude_document_ids=[document_id],
         )
-        indexed = store.upsert(records, index_version=batch_hash)
-        store.publish_version(batch_hash)
-        counts = store.counts(index_version=batch_hash)
     finally:
         store.close()
 

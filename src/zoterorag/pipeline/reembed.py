@@ -74,6 +74,17 @@ def start_reembed_job(
 
     require_embedding_profile(ledger, profile_name)
 
+    if execute:
+        # M6: reembed and ingest are mutually exclusive (see the ingest guard
+        # for rationale). Check before planning so a busy pipeline fails fast.
+        for kind in ("ingest", "reembed"):
+            active = ledger.list_jobs(kind=kind, status="running", limit=1)
+            if active:
+                raise RuntimeError(
+                    f"a {kind} job is already running (job_id={active[0]['job_id']}). "
+                    "Wait for it to finish or mark it failed before starting a reembed."
+                )
+
     plan = create_reembed_plan(
         ledger,
         profile_name=profile_name,

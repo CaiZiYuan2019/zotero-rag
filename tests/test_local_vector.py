@@ -58,6 +58,31 @@ class LocalVectorStoreVersionCleanupTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_stage_and_publish_runs_locked_sequence(self) -> None:
+        # M6: one compound call must equal copy -> upsert -> publish -> counts,
+        # with the superseded version deleted and both locks released after.
+        with workspace_tmpdir("local-vector-stage-publish-") as tmpdir:
+            store = LocalVectorStore(tmpdir / "vectors.sqlite", profile_name="p1", dimension=3)
+            try:
+                store.upsert([self._record("DOCA", "c1", [1.0, 0.0, 0.0])], index_version="v1")
+                store.publish_version("v1")
+
+                copied, indexed, counts = store.stage_and_publish(
+                    [self._record("DOCB", "c2", [0.0, 1.0, 0.0])],
+                    index_version="v2",
+                    exclude_document_ids=["DOCB"],
+                )
+
+                self.assertEqual(1, copied)
+                self.assertEqual(1, indexed)
+                self.assertEqual({"documents": 2, "chunks": 2}, counts)
+                self.assertEqual(["v2"], store.list_versions())
+                hits = store.search([1.0, 0.0, 0.0], top_k=10)
+                self.assertEqual({"c1", "c2"}, {hit["chunk_id"] for hit in hits})
+                self.assertFalse(store._file_lock.is_locked)
+            finally:
+                store.close()
+
     def test_publish_same_version_keeps_active_rows(self) -> None:
         with workspace_tmpdir("local-vector-republish-") as tmpdir:
             store = LocalVectorStore(tmpdir / "vectors.sqlite", profile_name="p1", dimension=3)

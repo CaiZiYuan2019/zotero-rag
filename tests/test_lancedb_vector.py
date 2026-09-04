@@ -323,17 +323,53 @@ class LanceDBVersionCleanupTests(unittest.TestCase):
 
 class _FakeTable:
     """Minimal stateful LanceDB table double: add accumulates rows; delete is
-    a tolerated no-op (upsert's delete-then-add hits it on empty tables)."""
+    a tolerated no-op (upsert's delete-then-add hits it on empty tables).
+
+    When ``owner`` is set, every mutating call asserts the owner's write
+    locks are held (M6).
+    """
 
     def __init__(self, rows: list[dict] | None = None) -> None:
         self.rows = list(rows or [])
         self.delete_calls: list[str] = []
+        self.owner: LanceDBVectorStore | None = None
+
+    def _check_lock(self) -> None:
+        if self.owner is not None:
+            assert self.owner._file_lock.is_locked, "write op without file lock"
+            # RLock has no public is-locked probe; _is_owned() is CPython's
+            # equivalent and these tests run on it.
+            assert self.owner._write_lock._is_owned(), "write op without thread lock"
 
     def add(self, rows) -> None:
+        self._check_lock()
         self.rows.extend(rows)
 
     def delete(self, predicate: str) -> None:
+        self._check_lock()
         self.delete_calls.append(predicate)
+
+    def merge_insert(self, key: str):
+        self._check_lock()
+        table = self
+
+        class _Builder:
+            def when_matched_update_all(self):
+                return self
+
+            def when_not_matched_insert_all(self):
+                return self
+
+            def execute(self, rows) -> None:
+                for row in rows:
+                    for i, existing in enumerate(table.rows):
+                        if existing.get(key) == row.get(key):
+                            table.rows[i] = dict(row)
+                            break
+                    else:
+                        table.rows.append(dict(row))
+
+        return _Builder()
 
     def to_arrow(self) -> MagicMock:
         arrow = MagicMock()
@@ -504,3 +540,89 @@ class LanceDBStagedDedupeTests(unittest.TestCase):
             store = self._store(tmpdir)
             self.assertEqual(1, store.upsert([record], index_version="v2"))
             self.assertIn("vector_meta", self.tables)
+
+
+class LanceDBWriteLockTests(LanceDBStagedDedupeTests):
+    """M6: every write op runs under the per-profile file lock, and
+    stage_and_publish holds it across the whole copy->upsert->publish
+    sequence (verified via _FakeTable.owner lock assertions)."""
+
+    def _locked_store(self, tmpdir) -> LanceDBVectorStore:
+        store = self._store(tmpdir)
+        for table in self.tables.values():
+            table.owner = store
+        return store
+
+    def test_upsert_holds_write_locks(self) -> None:
+        with workspace_tmpdir("lancedb-m6-upsert-") as tmpdir:
+            store = self._locked_store(tmpdir)
+            record = VectorRecord(
+                record_id="r3",
+                document_id="docC",
+                chunk_id="c3",
+                vector=[0.0, 0.0, 1.0],
+                text="gamma",
+            )
+            self.assertEqual(1, store.upsert([record], index_version="v2"))
+            self.assertFalse(store._file_lock.is_locked)
+
+    def test_stage_and_publish_locked_sequence(self) -> None:
+        with workspace_tmpdir("lancedb-m6-sequence-") as tmpdir:
+            store = self._locked_store(tmpdir)
+            record = VectorRecord(
+                record_id="r3",
+                document_id="docC",
+                chunk_id="c3",
+                vector=[0.0, 0.0, 1.0],
+                text="gamma",
+            )
+            copied, indexed, counts = store.stage_and_publish(
+                [record], index_version="v2", exclude_document_ids=["docC"]
+            )
+            # Carry-forward copied the two active rows; publish flipped meta
+            # and dropped the superseded table — all under one lock.
+            self.assertEqual(2, copied)
+            self.assertEqual(1, indexed)
+            self.assertEqual({"documents": 3, "chunks": 3}, counts)
+            self.assertEqual(
+                [{"profile_name": "p1", "active_version": "v2"}],
+                self.tables["vector_meta"].rows,
+            )
+            self.assertNotIn("vectors_v1", self.tables)
+            self.assertFalse(store._file_lock.is_locked)
+
+    def test_stage_and_publish_accepts_iterators(self) -> None:
+        with workspace_tmpdir("lancedb-m6-iter-") as tmpdir:
+            store = self._locked_store(tmpdir)
+            records = (
+                VectorRecord(
+                    record_id="r3",
+                    document_id="docC",
+                    chunk_id="c3",
+                    vector=[0.0, 0.0, 1.0],
+                    text="gamma",
+                )
+                for _ in range(1)
+            )
+            copied, indexed, counts = store.stage_and_publish(
+                records, index_version="v2", exclude_document_ids=["docC"]
+            )
+            self.assertEqual(1, indexed)
+            self.assertEqual(3, counts["chunks"])
+
+    def test_stage_and_publish_releases_locks_on_error(self) -> None:
+        with workspace_tmpdir("lancedb-m6-error-") as tmpdir:
+            store = self._locked_store(tmpdir)
+            bad = VectorRecord(
+                record_id="rbad",
+                document_id="docC",
+                chunk_id="cbad",
+                vector=[1.0],  # wrong dimension -> upsert raises mid-sequence
+                text="bad",
+            )
+            with self.assertRaises(ValueError):
+                store.stage_and_publish([bad], index_version="v2")
+            self.assertFalse(store._file_lock.is_locked)
+            # A clean retry after the failure must proceed normally.
+            copied, indexed, _ = store.stage_and_publish([], index_version="v2")
+            self.assertEqual((2, 0), (copied, indexed))
