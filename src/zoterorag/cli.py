@@ -528,6 +528,7 @@ def main(argv: list[str] | None = None) -> int:
                             cache_dir=config.paths.extract_cache_dir,
                             provider=provider,
                             key_pool=key_pool,
+                            job_max_lifetime_seconds=config.extract.job_max_lifetime_seconds,
                         )
                         kwargs["extract_cache_dir"] = config.paths.extract_cache_dir
                         kwargs["normalized_dir"] = config.paths.normalized_dir
@@ -563,6 +564,7 @@ def main(argv: list[str] | None = None) -> int:
                             cache_dir=config.paths.extract_cache_dir,
                             provider=provider,
                             key_pool=key_pool,
+                            job_max_lifetime_seconds=config.extract.job_max_lifetime_seconds,
                         )
                         kwargs["extract_cache_dir"] = config.paths.extract_cache_dir
                         kwargs["normalized_dir"] = config.paths.normalized_dir
@@ -789,6 +791,7 @@ def main(argv: list[str] | None = None) -> int:
                     cache_dir=config.paths.extract_cache_dir,
                     provider=StubExtractorProvider(),
                     key_pool=key_pool,
+                    job_max_lifetime_seconds=config.extract.job_max_lifetime_seconds,
                 )
                 result = manager.ensure_extraction(
                     ExtractionRequest(

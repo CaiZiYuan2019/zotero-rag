@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import itertools
 import json
 from pathlib import Path
+from typing import Any
 import unittest
 from unittest.mock import patch
 import uuid
@@ -14,7 +16,6 @@ from zoterorag.extractors import (
     ExtractionManager,
     ExtractionRequest,
     ExtractorKeyPool,
-    MinerUAPIError,
     MinerUProvider,
     recommended_mineru_timeout_seconds,
 )
@@ -471,10 +472,46 @@ class AlwaysRunningPollProvider:
         raise AssertionError("download should not be called")
 
 
+class SlowBatchProvider:
+    """Provider whose remote batch stays running for a configurable number of
+    polls (None = forever). Records submit/poll calls so tests can assert that
+    no resubmission happened and the same external id kept being polled."""
+
+    name = "slow-batch"
+    version = "0"
+
+    def __init__(self, polls_until_done: int | None = None) -> None:
+        self.polls_until_done = polls_until_done
+        self.submit_calls: list[dict[str, Any]] = []
+        self.poll_calls: list[str] = []
+
+    def fingerprint(self, input_file, options_hash: str) -> str:
+        return "slow-batch"
+
+    def submit(self, input_file, options_hash: str, *, options=None, api_key=None) -> ExtractJobState:
+        self.submit_calls.append({"options_hash": options_hash})
+        return ExtractJobState(external_job_id="batch-slow-1", state="running")
+
+    def poll(self, external_job_id: str, *, api_key=None, options=None) -> ExtractJobState:
+        self.poll_calls.append(external_job_id)
+        if self.polls_until_done is not None and len(self.poll_calls) > self.polls_until_done:
+            return ExtractJobState(external_job_id=external_job_id, state="completed")
+        return ExtractJobState(external_job_id=external_job_id, state="running")
+
+    def download(self, external_job_id, output_dir, *, api_key=None, source_pdf=None, options=None) -> ExtractArtifact:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        manifest = output_dir / "manifest.json"
+        source = Path(source_pdf) if source_pdf is not None else Path(external_job_id)
+        manifest.write_text(json.dumps({"source_pdf": str(source)}, ensure_ascii=False), encoding="utf-8")
+        return ExtractArtifact(source_pdf=source, artifact_dir=output_dir, manifest_path=manifest)
+
+
 class ExtractionManagerResumeTests(unittest.TestCase):
-    def test_resume_poll_deadline_never_below_manager_default(self) -> None:
-        """A job persisted with the old 1-page budget (36s) must not be failed
-        prematurely on resume; the manager-level default wins as the floor."""
+    def test_resume_poll_timeout_stands_down_and_keeps_batch(self) -> None:
+        """M2: a poll timeout is not a failure. The persisted 36s budget is
+        clamped up to the 30min floor, and on timeout the job stays running
+        with its external_job_id so the next round polls the same batch."""
         with workspace_tmpdir("extract-resume-deadline-") as tmpdir:
             ledger = StateLedger(tmpdir / "state.sqlite")
             try:
@@ -504,13 +541,17 @@ class ExtractionManagerResumeTests(unittest.TestCase):
                 )
                 ticks = itertools.count(start=0.0, step=10000.0)
                 with patch("time.monotonic", side_effect=lambda: next(ticks)):
-                    with self.assertRaises(MinerUAPIError) as ctx:
-                        manager.resume_extraction(job_id)
-                # The 36s persisted budget would have raised almost
-                # immediately; the manager default (21600s) must be the floor.
-                self.assertIn("21600s", str(ctx.exception))
+                    # No exception escapes: the round simply stands down.
+                    result = manager.resume_extraction(job_id)
+                self.assertEqual("running", result.job["state"])
                 job = ledger.get_extract_job(job_id=job_id)
-                self.assertEqual("failed_retryable", job["state"])
+                self.assertEqual("running", job["state"])
+                self.assertEqual("poll", job["local_stage"])
+                self.assertEqual("poll-timeout", job["error_code"])
+                # The 36s persisted budget is clamped up to the 1800s floor.
+                self.assertIn("1800s", job["error_message"])
+                # The remote batch id survives so the next round resumes it.
+                self.assertEqual("batch-tiny-budget", job["external_job_id"])
             finally:
                 ledger.close()
 
@@ -725,6 +766,264 @@ class FailingPollProvider:
         options=None,
     ) -> ExtractArtifact:
         raise AssertionError("download should not be called")
+
+
+class PollTimeoutSemanticsTests(unittest.TestCase):
+    """M2: poll timeout = stand down this round, resume the same batch next
+    round; plus the decision-1 total lifetime cap."""
+
+    def test_poll_budget_clamped_into_band(self) -> None:
+        with workspace_tmpdir("extract-budget-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                manager = ExtractionManager(ledger=ledger, cache_dir=tmpdir / "extract_cache")
+                # Tiny persisted budgets clamp up to the 30min floor.
+                self.assertEqual(1800.0, manager._poll_budget_seconds({"timeout_seconds": 36}))
+                # Huge budgets clamp down to the lifetime cap (default 6h).
+                self.assertEqual(21600.0, manager._poll_budget_seconds({"timeout_seconds": 100000}))
+                # Missing/garbage budgets fall back to poll_timeout_seconds.
+                self.assertEqual(21600.0, manager._poll_budget_seconds({}))
+                self.assertEqual(21600.0, manager._poll_budget_seconds({"timeout_seconds": "junk"}))
+                capped = ExtractionManager(
+                    ledger=ledger, cache_dir=tmpdir / "extract_cache", job_max_lifetime_seconds=5000
+                )
+                self.assertEqual(5000.0, capped._poll_budget_seconds({"timeout_seconds": 100000}))
+                floored = ExtractionManager(
+                    ledger=ledger, cache_dir=tmpdir / "extract_cache", poll_timeout_seconds=900
+                )
+                self.assertEqual(1800.0, floored._poll_budget_seconds({}))
+            finally:
+                ledger.close()
+
+    def test_ensure_timeout_does_not_cooldown_key_or_fail_job(self) -> None:
+        with workspace_tmpdir("extract-ensure-timeout-") as tmpdir:
+            source = tmpdir / "paper.pdf"
+            source.write_bytes(b"%PDF-1.4 fake body")
+            clock = FakeClock()
+            pool = ExtractorKeyPool(
+                [ApiKeyRef(alias="mineru_a", secret="secret-a")],
+                clock=clock.now,
+            )
+            provider = SlowBatchProvider(polls_until_done=None)
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=provider,
+                    key_pool=pool,
+                    poll_interval_seconds=0.0,
+                )
+                ticks = itertools.count(start=0.0, step=10000.0)
+                with patch("time.monotonic", side_effect=lambda: next(ticks)):
+                    result = manager.ensure_extraction(
+                        ExtractionRequest(input_file=source, attachment_key="ATT1")
+                    )
+                # Stand-down semantics: no exception, job stays running.
+                self.assertEqual("running", result.job["state"])
+                self.assertEqual("poll-timeout", result.job["error_code"])
+                self.assertEqual("batch-slow-1", result.job["external_job_id"])
+                # Exactly one submission; the key was released without cooldown.
+                self.assertEqual(1, len(provider.submit_calls))
+                public = pool.list_public_keys()[0]
+                self.assertEqual(0, public["in_flight"])
+                self.assertEqual(0, public["cooldown_remaining_seconds"])
+                self.assertIsNotNone(pool.acquire_key())
+            finally:
+                ledger.close()
+
+    def test_resume_after_timeout_continues_same_batch_and_clears_error(self) -> None:
+        with workspace_tmpdir("extract-timeout-resume-") as tmpdir:
+            source = tmpdir / "paper.pdf"
+            source.write_bytes(b"%PDF-1.4 fake body")
+            provider = SlowBatchProvider(polls_until_done=3)
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=provider,
+                    poll_interval_seconds=0.0,
+                )
+                ticks = itertools.count(start=0.0, step=10000.0)
+                with patch("time.monotonic", side_effect=lambda: next(ticks)):
+                    first = manager.ensure_extraction(
+                        ExtractionRequest(input_file=source, attachment_key="ATT1")
+                    )
+                self.assertEqual("running", first.job["state"])
+
+                # Next round (real clock, generous budget): the same external
+                # batch is polled to completion; no resubmission happens.
+                result = manager.resume_extraction(first.job["job_id"])
+                self.assertEqual("downloaded", result.job["state"])
+                self.assertEqual(1, len(provider.submit_calls))
+                self.assertEqual({"batch-slow-1"}, set(provider.poll_calls))
+                # The success path clears the poll-timeout error record.
+                self.assertIsNone(result.job["error_code"])
+                self.assertIsNone(result.job["error_message"])
+            finally:
+                ledger.close()
+
+    def test_failed_retryable_timeout_does_not_trigger_resubmit(self) -> None:
+        """The fallback path must re-raise PollTimeoutError instead of
+        resubmitting; AlwaysRunningPollProvider.submit raises AssertionError,
+        so any resubmit attempt fails the test loudly."""
+        with workspace_tmpdir("extract-fallback-timeout-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=AlwaysRunningPollProvider(),
+                    poll_interval_seconds=0.0,
+                )
+                job_id = str(uuid.uuid4())
+                ledger.upsert_extract_job(
+                    {
+                        "job_id": job_id,
+                        "attachment_key": "ATT1",
+                        "pdf_sha256": "a" * 64,
+                        "selected_pages": "",
+                        "cache_key": "cache-fallback",
+                        "provider": "always-running",
+                        "provider_version": "0",
+                        "options_hash": "options",
+                        "api_key_alias": "stub_stub",
+                        "external_job_id": "batch-failed",
+                        "state": "failed_retryable",
+                        "local_stage": "poll",
+                        "payload": {"options": {"timeout_seconds": 36}},
+                    }
+                )
+                ticks = itertools.count(start=0.0, step=10000.0)
+                with patch("time.monotonic", side_effect=lambda: next(ticks)):
+                    result = manager.resume_extraction(job_id)
+                # The job is stood down (running), not resubmitted; the
+                # external batch id is preserved for the next round.
+                self.assertEqual("running", result.job["state"])
+                job = ledger.get_extract_job(job_id=job_id)
+                self.assertEqual("poll-timeout", job["error_code"])
+                self.assertEqual("batch-failed", job["external_job_id"])
+            finally:
+                ledger.close()
+
+    def test_resume_flips_overdue_job_to_manual_review(self) -> None:
+        with workspace_tmpdir("extract-lifetime-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=AlwaysRunningPollProvider(),
+                    poll_interval_seconds=0.0,
+                )
+                job_id = str(uuid.uuid4())
+                old = (datetime.now(timezone.utc) - timedelta(hours=7)).isoformat()
+                ledger.upsert_extract_job(
+                    {
+                        "job_id": job_id,
+                        "attachment_key": "ATT1",
+                        "pdf_sha256": "a" * 64,
+                        "selected_pages": "",
+                        "cache_key": "cache-overdue",
+                        "provider": "always-running",
+                        "provider_version": "0",
+                        "options_hash": "options",
+                        "api_key_alias": "stub_stub",
+                        "external_job_id": "batch-overdue",
+                        "state": "running",
+                        "local_stage": "poll",
+                        "submitted_at": old,
+                        "payload": {"options": {"timeout_seconds": 36}},
+                    }
+                )
+                with self.assertRaises(RuntimeError) as ctx:
+                    manager.resume_extraction(job_id)
+                self.assertIn("failed_manual_review", str(ctx.exception))
+                job = ledger.get_extract_job(job_id=job_id)
+                self.assertEqual("failed_manual_review", job["state"])
+                self.assertEqual("job-max-lifetime", job["error_code"])
+                # A second resume hits the classify manual_review branch and
+                # keeps the state stable.
+                with self.assertRaises(RuntimeError) as ctx2:
+                    manager.resume_extraction(job_id)
+                self.assertIn("manual review", str(ctx2.exception))
+                self.assertEqual("failed_manual_review", ledger.get_extract_job(job_id=job_id)["state"])
+            finally:
+                ledger.close()
+
+    def test_lifetime_cap_ignores_download_and_terminal_states(self) -> None:
+        with workspace_tmpdir("extract-lifetime-skip-") as tmpdir:
+            source = tmpdir / "paper.pdf"
+            source.write_bytes(b"%PDF-1.4 fake body")
+            provider = SlowBatchProvider(polls_until_done=0)
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=provider,
+                    poll_interval_seconds=0.0,
+                )
+                done = manager.ensure_extraction(
+                    ExtractionRequest(input_file=source, attachment_key="ATT1")
+                )
+                self.assertEqual("downloaded", done.job["state"])
+                job_id = done.job["job_id"]
+                old = (datetime.now(timezone.utc) - timedelta(hours=7)).isoformat()
+                ledger.conn.execute(
+                    "UPDATE extract_jobs SET submitted_at = ? WHERE job_id = ?", (old, job_id)
+                )
+                # Terminal (downloaded) jobs must never be flipped by the cap.
+                skipped = manager.resume_extraction(job_id)
+                self.assertTrue(skipped.cache_hit)
+                self.assertEqual("downloaded", ledger.get_extract_job(job_id=job_id)["state"])
+
+                # A completed-but-not-downloaded job only needs a local
+                # download; the cap must not waste the finished remote batch.
+                ledger.set_extract_job_state(job_id, state="completed", local_stage="download")
+                resumed = manager.resume_extraction(job_id)
+                self.assertEqual("downloaded", resumed.job["state"])
+            finally:
+                ledger.close()
+
+    def test_ensure_does_not_auto_resubmit_overdue_job(self) -> None:
+        with workspace_tmpdir("extract-overdue-resubmit-") as tmpdir:
+            source = tmpdir / "paper.pdf"
+            source.write_bytes(b"%PDF-1.4 fake body")
+            provider = SlowBatchProvider(polls_until_done=None)
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=provider,
+                    poll_interval_seconds=0.0,
+                )
+                ticks = itertools.count(start=0.0, step=10000.0)
+                with patch("time.monotonic", side_effect=lambda: next(ticks)):
+                    first = manager.ensure_extraction(
+                        ExtractionRequest(input_file=source, attachment_key="ATT1")
+                    )
+                job_id = first.job["job_id"]
+                # Simulate an old, failed job: backdate the clock and mark it
+                # failed_retryable (non-reusable -> ensure would resubmit).
+                old = (datetime.now(timezone.utc) - timedelta(hours=7)).isoformat()
+                ledger.set_extract_job_state(job_id, state="failed_retryable", local_stage="error")
+                ledger.conn.execute(
+                    "UPDATE extract_jobs SET submitted_at = ? WHERE job_id = ?", (old, job_id)
+                )
+                with self.assertRaises(RuntimeError) as ctx:
+                    manager.ensure_extraction(
+                        ExtractionRequest(input_file=source, attachment_key="ATT1")
+                    )
+                self.assertIn("failed_manual_review", str(ctx.exception))
+                job = ledger.get_extract_job(job_id=job_id)
+                self.assertEqual("failed_manual_review", job["state"])
+                self.assertEqual("job-max-lifetime", job["error_code"])
+                self.assertEqual(1, len(provider.submit_calls))
+            finally:
+                ledger.close()
 
 
 if __name__ == "__main__":

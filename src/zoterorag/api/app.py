@@ -287,7 +287,11 @@ def create_app(config_path: str | Path = "config/config.toml") -> Any:
             )
             if execute:
                 kwargs["extract_manager"] = _build_extract_manager(
-                    ledger, config.paths.extract_cache_dir, str(payload.get("env", ".env")), project_root
+                    ledger,
+                    config.paths.extract_cache_dir,
+                    str(payload.get("env", ".env")),
+                    project_root,
+                    job_max_lifetime_seconds=config.extract.job_max_lifetime_seconds,
                 )
                 kwargs["extract_cache_dir"] = config.paths.extract_cache_dir
                 kwargs["normalized_dir"] = config.paths.normalized_dir
@@ -691,7 +695,14 @@ def create_app(config_path: str | Path = "config/config.toml") -> Any:
     return app
 
 
-def _build_extract_manager(ledger: Any, extract_cache_dir: Any, env_path: str, project_root: Path) -> Any:
+def _build_extract_manager(
+    ledger: Any,
+    extract_cache_dir: Any,
+    env_path: str,
+    project_root: Path,
+    *,
+    job_max_lifetime_seconds: int = 21600,
+) -> Any:
     """Build an ExtractionManager wired to real MinerU provider and key pool."""
     from ..providers import build_mineru_provider
     from ..extractors import ExtractorKeyPool, ExtractionManager
@@ -704,6 +715,7 @@ def _build_extract_manager(ledger: Any, extract_cache_dir: Any, env_path: str, p
         cache_dir=extract_cache_dir,
         provider=provider,
         key_pool=key_pool,
+        job_max_lifetime_seconds=job_max_lifetime_seconds,
     )
 
 

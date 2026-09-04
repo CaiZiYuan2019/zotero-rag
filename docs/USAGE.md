@@ -82,12 +82,17 @@ require_api_token = true                          # 是否要求 token 鉴权
 [extract]
 split_large_pdfs = true                           # 是否自动拆分超大 PDF
 max_pages_per_extraction = 200                    # 单次 MinerU 转换的最大页数
+job_max_lifetime_seconds = 21600                  # 单个提取任务总寿命上限（秒，自 submitted_at 起算）
 
 # 说明：
 # - 当 PDF 页数超过 max_pages_per_extraction 且 split_large_pdfs=true 时，
 #   系统会自动按页码范围（如 1-200, 201-400）拆分为多个 MinerU 任务提交，
 #   本地合并结果后再标准化。
 # - 自动拆分需要 PyMuPDF（fitz）读取 PDF 页数；未安装时该功能自动降级为单任务。
+# - poll 超时（单轮预算 pages*6+30 秒，钳制在 30min～job_max_lifetime_seconds 之间）
+#   不算失败：任务保持 running 并保留远端 batch id，下一轮继续 poll 原 batch，
+#   不会重新提交（避免重复计费）；超过 job_max_lifetime_seconds 总寿命的任务转为
+#   failed_manual_review，需人工裁决，不会自动重提。
 
 [[embedding_profiles]]
 name = "qwen3vl_cloud_2560_text"

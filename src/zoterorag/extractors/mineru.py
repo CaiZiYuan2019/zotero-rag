@@ -104,6 +104,20 @@ class MinerUAPIError(RuntimeError):
         self.code = code
 
 
+class PollTimeoutError(MinerUAPIError):
+    """The remote batch did not complete within the local poll budget.
+
+    This is a local watchdog timeout, NOT a remote failure: the batch may
+    still be running remotely. Handlers must keep the external_job_id and
+    resume polling the same batch on the next run; resubmitting the PDF would
+    double-bill it. The stage is pinned to ``"poll-timeout"`` so persisted
+    error records stay machine-greppable.
+    """
+
+    def __init__(self, message: str, *, batch_id: str | None = None) -> None:
+        super().__init__(message, stage="poll-timeout", batch_id=batch_id)
+
+
 class MinerUProvider:
     """MinerU API v4 extractor provider.
 

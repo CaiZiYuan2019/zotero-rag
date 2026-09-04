@@ -19,6 +19,12 @@ tool_timeout = 30.0
 # Requires PyMuPDF (fitz) to detect page counts automatically.
 split_large_pdfs = true
 max_pages_per_extraction = 200
+# Total lifetime of one extract job, measured from submitted_at. A poll
+# timeout only stands the job down for the current round (state stays
+# "running", the remote batch id is kept, polling resumes next run); a job
+# that outlives this cap is flipped to failed_manual_review and is never
+# auto-resubmitted.
+job_max_lifetime_seconds = 21600
 
 [[embedding_profiles]]
 name = "qwen3vl_cloud_2560_text"

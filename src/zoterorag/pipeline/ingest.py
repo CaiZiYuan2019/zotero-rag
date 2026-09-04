@@ -846,10 +846,10 @@ def _execute_extract_stage(
     if not should_split:
         _progress("  extract: submitting...")
         # selected_page_count feeds the persisted per-job poll budget
-        # (pages*6+30). Passing 1 for an unsplit PDF would persist a 36s
-        # budget that prematurely fails resumed polls and causes costly
-        # full-PDF resubmissions; use the real count when known and a
-        # conservative upper guess when PyMuPDF could not read the pages.
+        # (pages*6+30, clamped to [30min, job_max_lifetime_seconds] at poll
+        # time). Use the real count when known and a conservative upper guess
+        # when PyMuPDF could not read the pages, so the budget reflects the
+        # actual document size.
         request = ExtractionRequest(
             input_file=Path(file_path),
             attachment_key=attachment_key,

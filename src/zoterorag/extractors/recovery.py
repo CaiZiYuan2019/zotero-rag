@@ -69,11 +69,10 @@ def classify_extract_job(job: dict[str, Any]) -> ExtractRecoveryItem:
             return recovery_item(job, "download", "remote_completed_with_external_job_id", True, missing_paths=missing_paths)
         return recovery_item(job, "manual_review", "completed_state_missing_external_job_id", False, missing_paths=missing_paths)
 
-    if state in {"submitted", "running"} or local_stage == "poll":
-        if external_job_id:
-            return recovery_item(job, "poll", "external_job_id_recorded", True, missing_paths=missing_paths)
-        return recovery_item(job, "submit", "no_external_job_id_recorded", False, missing_paths=missing_paths)
-
+    # Failed states must be checked before the local_stage=="poll" guard
+    # below: a job flipped to failed_manual_review while polling (e.g. by the
+    # M2 lifetime cap) keeps local_stage="poll" and would otherwise be
+    # misclassified as a resumable poll.
     if state == "failed_retryable":
         if external_job_id:
             return recovery_item(job, "poll", "retryable_failure_with_external_job_id", True, missing_paths=missing_paths)
@@ -81,6 +80,11 @@ def classify_extract_job(job: dict[str, Any]) -> ExtractRecoveryItem:
 
     if state == "failed_manual_review":
         return recovery_item(job, "manual_review", "manual_review_required", False, missing_paths=missing_paths)
+
+    if state in {"submitted", "running"} or local_stage == "poll":
+        if external_job_id:
+            return recovery_item(job, "poll", "external_job_id_recorded", True, missing_paths=missing_paths)
+        return recovery_item(job, "submit", "no_external_job_id_recorded", False, missing_paths=missing_paths)
 
     return recovery_item(job, "manual_review", f"unknown_extract_state:{state or 'empty'}", False, missing_paths=missing_paths)
 

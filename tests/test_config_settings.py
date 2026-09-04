@@ -5,7 +5,7 @@ from pathlib import Path
 import unittest
 
 from tests._support import workspace_tmpdir
-from zoterorag.config import EmbeddingProfile, ServerConfig, load_config
+from zoterorag.config import EmbeddingProfile, ExtractConfig, ServerConfig, load_config
 from zoterorag.runtime import config_as_public_dict, vector_store_path_for_profile
 
 
@@ -437,6 +437,43 @@ default_for_text = true
             self.assertEqual("sqlite-local", profile["backend"])
             self.assertEqual({"max_long_edge": 1600}, profile["image_policy"])
             self.assertEqual(32, profile["batch_size"])
+
+
+class ExtractConfigTests(unittest.TestCase):
+    def _write_config(self, tmpdir: Path, extract_section: str) -> Path:
+        config_path = tmpdir / "config.toml"
+        config_path.write_text(
+            f"""
+[paths]
+zotero_db = "{(tmpdir / 'zotero.sqlite').as_posix()}"
+zotero_storage = "{(tmpdir / 'storage').as_posix()}"
+data_dir = "data"
+
+{extract_section}
+""",
+            encoding="utf-8",
+        )
+        return config_path
+
+    def test_job_max_lifetime_defaults_and_parses(self) -> None:
+        with workspace_tmpdir("extract-config-") as tmpdir:
+            config = load_config(self._write_config(tmpdir, ""))
+            self.assertEqual(21600, config.extract.job_max_lifetime_seconds)
+        with workspace_tmpdir("extract-config-") as tmpdir:
+            config = load_config(
+                self._write_config(tmpdir, "[extract]\njob_max_lifetime_seconds = 7200\n")
+            )
+            self.assertEqual(7200, config.extract.job_max_lifetime_seconds)
+            self.assertEqual(200, config.extract.max_pages_per_extraction)
+
+    def test_job_max_lifetime_must_be_positive(self) -> None:
+        with workspace_tmpdir("extract-config-") as tmpdir:
+            with self.assertRaises(ValueError):
+                load_config(self._write_config(tmpdir, "[extract]\njob_max_lifetime_seconds = 0\n"))
+        with self.assertRaises(ValueError):
+            ExtractConfig(job_max_lifetime_seconds=0)
+        with self.assertRaises(ValueError):
+            ExtractConfig(job_max_lifetime_seconds=True)
 
 
 if __name__ == "__main__":

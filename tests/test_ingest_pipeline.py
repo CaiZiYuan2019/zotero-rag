@@ -580,7 +580,9 @@ class IngestPipelineTests(unittest.TestCase):
                 provider = TwoPhaseStubExtractorProvider()
 
                 # Seed a running extract job as if a previous run was interrupted.
-                # Compute the same cache_key that ensure_extraction would use.
+                # submitted_at must be fresh: the M2 lifetime cap flips jobs
+                # older than job_max_lifetime_seconds (6h) to manual review.
+                from zoterorag.db.state import utc_now
                 from zoterorag.extractors.cache import (
                     extractor_cache_key,
                     sha256_file,
@@ -614,8 +616,8 @@ class IngestPipelineTests(unittest.TestCase):
                         "external_job_id": "ext-running",
                         "state": "running",
                         "local_stage": "poll",
-                        "submitted_at": "2026-01-01T00:00:00+00:00",
-                        "last_poll_at": "2026-01-01T00:00:00+00:00",
+                        "submitted_at": utc_now(),
+                        "last_poll_at": utc_now(),
                         "payload": {
                             "input_file": attachment["file_path"],
                             "options": options,

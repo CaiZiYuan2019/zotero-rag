@@ -100,12 +100,24 @@ class McpConfig:
 class ExtractConfig:
     split_large_pdfs: bool = True
     max_pages_per_extraction: int = 200
+    # 决策1: total lifetime of one extract job, measured from submitted_at.
+    # Jobs exceeding it are flipped to failed_manual_review (no auto-resubmit).
+    job_max_lifetime_seconds: int = 21600
 
     def __post_init__(self) -> None:
         if not isinstance(self.max_pages_per_extraction, int) or self.max_pages_per_extraction < 1:
             raise ValueError(
                 f"extract.max_pages_per_extraction must be a positive integer, "
                 f"got {self.max_pages_per_extraction!r}"
+            )
+        if (
+            not isinstance(self.job_max_lifetime_seconds, int)
+            or isinstance(self.job_max_lifetime_seconds, bool)
+            or self.job_max_lifetime_seconds < 1
+        ):
+            raise ValueError(
+                f"extract.job_max_lifetime_seconds must be a positive integer, "
+                f"got {self.job_max_lifetime_seconds!r}"
             )
 
 
@@ -294,6 +306,7 @@ def load_config(path: str | Path = "config/config.toml") -> AppConfig:
             "extract.split_large_pdfs",
         ),
         max_pages_per_extraction=int(extract_data.get("max_pages_per_extraction", 200)),
+        job_max_lifetime_seconds=int(extract_data.get("job_max_lifetime_seconds", 21600)),
     )
     return AppConfig(
         paths=paths,
