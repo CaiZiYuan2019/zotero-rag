@@ -890,8 +890,8 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
                 return 0
-            # RuntimeError: the M6 busy-pipeline guard (a running ingest or
-            # reembed job) is an expected user-facing error, not a traceback.
+            # RuntimeError: the M10 runner lock / active-job guard is an
+            # expected user-facing error, not a traceback.
             except (KeyError, ValueError, RuntimeError, RerankNotSupportedError) as exc:
                 emit({"ok": False, "error": str(exc)})
                 return 1

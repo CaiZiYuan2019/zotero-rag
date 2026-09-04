@@ -48,27 +48,26 @@ class ReembedPipelineTests(unittest.TestCase):
             finally:
                 ledger.close()
 
-    def test_reembed_execute_blocked_by_running_ingest(self) -> None:
-        """M6: a running ingest job must block a new reembed execution."""
-        with workspace_tmpdir("reembed-blocked-ingest-") as tmpdir:
+    def test_reembed_execute_sweeps_stale_running_ingest(self) -> None:
+        """M10: a stale running ingest is auto-interrupted and reembed proceeds."""
+        with workspace_tmpdir("reembed-sweep-ingest-") as tmpdir:
             ledger = StateLedger(tmpdir / "state.sqlite")
             try:
                 seed_profiles(ledger)
                 seed_normalized_document(tmpdir, ledger)
-                running_id = ledger.create_job("ingest", {})
-                ledger.set_job_status(running_id, "running")
+                stale_id = ledger.create_job("ingest", {})
+                ledger.set_job_status(stale_id, "running")
 
-                with self.assertRaises(RuntimeError) as ctx:
-                    start_reembed_job(
-                        ledger,
-                        vector_store_dir=tmpdir / "vectors",
-                        profile_name="stub_text",
-                        execute=True,
-                    )
-                self.assertIn("ingest", str(ctx.exception))
-                self.assertEqual([], ledger.list_jobs(kind="reembed"))
+                executed = start_reembed_job(
+                    ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="stub_text",
+                    execute=True,
+                )
+                self.assertEqual("completed", executed["job"]["status"])
+                self.assertEqual("interrupted", ledger.get_job(stale_id)["status"])
 
-                # Plan-only reembed (execute=False) is not blocked.
+                # Plan-only reembed (execute=False) was never blocked.
                 planned = start_reembed_job(
                     ledger,
                     vector_store_dir=tmpdir / "vectors",
@@ -79,22 +78,23 @@ class ReembedPipelineTests(unittest.TestCase):
             finally:
                 ledger.close()
 
-    def test_reembed_execute_blocked_by_running_reembed(self) -> None:
-        with workspace_tmpdir("reembed-blocked-reembed-") as tmpdir:
+    def test_reembed_execute_blocked_when_runner_lock_held(self) -> None:
+        from zoterorag.pipeline.runner import acquire_runner_lock
+
+        with workspace_tmpdir("reembed-lock-held-") as tmpdir:
             ledger = StateLedger(tmpdir / "state.sqlite")
             try:
                 seed_profiles(ledger)
                 seed_normalized_document(tmpdir, ledger)
-                running_id = ledger.create_job("reembed", {"profile_name": "stub_text"})
-                ledger.set_job_status(running_id, "running")
-
-                with self.assertRaises(RuntimeError):
-                    start_reembed_job(
-                        ledger,
-                        vector_store_dir=tmpdir / "vectors",
-                        profile_name="stub_text",
-                        execute=True,
-                    )
+                with acquire_runner_lock(ledger):
+                    with self.assertRaises(RuntimeError):
+                        start_reembed_job(
+                            ledger,
+                            vector_store_dir=tmpdir / "vectors",
+                            profile_name="stub_text",
+                            execute=True,
+                        )
+                self.assertEqual([], ledger.list_jobs(kind="reembed"))
             finally:
                 ledger.close()
 

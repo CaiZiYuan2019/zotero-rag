@@ -296,6 +296,10 @@ def create_app(config_path: str | Path = "config/config.toml") -> Any:
             return start_ingest_job(ledger, **kwargs)
         except NotImplementedError as exc:
             raise HTTPException(status_code=501, detail=str(exc)) from exc
+        except RuntimeError:
+            # M10: a busy runner lock / active job is a client-visible
+            # conflict, not a server failure.
+            raise _client_error(400) from None
         except ValueError:
             raise _client_error(400) from None
 

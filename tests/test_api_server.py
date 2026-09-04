@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 from typing import Any
 import unittest
+from unittest.mock import patch
 
 from tests._support import workspace_tmpdir
 from zoterorag.api.app import _find_project_root, _resolve_env_path, create_app
@@ -196,6 +197,18 @@ class ApiProfileResolutionTests(unittest.TestCase):
                 "/search/text", json={"query": "test", "profile_name": "unknown_profile"}
             )
             self.assertEqual(404, response.status_code)
+
+    def test_ingest_start_runner_busy_returns_400(self) -> None:
+        """M10: a busy runner lock surfaces as 400, not a 500 traceback."""
+        with workspace_tmpdir("api-ingest-busy-") as tmpdir:
+            app = create_app(self._create_config(tmpdir))
+            client = self._client(app)
+            with patch(
+                "zoterorag.api.app.start_ingest_job",
+                side_effect=RuntimeError("another ingest/reembed runner process is active"),
+            ):
+                response = client.post("/ingest/start", json={"execute": False})
+            self.assertEqual(400, response.status_code)
 
     def test_search_text_default_profile_resolves(self) -> None:
         with workspace_tmpdir("api-profile-") as tmpdir:

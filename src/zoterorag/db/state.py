@@ -868,6 +868,86 @@ class StateLedger:
             )
         return job_id
 
+    def find_active_job(
+        self,
+        *,
+        kinds: Iterable[str] = ("ingest", "reembed"),
+        statuses: Iterable[str] = ("created", "running"),
+        exclude_job_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Return the newest active pipeline job of the given kinds, if any.
+
+        "Active" means the job is between creation and a terminal state:
+        ``created`` (the pre-running window, whose inclusion closes the
+        check-then-create TOCTOU) or ``running``. ``planned``/``paused`` jobs
+        are deliberately excluded so plan-only jobs and resumes are not
+        blocked. Shared by :meth:`create_job_if_no_active`, the runner-lock
+        stale-run sweep, and resume paths.
+        """
+        kinds = tuple(kinds)
+        statuses = tuple(statuses)
+        query = """
+            SELECT job_id, kind, status, created_at, updated_at, payload_json
+            FROM pipeline_jobs
+            WHERE kind IN (%s) AND status IN (%s)
+        """ % (
+            ", ".join("?" for _ in kinds),
+            ", ".join("?" for _ in statuses),
+        )
+        params: list[Any] = [*kinds, *statuses]
+        if exclude_job_id is not None:
+            query += " AND job_id != ?"
+            params.append(exclude_job_id)
+        query += " ORDER BY updated_at DESC LIMIT 1"
+        row = self.conn.execute(query, params).fetchone()
+        return decode_pipeline_job_row(row) if row is not None else None
+
+    def create_job_if_no_active(
+        self,
+        kind: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        active_kinds: Iterable[str] = ("ingest", "reembed"),
+        active_statuses: Iterable[str] = ("created", "running"),
+    ) -> str:
+        """Atomically create a job only when no job of ``active_kinds`` is active.
+
+        M10: the connection is in autocommit mode (``isolation_level=None``),
+        so the check-then-insert only becomes a cross-process transaction with
+        an explicit ``BEGIN IMMEDIATE``. ``with self.conn`` holds the shared
+        RLock for the whole block (serializing in-process threads) and its
+        ``__exit__`` rolls back safely on error, so a failed BEGIN cannot mask
+        the original exception with a spurious rollback error.
+
+        Note: while this transaction is open, do not call ledger methods that
+        wrap themselves in ``with self.conn`` — the inner ``__exit__`` would
+        commit the outer transaction early. ``find_active_job`` is safe (it
+        only issues a bare SELECT).
+        """
+        kinds = tuple(active_kinds)
+        statuses = tuple(active_statuses)
+        job_id = str(uuid.uuid4())
+        now = utc_now()
+        payload_json = json.dumps(payload or {}, ensure_ascii=False, sort_keys=True, default=str)
+        with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            active = self.find_active_job(kinds=kinds, statuses=statuses)
+            if active is not None:
+                raise RuntimeError(
+                    f"an active {active['kind']} job exists "
+                    f"(job_id={active['job_id']}, status={active['status']}). "
+                    "Wait for it to finish or mark it failed before starting a new one."
+                )
+            self.conn.execute(
+                """
+                INSERT INTO pipeline_jobs(job_id, kind, status, created_at, updated_at, payload_json)
+                VALUES (?, ?, 'created', ?, ?, ?)
+                """,
+                (job_id, kind, now, now, payload_json),
+            )
+            self.conn.execute("COMMIT")
+        return job_id
+
     def set_job_status(self, job_id: str, status: str) -> None:
         with self.conn:
             self.conn.execute(

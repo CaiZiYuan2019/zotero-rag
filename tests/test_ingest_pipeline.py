@@ -127,63 +127,63 @@ class IngestPipelineTests(unittest.TestCase):
             finally:
                 ledger.close()
 
-    def test_execute_blocked_by_running_reembed(self) -> None:
-        """M6: a running reembed job must block a new ingest execution."""
-        with workspace_tmpdir("ingest-blocked-reembed-") as tmpdir:
+    def test_execute_sweeps_stale_running_reembed(self) -> None:
+        """M10: a running job while the runner lock is free is a dead-process
+        leftover — it is auto-interrupted and the new ingest proceeds."""
+        with workspace_tmpdir("ingest-sweep-reembed-") as tmpdir:
             ledger = StateLedger(tmpdir / "state.sqlite")
             try:
                 seed_profiles(ledger)
-                attachment = build_attachment_with_file(tmpdir, "ATT_BLOCKED", title="Blocked Paper")
+                attachment = build_attachment_with_file(tmpdir, "ATT_SWEEP", title="Sweep Paper")
                 ledger.upsert_attachments([attachment])
                 extract_manager = ExtractionManager(
                     ledger=ledger,
                     cache_dir=tmpdir / "extract_cache",
                     provider=MarkdownStubExtractorProvider(),
                 )
-                running_id = ledger.create_job("reembed", {"profile_name": "text-profile"})
-                ledger.set_job_status(running_id, "running")
+                stale_id = ledger.create_job("reembed", {"profile_name": "text-profile"})
+                ledger.set_job_status(stale_id, "running")
 
-                with self.assertRaises(RuntimeError) as ctx:
-                    start_ingest_job(
-                        ledger,
-                        execute=True,
-                        extract_manager=extract_manager,
-                        extract_cache_dir=tmpdir / "extract_cache",
-                        normalized_dir=tmpdir / "normalized",
-                        vector_store_dir=tmpdir / "vectors",
-                    )
-                self.assertIn("reembed", str(ctx.exception))
-                # The guard fires before any ingest job is created.
-                self.assertEqual([], ledger.list_jobs(kind="ingest"))
+                result = start_ingest_job(
+                    ledger,
+                    execute=True,
+                    extract_manager=extract_manager,
+                    extract_cache_dir=tmpdir / "extract_cache",
+                    normalized_dir=tmpdir / "normalized",
+                    vector_store_dir=tmpdir / "vectors",
+                )
+                self.assertEqual("completed", result["job"]["status"])
+                self.assertEqual("interrupted", ledger.get_job(stale_id)["status"])
             finally:
                 ledger.close()
 
-    def test_execute_blocked_by_running_ingest(self) -> None:
-        """M6: the pre-existing same-kind guard still blocks."""
-        with workspace_tmpdir("ingest-blocked-ingest-") as tmpdir:
+    def test_execute_blocked_when_runner_lock_held(self) -> None:
+        """M10: a live runner holding the lock makes a second start fail fast."""
+        from zoterorag.pipeline.runner import acquire_runner_lock
+
+        with workspace_tmpdir("ingest-lock-held-") as tmpdir:
             ledger = StateLedger(tmpdir / "state.sqlite")
             try:
                 seed_profiles(ledger)
-                attachment = build_attachment_with_file(tmpdir, "ATT_BLOCKED2", title="Blocked Paper 2")
+                attachment = build_attachment_with_file(tmpdir, "ATT_LOCKED", title="Locked Paper")
                 ledger.upsert_attachments([attachment])
                 extract_manager = ExtractionManager(
                     ledger=ledger,
                     cache_dir=tmpdir / "extract_cache",
                     provider=MarkdownStubExtractorProvider(),
                 )
-                running_id = ledger.create_job("ingest", {})
-                ledger.set_job_status(running_id, "running")
-
-                with self.assertRaises(RuntimeError) as ctx:
-                    start_ingest_job(
-                        ledger,
-                        execute=True,
-                        extract_manager=extract_manager,
-                        extract_cache_dir=tmpdir / "extract_cache",
-                        normalized_dir=tmpdir / "normalized",
-                        vector_store_dir=tmpdir / "vectors",
-                    )
-                self.assertIn(running_id, str(ctx.exception))
+                with acquire_runner_lock(ledger):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        start_ingest_job(
+                            ledger,
+                            execute=True,
+                            extract_manager=extract_manager,
+                            extract_cache_dir=tmpdir / "extract_cache",
+                            normalized_dir=tmpdir / "normalized",
+                            vector_store_dir=tmpdir / "vectors",
+                        )
+                self.assertIn("runner process is active", str(ctx.exception))
+                self.assertEqual([], ledger.list_jobs(kind="ingest"))
             finally:
                 ledger.close()
 
