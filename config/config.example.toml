@@ -26,6 +26,12 @@ max_pages_per_extraction = 200
 # auto-resubmitted.
 job_max_lifetime_seconds = 21600
 
+[vectors]
+# `vectors prune` recycles embedding batches stuck "running" for longer than
+# this (a crashed embed otherwise blocks pruning forever). Run prune only
+# while no indexing job is active.
+stale_embedding_batch_hours = 24
+
 [[embedding_profiles]]
 name = "qwen3vl_cloud_2560_text"
 provider = "dashscope"

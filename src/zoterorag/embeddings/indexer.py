@@ -16,6 +16,11 @@ from .profile import embedding_profile_hash
 
 SearchMode = Literal["text", "multimodal"]
 
+# M4: prune recycles embedding batches stuck "running" longer than this.
+# Keep in sync with the config default vectors.stale_embedding_batch_hours
+# (24h) in config/settings.py.
+DEFAULT_STALE_BATCH_SECONDS = 24.0 * 3600.0
+
 
 @dataclass(frozen=True)
 class IndexResult:
@@ -309,6 +314,7 @@ def prune_vector_index_versions(
     vector_store_dir: str | Path,
     profile_name: str,
     vacuum: bool = False,
+    stale_batch_seconds: float | None = DEFAULT_STALE_BATCH_SECONDS,
 ) -> dict[str, Any]:
     """Delete every non-active vector version for a profile (one-time reclaim).
 
@@ -320,12 +326,23 @@ def prune_vector_index_versions(
     Run this only while no indexing job is active for the profile: pruning
     concurrently with an in-flight index could delete the version being
     staged, so a running embedding batch aborts the prune.
+
+    M4: batches stuck "running" by a crash are first recycled to "failed"
+    when their updated_at is older than ``stale_batch_seconds`` (default 24h,
+    matching the config default vectors.stale_embedding_batch_hours), so
+    orphaned rows no longer block the prune forever. Pass None to disable
+    the recycling. Only genuinely fresh running batches still abort.
     """
 
     profiles = {profile["name"]: profile for profile in ledger.list_embedding_profiles()}
     profile = profiles.get(profile_name)
     if profile is None:
         raise ValueError(f"profile_not_found:{profile_name}")
+    recycled_stale = 0
+    if stale_batch_seconds is not None:
+        recycled_stale = ledger.mark_stale_embedding_batches_failed(
+            profile_name, older_than_seconds=stale_batch_seconds
+        )
     running_batches = ledger.list_embedding_batches(profile_name=profile_name, status="running")
     if running_batches:
         raise ValueError(
@@ -379,6 +396,7 @@ def prune_vector_index_versions(
             "active_version": active_version,
             "kept_versions": [active_version],
             "removed_versions": removed,
+            "recycled_stale_batches": recycled_stale,
             "vacuumed": vacuumed,
         }
     finally:

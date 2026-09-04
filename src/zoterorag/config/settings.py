@@ -122,11 +122,31 @@ class ExtractConfig:
 
 
 @dataclass(frozen=True)
+class VectorsConfig:
+    # M4: embedding batches stuck "running" longer than this are recycled to
+    # "failed" by `vectors prune` so crashed runs cannot block pruning forever.
+    # Keep in sync with DEFAULT_STALE_BATCH_SECONDS in embeddings/indexer.py.
+    stale_embedding_batch_hours: float = 24.0
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.stale_embedding_batch_hours, (int, float))
+            or isinstance(self.stale_embedding_batch_hours, bool)
+            or self.stale_embedding_batch_hours <= 0
+        ):
+            raise ValueError(
+                f"vectors.stale_embedding_batch_hours must be a positive number, "
+                f"got {self.stale_embedding_batch_hours!r}"
+            )
+
+
+@dataclass(frozen=True)
 class AppConfig:
     paths: PathsConfig
     server: ServerConfig = field(default_factory=ServerConfig)
     mcp: McpConfig = field(default_factory=McpConfig)
     extract: ExtractConfig = field(default_factory=ExtractConfig)
+    vectors: VectorsConfig = field(default_factory=VectorsConfig)
     embedding_profiles: tuple[EmbeddingProfile, ...] = ()
 
     def ensure_runtime_dirs(self) -> None:
@@ -264,6 +284,7 @@ def load_config(path: str | Path = "config/config.toml") -> AppConfig:
     server_data = data.get("server", {})
     mcp_data = data.get("mcp", {})
     extract_data = data.get("extract", {})
+    vectors_data = data.get("vectors", {})
     profiles_data = data.get("embedding_profiles", [])
 
     missing_paths = [
@@ -308,10 +329,14 @@ def load_config(path: str | Path = "config/config.toml") -> AppConfig:
         max_pages_per_extraction=int(extract_data.get("max_pages_per_extraction", 200)),
         job_max_lifetime_seconds=int(extract_data.get("job_max_lifetime_seconds", 21600)),
     )
+    vectors = VectorsConfig(
+        stale_embedding_batch_hours=float(vectors_data.get("stale_embedding_batch_hours", 24.0)),
+    )
     return AppConfig(
         paths=paths,
         server=server,
         mcp=mcp,
         extract=extract,
+        vectors=vectors,
         embedding_profiles=profiles,
     )

@@ -147,5 +147,6 @@ def config_as_public_dict(config: AppConfig) -> dict[str, Any]:
         },
         "server": asdict(config.server),
         "extract": asdict(config.extract),
+        "vectors": asdict(config.vectors),
         "embedding_profiles": [asdict(profile) for profile in config.embedding_profiles],
     }

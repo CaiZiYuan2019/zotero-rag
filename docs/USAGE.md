@@ -94,6 +94,10 @@ job_max_lifetime_seconds = 21600                  # 单个提取任务总寿命�
 #   不会重新提交（避免重复计费）；超过 job_max_lifetime_seconds 总寿命的任务转为
 #   failed_manual_review，需人工裁决，不会自动重提。
 
+[vectors]
+stale_embedding_batch_hours = 24                  # vectors prune 自动回收超过此时长仍卡 running 的嵌入批次
+                                                  # （崩溃残留），转为 failed；新鲜 running 批次仍会阻止 prune
+
 [[embedding_profiles]]
 name = "qwen3vl_cloud_2560_text"
 provider = "dashscope"

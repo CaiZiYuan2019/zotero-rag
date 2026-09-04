@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import threading
 import unittest
 
@@ -158,6 +159,67 @@ class StateLedgerTests(unittest.TestCase):
                 self.assertEqual(1, len(ledger.list_embedding_batches(profile_name="profile-a")))
                 self.assertEqual(1, len(ledger.list_embedding_batches(document_id="doc-1", status="completed")))
                 self.assertEqual({"completed": 1}, ledger.status_summary()["embedding_batches"])
+            finally:
+                ledger.close()
+
+    def test_mark_stale_embedding_batches_failed_only_flips_old_running(self) -> None:
+        """M4: crashed runs leave permanently "running" batches that block
+        prune; only rows stale by updated_at are recycled."""
+        with workspace_tmpdir("state-ledger-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                for batch_hash, document_id in (("a" * 64, "doc-old"), ("c" * 64, "doc-fresh")):
+                    ledger.upsert_embedding_batch(
+                        batch_hash=batch_hash,
+                        profile_name="profile-a",
+                        profile_hash="p" * 64,
+                        document_id=document_id,
+                        chunk_type="text",
+                        chunk_count=1,
+                        status="running",
+                        provider="stub",
+                        model="stub",
+                        payload={},
+                    )
+                # Backdate one batch beyond the staleness cutoff.
+                stale_ts = (
+                    datetime.now(timezone.utc) - timedelta(hours=25)
+                ).isoformat(timespec="seconds")
+                ledger.conn.execute(
+                    "UPDATE embedding_batches SET updated_at = ? WHERE batch_hash = ?",
+                    (stale_ts, "a" * 64),
+                )
+                # A completed batch must never be touched even when stale.
+                ledger.upsert_embedding_batch(
+                    batch_hash="d" * 64,
+                    profile_name="profile-a",
+                    profile_hash="p" * 64,
+                    document_id="doc-done",
+                    chunk_type="text",
+                    chunk_count=1,
+                    status="completed",
+                    provider="stub",
+                    model="stub",
+                    payload={},
+                )
+                ledger.conn.execute(
+                    "UPDATE embedding_batches SET updated_at = ? WHERE batch_hash = ?",
+                    (stale_ts, "d" * 64),
+                )
+
+                flipped = ledger.mark_stale_embedding_batches_failed(
+                    "profile-a", older_than_seconds=24 * 3600
+                )
+
+                self.assertEqual(1, flipped)
+                self.assertEqual("failed", ledger.get_embedding_batch("a" * 64)["status"])
+                self.assertEqual("running", ledger.get_embedding_batch("c" * 64)["status"])
+                self.assertEqual("completed", ledger.get_embedding_batch("d" * 64)["status"])
+                # Nothing to do on a second pass.
+                self.assertEqual(
+                    0,
+                    ledger.mark_stale_embedding_batches_failed("profile-a", older_than_seconds=24 * 3600),
+                )
             finally:
                 ledger.close()
 

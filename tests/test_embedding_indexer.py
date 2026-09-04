@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import unittest
 
@@ -772,6 +773,83 @@ class VectorIndexPruneTests(unittest.TestCase):
                         ledger=ledger,
                         vector_store_dir=tmpdir / "vectors",
                         profile_name="p_text",
+                    )
+                self.assertIn("running", str(ctx.exception))
+            finally:
+                ledger.close()
+
+    def test_prune_recycles_stale_running_batch(self) -> None:
+        """M4: a running batch stale beyond the threshold is flipped to failed
+        and no longer blocks the prune."""
+        from zoterorag.embeddings.indexer import prune_vector_index_versions
+
+        with workspace_tmpdir("vector-prune-stale-") as tmpdir:
+            ledger, _ = self._seed_store_and_ledger(tmpdir)
+            try:
+                ledger.upsert_embedding_batch(
+                    batch_hash="stale-batch",
+                    profile_name="p_text",
+                    profile_hash="hash",
+                    document_id="DOCX",
+                    chunk_type="text",
+                    chunk_count=1,
+                    status="running",
+                    provider="stub",
+                    model="stub",
+                    payload={},
+                )
+                stale_ts = (
+                    datetime.now(timezone.utc) - timedelta(hours=25)
+                ).isoformat(timespec="seconds")
+                ledger.conn.execute(
+                    "UPDATE embedding_batches SET updated_at = ? WHERE batch_hash = ?",
+                    (stale_ts, "stale-batch"),
+                )
+
+                result = prune_vector_index_versions(
+                    ledger=ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="p_text",
+                )
+
+                self.assertEqual(1, result["recycled_stale_batches"])
+                self.assertEqual("failed", ledger.get_embedding_batch("stale-batch")["status"])
+                self.assertEqual({"orphan": 1}, result["removed_versions"])
+            finally:
+                ledger.close()
+
+    def test_prune_stale_recycling_can_be_disabled(self) -> None:
+        """stale_batch_seconds=None keeps the old abort behavior verbatim."""
+        from zoterorag.embeddings.indexer import prune_vector_index_versions
+
+        with workspace_tmpdir("vector-prune-nostale-") as tmpdir:
+            ledger, _ = self._seed_store_and_ledger(tmpdir)
+            try:
+                ledger.upsert_embedding_batch(
+                    batch_hash="stale-batch",
+                    profile_name="p_text",
+                    profile_hash="hash",
+                    document_id="DOCX",
+                    chunk_type="text",
+                    chunk_count=1,
+                    status="running",
+                    provider="stub",
+                    model="stub",
+                    payload={},
+                )
+                stale_ts = (
+                    datetime.now(timezone.utc) - timedelta(hours=25)
+                ).isoformat(timespec="seconds")
+                ledger.conn.execute(
+                    "UPDATE embedding_batches SET updated_at = ? WHERE batch_hash = ?",
+                    (stale_ts, "stale-batch"),
+                )
+                with self.assertRaises(ValueError) as ctx:
+                    prune_vector_index_versions(
+                        ledger=ledger,
+                        vector_store_dir=tmpdir / "vectors",
+                        profile_name="p_text",
+                        stale_batch_seconds=None,
                     )
                 self.assertIn("running", str(ctx.exception))
             finally:

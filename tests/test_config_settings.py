@@ -5,7 +5,7 @@ from pathlib import Path
 import unittest
 
 from tests._support import workspace_tmpdir
-from zoterorag.config import EmbeddingProfile, ExtractConfig, ServerConfig, load_config
+from zoterorag.config import EmbeddingProfile, ExtractConfig, ServerConfig, VectorsConfig, load_config
 from zoterorag.runtime import config_as_public_dict, vector_store_path_for_profile
 
 
@@ -474,6 +474,23 @@ data_dir = "data"
             ExtractConfig(job_max_lifetime_seconds=0)
         with self.assertRaises(ValueError):
             ExtractConfig(job_max_lifetime_seconds=True)
+
+    def test_vectors_stale_batch_hours_defaults_and_parses(self) -> None:
+        with workspace_tmpdir("vectors-config-") as tmpdir:
+            config = load_config(self._write_config(tmpdir, ""))
+            self.assertEqual(24.0, config.vectors.stale_embedding_batch_hours)
+        with workspace_tmpdir("vectors-config-") as tmpdir:
+            config = load_config(
+                self._write_config(tmpdir, "[vectors]\nstale_embedding_batch_hours = 12\n")
+            )
+            self.assertEqual(12.0, config.vectors.stale_embedding_batch_hours)
+
+    def test_vectors_stale_batch_hours_must_be_positive(self) -> None:
+        with workspace_tmpdir("vectors-config-") as tmpdir:
+            with self.assertRaises(ValueError):
+                load_config(self._write_config(tmpdir, "[vectors]\nstale_embedding_batch_hours = 0\n"))
+        with self.assertRaises(ValueError):
+            VectorsConfig(stale_embedding_batch_hours=-1)
 
 
 if __name__ == "__main__":

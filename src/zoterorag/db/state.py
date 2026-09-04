@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import logging
@@ -1342,6 +1342,41 @@ class StateLedger:
         if batch is None:
             raise KeyError(f"embedding batch not found after upsert: {batch_hash}")
         return batch
+
+    def mark_stale_embedding_batches_failed(
+        self,
+        profile_name: str,
+        *,
+        older_than_seconds: float,
+    ) -> int:
+        """Flip running embedding batches that have gone stale to "failed".
+
+        M4: an embedding run killed between the running upsert and the
+        completion write leaves a permanently "running" row that blocks
+        `prune_vector_index_versions` forever. Staleness is judged by
+        updated_at (the last ledger write for the batch). A single UPDATE
+        keeps the flip atomic; returns the number of rows flipped.
+
+        Precondition: no indexing job is actively writing this profile — a
+        legitimately slow embed whose updated_at is older than the cutoff
+        would otherwise be misflipped.
+        """
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(seconds=float(older_than_seconds))
+        ).isoformat(timespec="seconds")
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                UPDATE embedding_batches
+                SET status = 'failed',
+                    updated_at = ?
+                WHERE profile_name = ?
+                  AND status = 'running'
+                  AND updated_at < ?
+                """,
+                (utc_now(), profile_name, cutoff),
+            )
+        return cursor.rowcount
 
     def get_embedding_batch(self, batch_hash: str) -> dict[str, Any] | None:
         row = self.conn.execute(

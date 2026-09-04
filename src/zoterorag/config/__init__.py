@@ -1,4 +1,4 @@
-from .settings import AppConfig, EmbeddingProfile, ExtractConfig, PathsConfig, ServerConfig, load_config
+from .settings import AppConfig, EmbeddingProfile, ExtractConfig, PathsConfig, ServerConfig, VectorsConfig, load_config
 
 __all__ = [
     "AppConfig",
@@ -6,6 +6,7 @@ __all__ = [
     "ExtractConfig",
     "PathsConfig",
     "ServerConfig",
+    "VectorsConfig",
     "load_config",
 ]
 

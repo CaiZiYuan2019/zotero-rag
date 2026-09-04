@@ -490,6 +490,7 @@ def main(argv: list[str] | None = None) -> int:
                     vector_store_dir=config.paths.vector_store_dir,
                     profile_name=args.profile,
                     vacuum=args.vacuum,
+                    stale_batch_seconds=config.vectors.stale_embedding_batch_hours * 3600.0,
                 )
             # RuntimeError: the L8 corrupted-store guard in active_version()
             # must surface as a clean CLI error, not a raw traceback.
