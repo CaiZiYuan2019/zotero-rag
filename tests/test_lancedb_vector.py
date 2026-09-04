@@ -7,12 +7,12 @@ from unittest.mock import MagicMock, patch
 from tests._support import workspace_tmpdir
 from zoterorag.index.lancedb_vector import (
     LanceDBVectorStore,
-    _build_profile_name_predicate,
     _build_record_id_in_predicate,
     _is_table_missing,
     _validate_predicate_literal,
     clear_lancedb_cache,
 )
+from zoterorag.index.local_vector import VectorRecord
 
 
 class LanceDBExceptionHelpersTests(unittest.TestCase):
@@ -47,12 +47,6 @@ class LanceDBPredicateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _build_record_id_in_predicate(["p1'; DROP"])
 
-    def test_profile_name_predicate(self) -> None:
-        self.assertEqual(
-            "profile_name = 'my-profile'",
-            _build_profile_name_predicate("my-profile"),
-        )
-
     def test_unsafe_profile_name_rejected(self) -> None:
         with self.assertRaises(ValueError):
             _validate_predicate_literal("p'; --", "profile_name")
@@ -70,6 +64,50 @@ class LanceDBVectorStoreBehaviorTests(unittest.TestCase):
 
     def test_active_version_returns_legacy_when_meta_table_missing(self) -> None:
         self.mock_db.open_table.side_effect = RuntimeError("table not found")
+        # L8 rule: fresh store (no tables at all) still defaults to legacy.
+        self.mock_db.table_names.return_value = []
+        with patch(
+            "zoterorag.index.lancedb_vector._import_lancedb",
+            return_value=self._mock_lancedb_module(),
+        ):
+            store = LanceDBVectorStore("/tmp/vectors", profile_name="p1", dimension=3)
+            self.assertEqual("legacy", store.active_version())
+
+    def test_active_version_returns_legacy_when_only_legacy_table(self) -> None:
+        self.mock_db.open_table.side_effect = RuntimeError("table not found")
+        # L8 rule: a pre-versioning store (only vectors_legacy) stays readable.
+        self.mock_db.table_names.return_value = ["vectors_legacy"]
+        with patch(
+            "zoterorag.index.lancedb_vector._import_lancedb",
+            return_value=self._mock_lancedb_module(),
+        ):
+            store = LanceDBVectorStore("/tmp/vectors", profile_name="p1", dimension=3)
+            self.assertEqual("legacy", store.active_version())
+
+    def test_active_version_raises_when_meta_lost_but_versioned_tables_exist(
+        self,
+    ) -> None:
+        self.mock_db.open_table.side_effect = RuntimeError("table not found")
+        # L8 rule: meta lost while versioned tables survive is corruption and
+        # must fail loudly (the old fallback silently searched an empty
+        # legacy table).
+        self.mock_db.table_names.return_value = ["vectors_9f8a", "vectors_legacy"]
+        with patch(
+            "zoterorag.index.lancedb_vector._import_lancedb",
+            return_value=self._mock_lancedb_module(),
+        ):
+            store = LanceDBVectorStore("/tmp/vectors", profile_name="p1", dimension=3)
+            with self.assertRaises(RuntimeError) as ctx:
+                store.active_version()
+            self.assertIn("vectors verify --profile p1", str(ctx.exception))
+
+    def test_active_version_returns_legacy_when_profile_row_missing(self) -> None:
+        meta_table = MagicMock()
+        arrow = MagicMock()
+        # Meta exists but this profile was never published.
+        arrow.to_pylist.return_value = []
+        meta_table.to_arrow.return_value = arrow
+        self.mock_db.open_table.return_value = meta_table
         with patch(
             "zoterorag.index.lancedb_vector._import_lancedb",
             return_value=self._mock_lancedb_module(),
@@ -177,16 +215,32 @@ class LanceDBVersionCleanupTests(unittest.TestCase):
         with patch("zoterorag.index.lancedb_vector._import_lancedb", return_value=lancedb):
             return LanceDBVectorStore(tmpdir / "vectors", profile_name="p1", dimension=3)
 
+    def _assert_merge_insert_publish(self, version: str) -> None:
+        """publish_version must flip the meta row via one atomic merge_insert
+        (M5), never via the old delete+add pair with its zero-row window."""
+        self.meta_table.merge_insert.assert_called_once_with("profile_name")
+        builder = self.meta_table.merge_insert.return_value
+        builder.when_matched_update_all.assert_called_once_with()
+        builder.when_matched_update_all.return_value.when_not_matched_insert_all.assert_called_once_with()
+        execute = (
+            builder.when_matched_update_all.return_value
+            .when_not_matched_insert_all.return_value.execute
+        )
+        execute.assert_called_once_with(
+            [{"profile_name": "p1", "active_version": version}]
+        )
+        self.meta_table.delete.assert_not_called()
+        self.meta_table.add.assert_not_called()
+
     def test_publish_drops_superseded_table(self) -> None:
         with workspace_tmpdir("lancedb-publish-drop-") as tmpdir:
             store = self._store(tmpdir)
             store._table_cache["vectors_v1"] = object()
             store.publish_version("v2")
 
+            self._assert_merge_insert_publish("v2")
             self.mock_db.drop_table.assert_called_once_with("vectors_v1")
             self.assertNotIn("vectors_v1", store._table_cache)
-            self.meta_table.delete.assert_called_once()
-            self.meta_table.add.assert_called_once()
 
     def test_publish_same_version_does_not_drop(self) -> None:
         with workspace_tmpdir("lancedb-publish-same-") as tmpdir:
@@ -194,6 +248,7 @@ class LanceDBVersionCleanupTests(unittest.TestCase):
             # Meta reports "v1" active; republishing "v1" must not drop it.
             store.publish_version("v1")
 
+            self._assert_merge_insert_publish("v1")
             self.mock_db.drop_table.assert_not_called()
 
     def test_publish_drop_failure_only_warns(self) -> None:
@@ -267,16 +322,18 @@ class LanceDBVersionCleanupTests(unittest.TestCase):
 
 
 class _FakeTable:
-    """Minimal stateful LanceDB table double: add/delete accumulate rows."""
+    """Minimal stateful LanceDB table double: add accumulates rows; delete is
+    a tolerated no-op (upsert's delete-then-add hits it on empty tables)."""
 
     def __init__(self, rows: list[dict] | None = None) -> None:
         self.rows = list(rows or [])
+        self.delete_calls: list[str] = []
 
     def add(self, rows) -> None:
         self.rows.extend(rows)
 
-    def delete(self, predicate: str) -> None:  # pragma: no cover - not exercised
-        raise AssertionError("unexpected delete in staged-dedupe tests")
+    def delete(self, predicate: str) -> None:
+        self.delete_calls.append(predicate)
 
     def to_arrow(self) -> MagicMock:
         arrow = MagicMock()
@@ -415,3 +472,35 @@ class LanceDBStagedDedupeTests(unittest.TestCase):
             self.assertEqual(2, copied)
             self.mock_db.drop_table.assert_called_once_with("vectors_v_1abc")
             self.assertEqual(2, len(self.tables["vectors_v_1abc"].rows))
+
+    def test_copy_creates_meta_table_up_front_and_self_heals(self) -> None:
+        # L8: a pre-fix leftover ("staged table, no vector_meta") must not be
+        # misread as corruption — the write path creates meta first, after
+        # which the leftover is dropped and rebuilt as usual.
+        del self.tables["vector_meta"]
+        self.tables["vectors_v2"] = _FakeTable([{"record_id": "v2:stale"}])
+        # No published version either: only the staged leftover survives.
+        del self.tables["vectors_v1"]
+        with workspace_tmpdir("lancedb-l8-selfheal-") as tmpdir:
+            store = self._store(tmpdir)
+            copied = store.copy_active_records_to_version(index_version="v2")
+            self.assertEqual(0, copied)
+            self.assertIn("vector_meta", self.tables)
+            self.mock_db.drop_table.assert_called_once_with("vectors_v2")
+            self.assertNotIn("vectors_v2", self.tables)
+
+    def test_upsert_creates_meta_table_up_front(self) -> None:
+        del self.tables["vector_meta"]
+        record = VectorRecord(
+            record_id="r1",
+            document_id="docA",
+            chunk_id="c1",
+            vector=[1.0, 0.0, 0.0],
+            text="alpha",
+            modality="text",
+            metadata={},
+        )
+        with workspace_tmpdir("lancedb-l8-upsert-meta-") as tmpdir:
+            store = self._store(tmpdir)
+            self.assertEqual(1, store.upsert([record], index_version="v2"))
+            self.assertIn("vector_meta", self.tables)

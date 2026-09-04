@@ -485,7 +485,9 @@ def main(argv: list[str] | None = None) -> int:
                     profile_name=args.profile,
                     vacuum=args.vacuum,
                 )
-            except (FileNotFoundError, ImportError, ValueError) as exc:
+            # RuntimeError: the L8 corrupted-store guard in active_version()
+            # must surface as a clean CLI error, not a raw traceback.
+            except (FileNotFoundError, ImportError, ValueError, RuntimeError) as exc:
                 emit({"ok": False, "error": str(exc)})
                 return 1
             emit({"ok": True, **result})

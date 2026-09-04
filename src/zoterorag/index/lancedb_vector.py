@@ -79,6 +79,11 @@ class LanceDBVectorStore:
                     f"expected {self.dimension}"
                 )
         table = self._ensure_table(table_name, rows)
+        # L8: create the meta table up front on every write path. A missing
+        # vector_meta alongside versioned tables then unambiguously means
+        # external deletion/corruption (see ``active_version``), never a
+        # crash-interrupted first run.
+        self._ensure_meta_table()
         # LanceDB merge_insert uses record_id as the primary merge key when
         # the schema declares it. For simplicity we delete-then-add within
         # the same version table.
@@ -95,6 +100,10 @@ class LanceDBVectorStore:
         exclude_document_ids: Iterable[str] = (),
     ) -> int:
         """Stage existing active records under a new version."""
+        # L8: create the meta table up front (see ``upsert``); must precede
+        # the active_version() read below so a crash window never leaves
+        # "no meta + staged table" behind.
+        self._ensure_meta_table()
         active_version = self.active_version()
         # H1: the staged version name is deterministic (content batch hash), so
         # a retry after a crash between staging and publish always reuses the
@@ -170,12 +179,13 @@ class LanceDBVectorStore:
         ``vectors_{batch_hash}`` table made disk usage grow without bound.
         """
         previous = self.active_version()
-        self._ensure_meta_table()
-        meta_table = self._db.open_table("vector_meta")
-        # Delete old row for this profile, then add the new one.
-        predicate = _build_profile_name_predicate(self.profile_name)
-        meta_table.delete(predicate)
-        meta_table.add(
+        meta_table = self._ensure_meta_table()
+        # M5: merge_insert executes as a single transaction. The previous
+        # delete+add pair left a crash window with zero meta rows, which the
+        # old active_version() masked by silently falling back to "legacy".
+        meta_table.merge_insert(
+            "profile_name"
+        ).when_matched_update_all().when_not_matched_insert_all().execute(
             [{"profile_name": self.profile_name, "active_version": index_version}]
         )
         # Guard: re-publishing the already-active version (e.g. a
@@ -242,15 +252,42 @@ class LanceDBVectorStore:
         except Exception as exc:
             # Broad because LanceDB raises varying exception types for missing tables.
             if _is_table_missing(exc):
-                logger.warning(
-                    "vector_meta table missing for profile %s, assuming legacy",
-                    self.profile_name,
-                )
-                return "legacy"
+                return self._active_version_without_meta()
             raise
         for row in rows:
             if row.get("profile_name") == self.profile_name:
                 return str(row.get("active_version", "legacy"))
+        # The profile has never been published (this also covers the
+        # crash-before-first-publish recovery window); the legacy table is
+        # the only valid default.
+        return "legacy"
+
+    def _active_version_without_meta(self) -> str:
+        """Resolve the active version when ``vector_meta`` itself is missing.
+
+        Fresh and pre-versioning stores legitimately have no meta table and
+        default to ``"legacy"``. Because both write paths (``upsert`` and
+        ``copy_active_records_to_version``) create the meta table up front, a
+        missing meta table alongside versioned (non-legacy) tables can only
+        come from external deletion or filesystem corruption. L8: surface
+        that loudly instead of silently falling back to an empty legacy
+        search (which also made a re-embed copy 0 rows and permanently drop
+        every other document's vectors on publish).
+        """
+        versioned = [
+            name
+            for name in _all_table_names(self._db)
+            if name.startswith("vectors_") and name != "vectors_legacy"
+        ]
+        if versioned:
+            raise RuntimeError(
+                f"vector_meta table is missing for profile {self.profile_name!r} "
+                f"but versioned tables exist: {versioned}; the store is "
+                "corrupted (meta lost) or holds leftovers from an interrupted "
+                "run. Run `zoterorag vectors verify --profile "
+                f"{self.profile_name}` to diagnose, or remove the stale "
+                "tables/profile directory and re-run the indexing."
+            )
         return "legacy"
 
     # ------------------------------------------------------------------
@@ -617,8 +654,3 @@ def _build_record_id_in_predicate(record_ids: list[str]) -> str:
     safe_ids = [_validate_predicate_literal(rid, "record_id") for rid in record_ids]
     literals = ", ".join(f"'{rid}'" for rid in safe_ids)
     return f"record_id IN ({literals})"
-
-
-def _build_profile_name_predicate(profile_name: str) -> str:
-    safe = _validate_predicate_literal(profile_name, "profile_name")
-    return f"profile_name = '{safe}'"
