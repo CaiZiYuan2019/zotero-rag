@@ -264,3 +264,154 @@ class LanceDBVersionCleanupTests(unittest.TestCase):
                 store.delete_version(version)
             # Only the orphan table is dropped; the active table survives.
             self.mock_db.drop_table.assert_called_once_with("vectors_orphan")
+
+
+class _FakeTable:
+    """Minimal stateful LanceDB table double: add/delete accumulate rows."""
+
+    def __init__(self, rows: list[dict] | None = None) -> None:
+        self.rows = list(rows or [])
+
+    def add(self, rows) -> None:
+        self.rows.extend(rows)
+
+    def delete(self, predicate: str) -> None:  # pragma: no cover - not exercised
+        raise AssertionError("unexpected delete in staged-dedupe tests")
+
+    def to_arrow(self) -> MagicMock:
+        arrow = MagicMock()
+        arrow.to_pylist.return_value = list(self.rows)
+        return arrow
+
+
+class LanceDBStagedDedupeTests(unittest.TestCase):
+    """H1: a staged table left over from a crashed run must be dropped and
+    rebuilt, never appended to, when the same version is staged again."""
+
+    def setUp(self) -> None:
+        clear_lancedb_cache()
+        self.tables: dict[str, _FakeTable] = {
+            "vector_meta": _FakeTable(
+                [{"profile_name": "p1", "active_version": "v1"}]
+            ),
+            "vectors_v1": _FakeTable(
+                [
+                    {
+                        "record_id": "v1:r1",
+                        "document_id": "docA",
+                        "chunk_id": "c1",
+                        "vector_json": "[1.0, 0.0, 0.0]",
+                        "text": "alpha",
+                        "modality": "text",
+                        "metadata_json": "{}",
+                    },
+                    {
+                        "record_id": "v1:r2",
+                        "document_id": "docB",
+                        "chunk_id": "c2",
+                        "vector_json": "[0.0, 1.0, 0.0]",
+                        "text": "beta",
+                        "modality": "text",
+                        "metadata_json": "{}",
+                    },
+                ]
+            ),
+        }
+        self.mock_db = MagicMock()
+        # Auto-vivifying open_table avoids the pyarrow-dependent create branch.
+        self.mock_db.open_table.side_effect = lambda name: self.tables.setdefault(
+            name, _FakeTable()
+        )
+        self.mock_db.table_names.side_effect = lambda **_: sorted(self.tables)
+        self.mock_db.drop_table.side_effect = lambda name: self.tables.pop(name, None)
+
+    def _store(self, tmpdir) -> LanceDBVectorStore:
+        lancedb = MagicMock()
+        lancedb.connect.return_value = self.mock_db
+        with patch("zoterorag.index.lancedb_vector._import_lancedb", return_value=lancedb):
+            return LanceDBVectorStore(tmpdir / "vectors", profile_name="p1", dimension=3)
+
+    def test_leftover_staged_table_is_dropped_and_rebuilt(self) -> None:
+        leftover = _FakeTable([{"record_id": "v2:stale", "document_id": "docOld"}])
+        self.tables["vectors_v2"] = leftover
+        with workspace_tmpdir("lancedb-h1-rebuild-") as tmpdir:
+            store = self._store(tmpdir)
+            # A stale cache handle must not let the old table survive either.
+            store._table_cache["vectors_v2"] = leftover
+            copied = store.copy_active_records_to_version(index_version="v2")
+
+            self.assertEqual(2, copied)
+            self.mock_db.drop_table.assert_called_once_with("vectors_v2")
+            staged = self.tables["vectors_v2"]
+            self.assertIsNot(staged, leftover)
+            self.assertEqual(2, len(staged.rows))
+            self.assertEqual(
+                {"v2:r1", "v2:r2"}, {row["record_id"] for row in staged.rows}
+            )
+            self.assertIs(store._table_cache["vectors_v2"], staged)
+
+    def test_restaging_same_version_does_not_double_rows(self) -> None:
+        with workspace_tmpdir("lancedb-h1-nodup-") as tmpdir:
+            store = self._store(tmpdir)
+            # Simulate two crash-retries: stage, crash before publish, stage again.
+            first = store.copy_active_records_to_version(index_version="v2")
+            second = store.copy_active_records_to_version(index_version="v2")
+            self.assertEqual(2, first)
+            self.assertEqual(2, second)
+            self.assertEqual(2, len(self.tables["vectors_v2"].rows))
+
+    def test_empty_copy_still_drops_leftover_staged_table(self) -> None:
+        self.tables["vectors_v2"] = _FakeTable([{"record_id": "v2:stale"}])
+        with workspace_tmpdir("lancedb-h1-empty-") as tmpdir:
+            store = self._store(tmpdir)
+            copied = store.copy_active_records_to_version(
+                index_version="v2", exclude_document_ids={"docA", "docB"}
+            )
+            self.assertEqual(0, copied)
+            self.mock_db.drop_table.assert_called_once_with("vectors_v2")
+            self.assertNotIn("vectors_v2", self.tables)
+
+    def test_staging_active_version_is_noop(self) -> None:
+        # Staging the already-active version must not append its rows back
+        # onto itself (which would double every row).
+        with workspace_tmpdir("lancedb-h1-active-") as tmpdir:
+            store = self._store(tmpdir)
+            copied = store.copy_active_records_to_version(index_version="v1")
+            self.assertEqual(0, copied)
+            self.mock_db.drop_table.assert_not_called()
+            self.assertEqual(2, len(self.tables["vectors_v1"].rows))
+
+    def test_leftover_staged_drop_failure_raises(self) -> None:
+        self.tables["vectors_v2"] = _FakeTable([{"record_id": "v2:stale"}])
+        self.mock_db.drop_table.side_effect = RuntimeError("disk full")
+        with workspace_tmpdir("lancedb-h1-dropfail-") as tmpdir:
+            store = self._store(tmpdir)
+            with self.assertRaises(RuntimeError):
+                store.copy_active_records_to_version(index_version="v2")
+
+    def test_leftover_staged_drop_missing_is_tolerated(self) -> None:
+        # The staged table vanished between listing and dropping (e.g. a
+        # concurrent prune): the guard must proceed and rebuild normally.
+        self.tables["vectors_v2"] = _FakeTable([{"record_id": "v2:stale"}])
+
+        def drop_then_vanish(name: str) -> None:
+            self.tables.pop(name, None)
+            raise FileNotFoundError(name)
+
+        self.mock_db.drop_table.side_effect = drop_then_vanish
+        with workspace_tmpdir("lancedb-h1-dropmissing-") as tmpdir:
+            store = self._store(tmpdir)
+            copied = store.copy_active_records_to_version(index_version="v2")
+            self.assertEqual(2, copied)
+            self.assertEqual(2, len(self.tables["vectors_v2"].rows))
+
+    def test_leftover_staged_drop_uses_sanitized_table_name(self) -> None:
+        # Digit-leading batch hashes map to an irreversible v_-prefixed table
+        # name; the guard must drop in table-name space.
+        self.tables["vectors_v_1abc"] = _FakeTable([{"record_id": "1abc:stale"}])
+        with workspace_tmpdir("lancedb-h1-digit-") as tmpdir:
+            store = self._store(tmpdir)
+            copied = store.copy_active_records_to_version(index_version="1abc")
+            self.assertEqual(2, copied)
+            self.mock_db.drop_table.assert_called_once_with("vectors_v_1abc")
+            self.assertEqual(2, len(self.tables["vectors_v_1abc"].rows))

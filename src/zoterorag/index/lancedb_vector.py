@@ -96,6 +96,30 @@ class LanceDBVectorStore:
     ) -> int:
         """Stage existing active records under a new version."""
         active_version = self.active_version()
+        # H1: the staged version name is deterministic (content batch hash), so
+        # a retry after a crash between staging and publish always reuses the
+        # same name. This guard must run before every early return below:
+        # appending carry-forward rows to a leftover staged table would double
+        # them on every retry, and the leftover rows would survive the later
+        # upsert's delete-then-add (which only deletes the new document's ids).
+        staged_table_name = _table_name(index_version)
+        if staged_table_name in _all_table_names(self._db):
+            # Compare against the active snapshot already fetched above, in
+            # table-name space (``_table_name`` sanitization is irreversible).
+            if staged_table_name == _table_name(active_version):
+                # Re-staging the already-active version (identical content
+                # hash) would append the active rows back onto the active
+                # table; there is nothing to stage.
+                return 0
+            # Drop strictly: a failed drop must abort the run rather than let
+            # _ensure_table reuse the stale table (or a cached handle to it)
+            # and silently duplicate rows.
+            self._table_cache.pop(staged_table_name, None)
+            try:
+                self._db.drop_table(staged_table_name)
+            except Exception as exc:
+                if not _is_table_missing(exc):
+                    raise
         if not active_version:
             return 0
         try:
