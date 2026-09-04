@@ -67,6 +67,31 @@ class ExtractRecoveryTests(unittest.TestCase):
         self.assertEqual(1, plan["summary"]["resumable_without_resubmit"])
         self.assertEqual({"manual_review": 1, "poll": 1, "submit": 1}, plan["summary"]["by_action"])
 
+    def test_legacy_empty_result_state_classifies_as_poll(self) -> None:
+        """M3: rows persisted before the fix may carry the pseudo-state
+        "empty-result"; they must resume polling, never land in manual review."""
+        with_stage = classify_extract_job(
+            base_job(state="empty-result", local_stage="poll", external_job_id="batch-1")
+        )
+        without_stage = classify_extract_job(
+            base_job(state="empty-result", local_stage="", external_job_id="batch-1")
+        )
+
+        self.assertEqual("poll", with_stage.action)
+        self.assertTrue(with_stage.can_resume_without_resubmit)
+        self.assertEqual("poll", without_stage.action)
+        self.assertTrue(without_stage.can_resume_without_resubmit)
+
+    def test_failed_manual_review_with_poll_stage_is_not_misclassified(self) -> None:
+        """M2 companion: a job flipped to failed_manual_review while polling
+        keeps local_stage="poll"; it must still classify as manual_review."""
+        item = classify_extract_job(
+            base_job(state="failed_manual_review", local_stage="poll", external_job_id="batch-1")
+        )
+
+        self.assertEqual("manual_review", item.action)
+        self.assertFalse(item.can_resume_without_resubmit)
+
 
 def base_job(**overrides):
     job = {

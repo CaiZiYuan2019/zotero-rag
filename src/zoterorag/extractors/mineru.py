@@ -390,7 +390,13 @@ class MinerUProvider:
         result = body.get("data") or {}
         extract_results = result.get("extract_result") or []
         if not extract_results:
-            return MinerUJobSnapshot(batch_id=batch_id, state="empty-result")
+            # M3: an empty extract_result means the batch is still queued
+            # remotely — it is NOT a real state (MinerU never reports one).
+            # Persisting the pseudo-state "empty-result" poisoned the ledger:
+            # it is not in REUSABLE_EXTRACT_STATES, so a crashed ingest would
+            # resubmit the PDF (orphaning the running batch, double billing).
+            # Map it to "running" so the job stays reusable/resumable.
+            return MinerUJobSnapshot(batch_id=batch_id, state="running")
         item = extract_results[0] or {}
         state = str(item.get("state") or "unknown")
         return MinerUJobSnapshot(

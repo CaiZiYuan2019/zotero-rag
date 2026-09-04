@@ -106,6 +106,17 @@ class MinerUProviderTests(unittest.TestCase):
             finally:
                 ledger.close()
 
+    def test_poll_empty_result_maps_to_running(self) -> None:
+        """M3: an empty extract_result list means the batch is still queued
+        remotely; it must surface as "running", not a persisted pseudo-state."""
+        client = EmptyResultMinerUClient(zip_bytes=b"")
+        provider = MinerUProvider(api_key="sk-test-secret", client=client)
+
+        polled = provider.poll("batch-001")
+
+        self.assertEqual("running", polled.state)
+        self.assertEqual("running", json.loads(polled.message)["mineru_state"])
+
     def test_safe_extract_rejects_zip_path_traversal(self) -> None:
         with workspace_tmpdir("mineru-zip-") as tmpdir:
             zip_path = tmpdir / "bad.zip"
@@ -259,6 +270,17 @@ class FakeMinerUClient:
                 },
             }
         )
+
+
+class EmptyResultMinerUClient(FakeMinerUClient):
+    """Fake client whose batch-result GET returns an empty extract_result
+    list (the batch is still queued remotely)."""
+
+    def get(self, url, *, headers=None, stream=False, timeout=None):
+        if url == "https://download.example.test/result.zip":
+            return super().get(url, headers=headers, stream=stream, timeout=timeout)
+        self.gets.append({"url": url, "headers": headers or {}, "stream": stream, "timeout": timeout})
+        return FakeResponse(body={"code": 0, "data": {"extract_result": []}})
 
 
 class FlakyFakeMinerUClient:

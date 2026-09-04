@@ -81,7 +81,10 @@ def classify_extract_job(job: dict[str, Any]) -> ExtractRecoveryItem:
     if state == "failed_manual_review":
         return recovery_item(job, "manual_review", "manual_review_required", False, missing_paths=missing_paths)
 
-    if state in {"submitted", "running"} or local_stage == "poll":
+    # "empty-result" is a legacy pseudo-state persisted before M3 (empty poll
+    # snapshot = remotely queued). List it explicitly so rows missing
+    # local_stage also classify as poll instead of manual review.
+    if state in {"submitted", "running", "empty-result"} or local_stage == "poll":
         if external_job_id:
             return recovery_item(job, "poll", "external_job_id_recorded", True, missing_paths=missing_paths)
         return recovery_item(job, "submit", "no_external_job_id_recorded", False, missing_paths=missing_paths)
