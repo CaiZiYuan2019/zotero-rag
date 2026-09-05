@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 from zoterorag.config import ExtractConfig
 from zoterorag.extractors.base import ExtractArtifact, ExtractJobState, StubExtractorProvider
-from zoterorag.extractors.manager import ExtractionManager, ExtractionRequest
+from zoterorag.extractors.manager import ExtractionManager, ExtractionRequest, extraction_cache_context
 from zoterorag.normalize import normalize_markdown_document
 from zoterorag.pipeline import (
     cancel_ingest_job,
@@ -25,6 +25,8 @@ from zoterorag.pipeline import (
 from zoterorag.pipeline.ingest import (
     CIRCUIT_BREAKER_CONSECUTIVE_FAILURES,
     _execute_normalize_stage,
+    _merge_and_checkpoint_segments,
+    _segment_page_start,
     _track_circuit_breaker,
 )
 
@@ -47,6 +49,19 @@ class CircuitBreakerUnitTests(unittest.TestCase):
         kind, streak, tripped = _track_circuit_breaker(RuntimeError("x"), kind=kind, streak=streak)
         self.assertTrue(tripped)
         self.assertEqual(CIRCUIT_BREAKER_CONSECUTIVE_FAILURES, streak)
+
+
+class SegmentOrderingUnitTests(unittest.TestCase):
+    def test_segment_page_start_parses_range(self) -> None:
+        self.assertEqual(1, _segment_page_start({"selected_pages": "1-200"}))
+        self.assertEqual(201, _segment_page_start({"selected_pages": " 201-400 "}))
+
+    def test_segment_page_start_defaults_to_zero(self) -> None:
+        # Whole-document jobs and unparseable values sort first, never last.
+        self.assertEqual(0, _segment_page_start({"selected_pages": ""}))
+        self.assertEqual(0, _segment_page_start({"selected_pages": None}))
+        self.assertEqual(0, _segment_page_start({}))
+        self.assertEqual(0, _segment_page_start({"selected_pages": "abc"}))
 
 
 class IngestPipelineTests(unittest.TestCase):
@@ -826,6 +841,179 @@ class IngestPipelineTests(unittest.TestCase):
 
                 self.assertEqual("completed", result2["job"]["status"])
                 self.assertIsNotNone(ledger.get_normalized_artifact("ATT_SPLIT_RESUME"))
+            finally:
+                ledger.close()
+
+    def test_split_failure_checkpoint_excludes_legacy_jobs_and_keeps_order(self) -> None:
+        """H3: when a split run fails mid-loop, the blocked checkpoint must
+        list exactly this run's segment jobs in page order. The previous
+        implementation scooped up every extract job of the attachment
+        (including pre-split whole-document jobs) in ledger order."""
+        with workspace_tmpdir("ingest-split-order-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                seed_profiles(ledger)
+                attachment = build_attachment_with_file(
+                    tmpdir, "ATT_SPLIT_ORDER", title="Long Paper Order"
+                )
+                ledger.upsert_attachments([attachment])
+
+                class FailingSegmentProvider(MarkdownStubExtractorProvider):
+                    def submit(
+                        self,
+                        input_file: Path,
+                        options_hash: str,
+                        *,
+                        options: dict[str, Any] | None = None,
+                        api_key: str | None = None,
+                    ) -> ExtractJobState:
+                        page_ranges = (options or {}).get("page_ranges", "")
+                        if page_ranges == "1-200":
+                            return ExtractJobState(external_job_id="seg1", state="completed")
+                        return ExtractJobState(external_job_id="seg2", state="completed")
+
+                    def poll(
+                        self,
+                        external_job_id: str,
+                        *,
+                        api_key: str | None = None,
+                        options: dict[str, Any] | None = None,
+                    ) -> ExtractJobState:
+                        if external_job_id == "seg1":
+                            return ExtractJobState(external_job_id=external_job_id, state="completed")
+                        # Segment 2 fails remotely -> MinerUAPIError mid-loop.
+                        return ExtractJobState(
+                            external_job_id=external_job_id,
+                            state="failed",
+                            message="simulated remote failure",
+                        )
+
+                provider = FailingSegmentProvider()
+
+                # Seed a legacy whole-document extract job from before the
+                # split era, derived through the same cache-key helper so the
+                # row is indistinguishable from a real one except for its
+                # whole-document selected_pages.
+                from zoterorag.db.state import utc_now
+
+                legacy_request = ExtractionRequest(
+                    input_file=Path(attachment["file_path"]),
+                    attachment_key="ATT_SPLIT_ORDER",
+                    selected_page_count=250,
+                )
+                legacy_ctx = extraction_cache_context(legacy_request, provider)
+                ledger.upsert_extract_job(
+                    {
+                        "job_id": "legacy-whole-doc-job",
+                        "attachment_key": "ATT_SPLIT_ORDER",
+                        "pdf_sha256": legacy_ctx.pdf_sha256,
+                        "selected_pages": "",
+                        "cache_key": legacy_ctx.cache_key,
+                        "provider": provider.name,
+                        "provider_version": provider.version,
+                        "options_hash": legacy_ctx.options_hash,
+                        "api_key_alias": "stub",
+                        "state": "failed_retryable",
+                        "local_stage": "error",
+                        "submitted_at": utc_now(),
+                        "payload": {
+                            "input_file": attachment["file_path"],
+                            "options": legacy_ctx.options,
+                        },
+                    }
+                )
+                # Make the legacy row the most recently updated one so any
+                # updated_at-ordered listing would surface it first.
+                ledger.conn.execute(
+                    "UPDATE extract_jobs SET updated_at = ? WHERE job_id = ?",
+                    ("2999-01-01T00:00:00+00:00", "legacy-whole-doc-job"),
+                )
+
+                extract_manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=provider,
+                )
+                extract_config = ExtractConfig(split_large_pdfs=True, max_pages_per_extraction=200)
+
+                with patch("zoterorag.pipeline.ingest.get_pdf_page_count", return_value=250):
+                    result = start_ingest_job(
+                        ledger,
+                        zotero_key="ATT_SPLIT_ORDER",
+                        include_multimodal=False,
+                        execute=True,
+                        extract_manager=extract_manager,
+                        extract_cache_dir=tmpdir / "extract_cache",
+                        normalized_dir=tmpdir / "normalized",
+                        vector_store_dir=tmpdir / "vectors",
+                        extract_config=extract_config,
+                    )
+
+                self.assertEqual("completed_with_errors", result["job"]["status"])
+                checkpoint = ledger.get_checkpoint("ATT_SPLIT_ORDER", "extract")
+                self.assertEqual("blocked", checkpoint["status"])
+                segment_job_ids = checkpoint["payload"]["segment_job_ids"]
+                # Exactly this run's two segment jobs, in page order — the
+                # legacy whole-document job must not be listed.
+                self.assertEqual(2, len(segment_job_ids))
+                self.assertNotIn("legacy-whole-doc-job", segment_job_ids)
+                segment_jobs = [ledger.get_extract_job(job_id=job_id) for job_id in segment_job_ids]
+                self.assertEqual(["1-200", "201-250"], [job["selected_pages"] for job in segment_jobs])
+                # states must align with the ids (derived from the same list).
+                self.assertEqual("downloaded", checkpoint["payload"]["states"][0])
+                self.assertEqual("failed_retryable", checkpoint["payload"]["states"][1])
+            finally:
+                ledger.close()
+
+    def test_merge_and_checkpoint_sorts_segments_by_page(self) -> None:
+        """H3: _merge_and_checkpoint_segments merges in page order even when
+        handed jobs in a scrambled order (e.g. resumed from a legacy
+        checkpoint persisted in ledger order)."""
+        with workspace_tmpdir("ingest-merge-order-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                attachment = build_attachment_with_file(tmpdir, "ATT_MERGE_ORDER", title="Merge Order")
+                ledger.upsert_attachments([attachment])
+                # job_events has a FK to the jobs table; create a real job row.
+                pipeline_job_id = ledger.create_job_if_no_active("ingest", {"mode": "incremental"})
+
+                seg1_dir = tmpdir / "seg1"
+                seg1_dir.mkdir()
+                (seg1_dir / "full.md").write_text("pages 1-200 content\n", encoding="utf-8")
+                seg2_dir = tmpdir / "seg2"
+                seg2_dir.mkdir()
+                (seg2_dir / "full.md").write_text("pages 201-250 content\n", encoding="utf-8")
+
+                scrambled_jobs = [
+                    {
+                        "job_id": "seg-job-2",
+                        "selected_pages": "201-250",
+                        "state": "downloaded",
+                        "artifact_dir": str(seg2_dir),
+                    },
+                    {
+                        "job_id": "seg-job-1",
+                        "selected_pages": "1-200",
+                        "state": "downloaded",
+                        "artifact_dir": str(seg1_dir),
+                    },
+                ]
+                _merge_and_checkpoint_segments(
+                    ledger=ledger,
+                    job_id=pipeline_job_id,
+                    attachment_key="ATT_MERGE_ORDER",
+                    segment_jobs=scrambled_jobs,
+                    extract_cache_dir=tmpdir / "extract_cache",
+                )
+
+                checkpoint = ledger.get_checkpoint("ATT_MERGE_ORDER", "extract")
+                self.assertEqual("done", checkpoint["status"])
+                self.assertEqual(
+                    ["seg-job-1", "seg-job-2"],
+                    checkpoint["payload"]["segment_job_ids"],
+                )
+                merged = Path(checkpoint["payload"]["merged_markdown"]).read_text(encoding="utf-8")
+                self.assertLess(merged.index("pages 1-200"), merged.index("pages 201-250"))
             finally:
                 ledger.close()
 

@@ -49,6 +49,56 @@ class ExtractionResult:
     cache_hit: bool
 
 
+@dataclass(frozen=True)
+class ExtractionCacheContext:
+    """Everything derived from an ExtractionRequest for cache-key purposes."""
+
+    pdf_sha256: str
+    selected_pages: str
+    options: dict[str, Any]
+    options_hash: str
+    endpoint_url: str
+    cache_key: str
+
+
+def extraction_cache_context(
+    request: ExtractionRequest,
+    provider: ExtractorProvider,
+    *,
+    pdf_sha256: str | None = None,
+) -> ExtractionCacheContext:
+    """Derive the cache context that an ``ensure_extraction`` call would use.
+
+    H3: shared with the ingest split path so a planned page segment can be
+    mapped back to its ledger job with exactly the key that submission
+    persisted — the two derivations cannot drift apart.
+    """
+
+    pdf_sha256 = pdf_sha256 or request.pdf_sha256 or sha256_file(Path(request.input_file))
+    selected_pages = canonical_selected_pages(request.selected_pages)
+    options = dict(request.options or {})
+    if "timeout_seconds" not in options:
+        options["timeout_seconds"] = recommended_mineru_timeout_seconds(request.selected_page_count)
+    options_hash = stable_options_hash(options)
+    endpoint_url = getattr(provider, "apply_upload_url", "") or getattr(provider, "endpoint", "")
+    cache_key = extractor_cache_key(
+        pdf_sha256=pdf_sha256,
+        selected_pages=selected_pages,
+        extractor_name=provider.name,
+        extractor_version=provider.version,
+        options_hash=options_hash,
+        endpoint_url=endpoint_url,
+    )
+    return ExtractionCacheContext(
+        pdf_sha256=pdf_sha256,
+        selected_pages=selected_pages,
+        options=options,
+        options_hash=options_hash,
+        endpoint_url=endpoint_url,
+        cache_key=cache_key,
+    )
+
+
 class ExtractionManager:
     """Coordinates extraction state, cache keys, and provider calls.
 
@@ -157,23 +207,17 @@ class ExtractionManager:
 
     def ensure_extraction(self, request: ExtractionRequest) -> ExtractionResult:
         input_file = Path(request.input_file)
-        pdf_sha256 = request.pdf_sha256 or sha256_file(input_file)
-        selected_pages = canonical_selected_pages(request.selected_pages)
-        options = dict(request.options or {})
-        if "timeout_seconds" not in options:
-            options["timeout_seconds"] = recommended_mineru_timeout_seconds(request.selected_page_count)
+        # Single source of truth for the cache-key derivation lives in
+        # extraction_cache_context(); the ingest split path uses the same
+        # helper to map segments back to their persisted jobs (H3).
+        ctx = extraction_cache_context(request, self.provider)
+        pdf_sha256 = ctx.pdf_sha256
+        selected_pages = ctx.selected_pages
+        options = ctx.options
         provider_options = dict(options)
         provider_options.setdefault("page_ranges", selected_pages)
-        options_hash = stable_options_hash(options)
-        endpoint_url = getattr(self.provider, "apply_upload_url", "") or getattr(self.provider, "endpoint", "")
-        cache_key = extractor_cache_key(
-            pdf_sha256=pdf_sha256,
-            selected_pages=selected_pages,
-            extractor_name=self.provider.name,
-            extractor_version=self.provider.version,
-            options_hash=options_hash,
-            endpoint_url=endpoint_url,
-        )
+        options_hash = ctx.options_hash
+        cache_key = ctx.cache_key
 
         existing = self.ledger.get_extract_job_by_cache_key(cache_key)
         if existing is not None and existing["state"] in REUSABLE_EXTRACT_STATES:

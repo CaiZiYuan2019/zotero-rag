@@ -17,7 +17,7 @@ from ..normalize.merge_extract_segments import (
 from ..pdf_pages import get_pdf_page_count
 from ..search.results import RerankNotSupportedError
 from ..extractors.segments import compute_page_segments
-from ..extractors.cache import UNKNOWN_PAGE_COUNT_FALLBACK
+from ..extractors.cache import UNKNOWN_PAGE_COUNT_FALLBACK, sha256_file
 from ..config.settings import ExtractConfig
 from .runner import acquire_runner_lock
 
@@ -958,7 +958,6 @@ def _execute_extract_stage(
             job_id=job_id,
             attachment_key=attachment_key,
             segment_jobs=segment_jobs,
-            segment_job_ids=segment_job_ids,
         )
         return "blocked"
 
@@ -1008,21 +1007,27 @@ def _execute_extract_stage(
             segment_job_ids.append(result.job["job_id"])
             _progress(f"  extract: segment {segment.index + 1}/{len(segments)} state={result.job['state']}")
     except Exception:
-        # Persist the segment ids that were submitted before the failure so
+        # Persist the segment jobs that were submitted before the failure so
         # that a later resume can pick up where we left off.
-        segment_jobs = [
-            job
-            for job in ledger.list_extract_jobs(limit=None)
-            if job.get("attachment_key") == attachment_key
-        ]
+        # H3: map each planned segment back to its own ledger job via the same
+        # cache key ensure_extraction persisted it under. The previous code
+        # scooped up *all* extract jobs for this attachment, which (a) pulled
+        # in legacy whole-document jobs from before the split era and (b)
+        # returned them in ledger order rather than segment order — both
+        # corrupt the persisted segment_job_ids that resume/merge rely on.
+        segment_jobs = _find_segment_jobs(
+            segments,
+            ledger=ledger,
+            extract_manager=extract_manager,
+            file_path=file_path,
+            attachment_key=attachment_key,
+        )
         if segment_jobs:
-            failed_segment_job_ids = [job["job_id"] for job in segment_jobs]
             _checkpoint_segment_blocked(
                 ledger=ledger,
                 job_id=job_id,
                 attachment_key=attachment_key,
                 segment_jobs=segment_jobs,
-                segment_job_ids=failed_segment_job_ids,
             )
         raise
 
@@ -1033,7 +1038,6 @@ def _execute_extract_stage(
             job_id=job_id,
             attachment_key=attachment_key,
             segment_jobs=segment_jobs,
-            segment_job_ids=[job["job_id"] for job in segment_jobs],
         )
         return "blocked"
 
@@ -1085,6 +1089,61 @@ def _merged_artifact_dir(extract_cache_dir: Path, attachment_key: str) -> Path:
     return extract_cache_dir / "merged" / sanitize_id(attachment_key)
 
 
+def _segment_page_start(job: dict[str, Any]) -> int:
+    """Sort key for segment jobs: first page of ``selected_pages``.
+
+    "201-400" -> 201. Whole-document jobs (empty selected_pages) and
+    unparseable values sort first (0) so they never silently move to the end.
+    """
+
+    raw = str(job.get("selected_pages") or "").strip()
+    try:
+        return int(raw.split("-", 1)[0])
+    except ValueError:
+        return 0
+
+
+def _find_segment_jobs(
+    segments: list[Any],
+    *,
+    ledger: StateLedger,
+    extract_manager: Any,
+    file_path: str | Path,
+    attachment_key: str,
+) -> list[dict[str, Any]]:
+    """Look up the ledger job for each planned page segment, in segment order.
+
+    H3: each segment's cache key is recomputed exactly as ensure_extraction
+    derived it, so the lookup finds precisely this split run's jobs — legacy
+    whole-document jobs for the same attachment have a different key and are
+    excluded. Segments whose job was never persisted (the failure happened
+    before upsert_extract_job) are skipped.
+
+    Known limitation (pre-existing, recorded in MODIFICATION_PLAN_20260904
+    follow-ups): the resume path trusts the persisted segment_job_ids subset
+    and never re-plans the full segment set, so a failure that struck before
+    later segments were persisted leaves them unsubmitted until a full
+    rebuild.
+    """
+
+    from ..extractors.manager import ExtractionRequest, extraction_cache_context
+
+    pdf_sha256 = sha256_file(file_path)
+    jobs: list[dict[str, Any]] = []
+    for segment in segments:
+        request = ExtractionRequest(
+            input_file=Path(file_path),
+            attachment_key=attachment_key,
+            selected_pages=segment.selected_pages,
+            selected_page_count=segment.page_count,
+        )
+        cache_key = extraction_cache_context(request, extract_manager.provider, pdf_sha256=pdf_sha256).cache_key
+        job = ledger.get_extract_job_by_cache_key(cache_key)
+        if job is not None:
+            jobs.append(job)
+    return jobs
+
+
 def _merge_and_checkpoint_segments(
     *,
     ledger: StateLedger,
@@ -1096,6 +1155,11 @@ def _merge_and_checkpoint_segments(
 ) -> None:
     """Merge segment artifacts and persist a done checkpoint."""
 
+    # H3: merge strictly in page order. Callers may hand us jobs in ledger or
+    # legacy-checkpoint order (e.g. a resumed run whose persisted
+    # segment_job_ids predate ordered persistence), which would otherwise
+    # scramble merged_full.md. sorted() is stable, so ties keep input order.
+    segment_jobs = sorted(segment_jobs, key=_segment_page_start)
     segment_job_ids = [job["job_id"] for job in segment_jobs]
     merged_dir = Path(merged_artifact_dir) if merged_artifact_dir else _merged_artifact_dir(extract_cache_dir, attachment_key)
 
@@ -1210,8 +1274,11 @@ def _checkpoint_segment_blocked(
     job_id: str,
     attachment_key: str,
     segment_jobs: list[dict[str, Any]],
-    segment_job_ids: list[str],
 ) -> None:
+    # H3: persist segment_job_ids in page order, derived from the same sorted
+    # jobs list as the states array so the two can never drift apart.
+    segment_jobs = sorted(segment_jobs, key=_segment_page_start)
+    segment_job_ids = [job["job_id"] for job in segment_jobs]
     failed_states = {job["state"] for job in segment_jobs if job["state"] not in DONE_EXTRACT_STATES}
     ledger.checkpoint(
         attachment_key,
