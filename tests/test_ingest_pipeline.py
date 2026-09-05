@@ -1017,6 +1017,139 @@ class IngestPipelineTests(unittest.TestCase):
             finally:
                 ledger.close()
 
+    def test_merge_and_checkpoint_force_remerges_truncated_file(self) -> None:
+        """H2: force=True re-merges even when merged_full.md already exists
+        (e.g. truncated by a killed run); the default keeps exists-skip."""
+        with workspace_tmpdir("ingest-merge-force-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                attachment = build_attachment_with_file(tmpdir, "ATT_MERGE_FORCE", title="Merge Force")
+                ledger.upsert_attachments([attachment])
+                # job_events has a FK to the jobs table; create a real job row.
+                pipeline_job_id = ledger.create_job_if_no_active("ingest", {"mode": "incremental"})
+
+                seg1_dir = tmpdir / "seg1"
+                seg1_dir.mkdir()
+                (seg1_dir / "full.md").write_text("pages 1-200 content\n", encoding="utf-8")
+                jobs = [
+                    {
+                        "job_id": "seg-job-1",
+                        "selected_pages": "1-200",
+                        "state": "downloaded",
+                        "artifact_dir": str(seg1_dir),
+                    }
+                ]
+
+                merged_dir = tmpdir / "merged_out"
+                merged_dir.mkdir()
+                (merged_dir / "merged_full.md").write_text("TRUNCATED", encoding="utf-8")
+
+                # Default: exists-skip keeps the truncated file untouched.
+                _merge_and_checkpoint_segments(
+                    ledger=ledger,
+                    job_id=pipeline_job_id,
+                    attachment_key="ATT_MERGE_FORCE",
+                    segment_jobs=jobs,
+                    extract_cache_dir=tmpdir / "extract_cache",
+                    merged_artifact_dir=merged_dir,
+                )
+                self.assertEqual("TRUNCATED", (merged_dir / "merged_full.md").read_text(encoding="utf-8"))
+
+                # force=True repairs it.
+                _merge_and_checkpoint_segments(
+                    ledger=ledger,
+                    job_id=pipeline_job_id,
+                    attachment_key="ATT_MERGE_FORCE",
+                    segment_jobs=jobs,
+                    extract_cache_dir=tmpdir / "extract_cache",
+                    merged_artifact_dir=merged_dir,
+                    force=True,
+                )
+                self.assertEqual(
+                    "pages 1-200 content\n",
+                    (merged_dir / "merged_full.md").read_text(encoding="utf-8"),
+                )
+            finally:
+                ledger.close()
+
+    def test_full_rebuild_repairs_truncated_merged_markdown(self) -> None:
+        """H2: --mode full re-merges segment artifacts even when a (truncated)
+        merged_full.md already exists; an incremental run leaves it alone."""
+        with workspace_tmpdir("ingest-full-remerge-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                seed_profiles(ledger)
+                attachment = build_attachment_with_file(tmpdir, "ATT_FULL_REMERGE", title="Full Remerge")
+                ledger.upsert_attachments([attachment])
+
+                extract_manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=MarkdownStubExtractorProvider(),
+                )
+                extract_config = ExtractConfig(split_large_pdfs=True, max_pages_per_extraction=200)
+
+                with patch("zoterorag.pipeline.ingest.get_pdf_page_count", return_value=250):
+                    result = start_ingest_job(
+                        ledger,
+                        zotero_key="ATT_FULL_REMERGE",
+                        include_multimodal=False,
+                        execute=True,
+                        extract_manager=extract_manager,
+                        extract_cache_dir=tmpdir / "extract_cache",
+                        normalized_dir=tmpdir / "normalized",
+                        vector_store_dir=tmpdir / "vectors",
+                        extract_config=extract_config,
+                    )
+                self.assertEqual("completed", result["job"]["status"])
+
+                checkpoint = ledger.get_checkpoint("ATT_FULL_REMERGE", "extract")
+                merged_path = Path(checkpoint["payload"]["merged_markdown"])
+                healthy = merged_path.read_text(encoding="utf-8")
+                self.assertIn("## Part 2", healthy)
+
+                # Simulate a crash-truncated merged file.
+                merged_path.write_text("TRUNCATED", encoding="utf-8")
+
+                # Incremental re-run: extract stage already done, so the
+                # truncated file is left untouched (exists-skip by design).
+                with patch("zoterorag.pipeline.ingest.get_pdf_page_count", return_value=250):
+                    result2 = start_ingest_job(
+                        ledger,
+                        zotero_key="ATT_FULL_REMERGE",
+                        include_multimodal=False,
+                        execute=True,
+                        extract_manager=extract_manager,
+                        extract_cache_dir=tmpdir / "extract_cache",
+                        normalized_dir=tmpdir / "normalized",
+                        vector_store_dir=tmpdir / "vectors",
+                        extract_config=extract_config,
+                    )
+                self.assertEqual("completed", result2["job"]["status"])
+                self.assertEqual("TRUNCATED", merged_path.read_text(encoding="utf-8"))
+
+                # Full rebuild: segment jobs cache-hit as downloaded, then the
+                # force merge repairs the truncated file.
+                with patch("zoterorag.pipeline.ingest.get_pdf_page_count", return_value=250):
+                    result3 = start_ingest_job(
+                        ledger,
+                        zotero_key="ATT_FULL_REMERGE",
+                        include_multimodal=False,
+                        mode="full",
+                        execute=True,
+                        extract_manager=extract_manager,
+                        extract_cache_dir=tmpdir / "extract_cache",
+                        normalized_dir=tmpdir / "normalized",
+                        vector_store_dir=tmpdir / "vectors",
+                        extract_config=extract_config,
+                    )
+                self.assertEqual("completed", result3["job"]["status"])
+                repaired = merged_path.read_text(encoding="utf-8")
+                self.assertIn("# Demo Paper", repaired)
+                self.assertIn("## Part 2", repaired)
+            finally:
+                ledger.close()
+
     def test_split_segments_blocked_while_remote_running_and_resume_finishes(self) -> None:
         """M9: a split PDF whose segments are still running remotely ends the
         run as blocked — never normalized from a fragment — and resume

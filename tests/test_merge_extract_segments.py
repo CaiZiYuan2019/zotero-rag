@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 from zoterorag.normalize.merge_extract_segments import merge_extract_segments
 
@@ -94,6 +95,40 @@ class MergeExtractSegmentsTest(unittest.TestCase):
             empty_dir.mkdir()
             with self.assertRaises(FileNotFoundError):
                 merge_extract_segments([empty_dir], tmp / "merged")
+
+    def test_merge_leaves_no_tmp_file(self) -> None:
+        """H2: the temp file is renamed into place, never left behind."""
+        with self._temp_dir() as tmp:
+            seg1 = self._make_segment(tmp, 1, "First segment.")
+            out = tmp / "merged"
+            merged_md = merge_extract_segments([seg1], out)
+
+            self.assertEqual("First segment.", merged_md.read_text(encoding="utf-8"))
+            self.assertFalse((out / "merged_full.md.tmp").exists())
+
+    def test_merge_crash_before_replace_preserves_existing_file(self) -> None:
+        """H2: a failure before the atomic rename must leave any previous
+        merged_full.md byte-identical — partial writes can never leak into
+        the final path."""
+        with self._temp_dir() as tmp:
+            # Build segment fixtures outside the patch context: _make_segment
+            # uses write_text/os.replace-free writes itself.
+            seg1 = self._make_segment(tmp, 1, "New content.")
+            out = tmp / "merged"
+            out.mkdir(parents=True)
+            (out / "merged_full.md").write_text("OLD", encoding="utf-8")
+
+            # Simulate a crash at the commit point (the atomic rename).
+            with patch(
+                "zoterorag.normalize.merge_extract_segments.os.replace",
+                side_effect=OSError("simulated crash"),
+            ):
+                with self.assertRaises(OSError):
+                    merge_extract_segments([seg1], out)
+
+            self.assertEqual("OLD", (out / "merged_full.md").read_text(encoding="utf-8"))
+            # The leftover temp file is harmless: the next merge overwrites it.
+            self.assertTrue((out / "merged_full.md.tmp").is_file())
 
     def _temp_dir(self):
         import tempfile

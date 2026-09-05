@@ -951,6 +951,10 @@ def _execute_extract_stage(
                 segment_jobs=segment_jobs,
                 extract_cache_dir=extract_cache_dir,
                 merged_artifact_dir=merged_artifact_dir,
+                # This branch only runs when not is_full_rebuild (guard at
+                # the top), so force is always False here; passed explicitly
+                # to keep the contract visible.
+                force=is_full_rebuild,
             )
             return "done"
         _checkpoint_segment_blocked(
@@ -1048,6 +1052,9 @@ def _execute_extract_stage(
         segment_jobs=segment_jobs,
         extract_cache_dir=extract_cache_dir,
         merged_artifact_dir=merged_artifact_dir,
+        # H2: a full rebuild must re-merge unconditionally so it can repair a
+        # truncated/stale merged_full.md left behind by a killed run.
+        force=is_full_rebuild,
     )
     return "done"
 
@@ -1152,6 +1159,7 @@ def _merge_and_checkpoint_segments(
     segment_jobs: list[dict[str, Any]],
     extract_cache_dir: Path,
     merged_artifact_dir: str | Path | None = None,
+    force: bool = False,
 ) -> None:
     """Merge segment artifacts and persist a done checkpoint."""
 
@@ -1164,8 +1172,11 @@ def _merge_and_checkpoint_segments(
     merged_dir = Path(merged_artifact_dir) if merged_artifact_dir else _merged_artifact_dir(extract_cache_dir, attachment_key)
 
     # Skip re-merging if the merged artifact already exists and looks valid.
+    # H2: force (full rebuild) re-merges unconditionally so a truncated or
+    # stale merged_full.md left behind by a killed run can be repaired;
+    # re-merging is local, cheap, and idempotent (atomic write since H2).
     merged_md = merged_dir / "merged_full.md"
-    if not merged_md.is_file():
+    if force or not merged_md.is_file():
         segment_dirs = segment_artifact_dirs_from_jobs(segment_jobs)
         merge_extract_segments(segment_dirs, merged_dir)
 

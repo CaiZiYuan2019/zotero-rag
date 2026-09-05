@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import re
 import shutil
@@ -122,7 +123,13 @@ def merge_extract_segments(
 
     merged_text = "".join(merged_parts)
     merged_md = output_dir / "merged_full.md"
-    merged_md.write_text(merged_text, encoding="utf-8", newline="\n")
+    # H2: write to a sibling temp file and atomically rename it into place.
+    # A crash mid-write then only leaves a .tmp file behind, so the caller's
+    # exists-skip guard can never mistake a truncated merged_full.md for a
+    # complete artifact. os.replace is atomic on the same directory/volume.
+    tmp_md = output_dir / (merged_md.name + ".tmp")
+    tmp_md.write_text(merged_text, encoding="utf-8", newline="\n")
+    os.replace(tmp_md, merged_md)
     return merged_md
 
 
