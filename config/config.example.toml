@@ -47,7 +47,10 @@ query_role_mode = "instruction"
 document_role_mode = "plain"
 instruction_template = ""
 image_policy = {}
-rate_limit = {}
+# Phase 1: concurrent embedding workers per profile (1 = legacy serial) and
+# HTTP-attempt pacing (0 = unlimited; retries count against the limit).
+embed_workers = 16
+rate_limit = { requests_per_second = 38 }
 
 [[embedding_profiles]]
 name = "qwen3vl_cloud_2560_multimodal"
@@ -64,4 +67,5 @@ query_role_mode = "instruction"
 document_role_mode = "plain"
 instruction_template = ""
 image_policy = {}
-rate_limit = {}
+embed_workers = 16
+rate_limit = { requests_per_second = 38 }

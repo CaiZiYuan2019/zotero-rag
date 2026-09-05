@@ -132,6 +132,10 @@ def build_qwen_embedding_provider(
     _validate_endpoint_url(endpoint_url, DASHSCOPE_ALLOWED_HOSTS)
     embedded_profile = dict(profile.get("profile") or {})
     instruction = profile.get("instruction_template") or embedded_profile.get("instruction_template") or ""
+    # Phase 1: pass concurrency and HTTP-attempt pacing through from the
+    # profile. Raw values are passed so the provider's own validation sees
+    # the original types (e.g. rejecting bools for embed_workers).
+    rate_limit = embedded_profile.get("rate_limit") or {}
     return Qwen3VLEmbeddingProvider(
         api_key=key[1],
         model=str(profile["model"]),
@@ -140,6 +144,8 @@ def build_qwen_embedding_provider(
         client=client,
         query_instruction=instruction or DEFAULT_QUERY_INSTRUCTION,
         document_instruction=embedded_profile.get("document_instruction", DEFAULT_DOCUMENT_INSTRUCTION),
+        embed_workers=embedded_profile.get("embed_workers", 1),
+        rate_limit_per_second=rate_limit.get("requests_per_second", 0.0) or 0.0,
     )
 
 

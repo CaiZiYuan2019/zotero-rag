@@ -28,7 +28,10 @@ default_for_text = true
 default_for_multimodal = false
 batch_size = 32
 image_policy = {}
-rate_limit = {}
+# Phase 1: concurrent embedding workers per profile + HTTP-attempt pacing
+# (retries included). Scope is one document-profile pass, not global.
+embed_workers = 16
+rate_limit = { requests_per_second = 38 }
 
 [[embedding_profiles]]
 name = "qwen3vl_cloud_2560_multimodal"
@@ -42,4 +45,5 @@ default_for_text = false
 default_for_multimodal = true
 batch_size = 32
 image_policy = {}
-rate_limit = {}
+embed_workers = 16
+rate_limit = { requests_per_second = 38 }

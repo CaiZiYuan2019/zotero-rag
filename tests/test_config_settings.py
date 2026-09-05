@@ -261,6 +261,64 @@ default_for_text = true
                 load_config(config_path)
             self.assertIn("model", str(ctx.exception))
 
+    def test_embed_workers_defaults_to_one(self) -> None:
+        with workspace_tmpdir("profile-workers-default-") as tmpdir:
+            config_path = self._write_config(
+                tmpdir,
+                """
+[[embedding_profiles]]
+name = "stub_text"
+provider = "stub"
+model = "stub"
+dimension = 8
+modality = "text"
+default_for_text = true
+""",
+            )
+            config = load_config(config_path)
+            self.assertEqual(1, config.embedding_profiles[0].embed_workers)
+
+    def test_embed_workers_parsed_from_toml(self) -> None:
+        with workspace_tmpdir("profile-workers-") as tmpdir:
+            config_path = self._write_config(
+                tmpdir,
+                """
+[[embedding_profiles]]
+name = "stub_text"
+provider = "stub"
+model = "stub"
+dimension = 8
+modality = "text"
+default_for_text = true
+embed_workers = 8
+rate_limit = { requests_per_second = 10 }
+""",
+            )
+            config = load_config(config_path)
+            profile = config.embedding_profiles[0]
+            self.assertEqual(8, profile.embed_workers)
+            self.assertEqual({"requests_per_second": 10}, profile.rate_limit)
+
+    def test_embed_workers_invalid_values_raise(self) -> None:
+        for bad in ("0", "-3", "true"):
+            with workspace_tmpdir("profile-workers-bad-") as tmpdir:
+                config_path = self._write_config(
+                    tmpdir,
+                    f"""
+[[embedding_profiles]]
+name = "stub_text"
+provider = "stub"
+model = "stub"
+dimension = 8
+modality = "text"
+default_for_text = true
+embed_workers = {bad}
+""",
+                )
+                with self.assertRaises(ValueError) as ctx:
+                    load_config(config_path)
+                self.assertIn("embed_workers", str(ctx.exception))
+
     def test_duplicate_profile_name_raises(self) -> None:
         with workspace_tmpdir("profile-dup-") as tmpdir:
             config_path = self._write_config(

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import json
 import mimetypes
 import random
+import threading
 import time
 from pathlib import Path
 from typing import Any, Protocol
@@ -33,6 +35,34 @@ DEFAULT_RETRY_BACKOFF_FACTOR = 2.0
 DEFAULT_RETRY_JITTER = 0.1
 
 _TRANSIENT_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504, 520})
+
+
+class _TokenBucket:
+    """Thread-safe token bucket for requests-per-second pacing.
+
+    Tokens refill continuously at ``rate`` per second up to ``capacity``
+    (which bounds the initial burst); ``acquire()`` blocks until a token is
+    available.
+    """
+
+    def __init__(self, rate_per_second: float, capacity: float) -> None:
+        self.rate = float(rate_per_second)
+        self.capacity = max(1.0, float(capacity))
+        self._tokens = self.capacity
+        self._updated = time.monotonic()
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                self._tokens = min(self.capacity, self._tokens + (now - self._updated) * self.rate)
+                self._updated = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                wait = (1.0 - self._tokens) / self.rate
+            time.sleep(wait)
 
 
 class QwenResponse(Protocol):
@@ -87,11 +117,20 @@ class Qwen3VLEmbeddingProvider:
         retry_max_seconds: float = DEFAULT_RETRY_MAX_SECONDS,
         retry_backoff_factor: float = DEFAULT_RETRY_BACKOFF_FACTOR,
         retry_jitter: float = DEFAULT_RETRY_JITTER,
+        embed_workers: int = 1,
+        rate_limit_per_second: float = 0.0,
     ) -> None:
         if dimension not in QWEN3VL_SUPPORTED_DIMENSIONS:
             raise ValueError(f"unsupported qwen3-vl-embedding dimension: {dimension}")
         if not api_key.strip():
             raise ValueError("api_key is required")
+        if isinstance(embed_workers, bool) or not isinstance(embed_workers, int) or embed_workers < 1:
+            raise ValueError(f"embed_workers must be a positive integer, got {embed_workers!r}")
+        if isinstance(rate_limit_per_second, bool):
+            raise ValueError(f"rate_limit_per_second must be a number >= 0, got {rate_limit_per_second!r}")
+        rate_limit_per_second = float(rate_limit_per_second or 0.0)
+        if rate_limit_per_second < 0:
+            raise ValueError(f"rate_limit_per_second must be >= 0, got {rate_limit_per_second!r}")
         self.api_key = api_key
         self.model = model
         self.dimension = dimension
@@ -106,6 +145,19 @@ class Qwen3VLEmbeddingProvider:
         self.retry_max_seconds = retry_max_seconds
         self.retry_backoff_factor = retry_backoff_factor
         self.retry_jitter = retry_jitter
+        self.embed_workers = embed_workers
+        # Phase 1: HTTP-attempt pacing. The scope is this provider instance
+        # (one document-profile embedding pass) — not a global limiter. The
+        # bucket capacity is capped by the worker count so the initial burst
+        # can never exceed what the worker pool would have in flight anyway.
+        self._rate_bucket = (
+            _TokenBucket(
+                rate_limit_per_second,
+                capacity=max(1.0, min(rate_limit_per_second, float(embed_workers))),
+            )
+            if rate_limit_per_second > 0
+            else None
+        )
 
     def _is_retryable_exception(self, exc: BaseException) -> bool:
         if isinstance(exc, (TimeoutError, OSError)):
@@ -128,6 +180,11 @@ class Qwen3VLEmbeddingProvider:
         last_exception: BaseException | None = None
         delay = self.retry_initial_seconds
         for attempt in range(self.max_retries):
+            if self._rate_bucket is not None:
+                # Phase 1: the rate limit counts HTTP attempts (retries
+                # included), so a 429/5xx storm cannot exceed the configured
+                # pace. Applies to both the serial and concurrent embed paths.
+                self._rate_bucket.acquire()
             try:
                 response = self.client.post(
                     self.endpoint,
@@ -155,7 +212,29 @@ class Qwen3VLEmbeddingProvider:
         raise QwenEmbeddingError("qwen embedding request failed after retries")
 
     def embed(self, inputs: list[EmbeddingInput]) -> list[EmbeddingVector]:
-        return [self._embed_one(item) for item in inputs]
+        # Phase 1: embed_workers=1 (the default) keeps the exact original
+        # serial path. The thread pool exists only for the duration of this
+        # call. With embed_workers>1 the client's post() must be thread-safe
+        # (the default requests module-level client is: each call builds and
+        # closes a fresh Session).
+        if self.embed_workers <= 1 or len(inputs) <= 1:
+            return [self._embed_one(item) for item in inputs]
+        pool = ThreadPoolExecutor(max_workers=self.embed_workers)
+        futures = [pool.submit(self._embed_one, item) for item in inputs]
+        try:
+            # future.result() iterates in submission order, so the output
+            # order always matches the input order regardless of completion
+            # order.
+            results = [future.result() for future in futures]
+        except BaseException:
+            # Fail fast: cancel queued-but-not-started tasks (in-flight ones
+            # finish on their own) so a systemic failure (e.g. a revoked key)
+            # cannot burn through every remaining input with retries before
+            # the error propagates.
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        pool.shutdown(wait=True)
+        return results
 
     def _embed_one(self, item: EmbeddingInput) -> EmbeddingVector:
         payload = self._payload_for_input(item)

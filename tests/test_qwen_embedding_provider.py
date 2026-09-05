@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import base64
 import json
+import threading
+import time
 import unittest
+from unittest.mock import patch
 
 from tests._support import workspace_tmpdir
 from zoterorag.embeddings import EmbeddingInput, Qwen3VLEmbeddingProvider, QwenEmbeddingError
+from zoterorag.embeddings.qwen import _TokenBucket
 from zoterorag.providers import _validate_endpoint_url, build_qwen_embedding_provider
 
 
@@ -254,6 +258,195 @@ class FakeQwenClient:
         if self._responses is not None:
             return self._responses.pop(0)
         return FakeQwenResponse(dimension=self.dimension)
+
+
+class ThreadSafeSlowClient:
+    """Fake client that is safe under concurrent embed: tracks the in-flight
+    call count and can simulate a fixed latency / failure status."""
+
+    def __init__(self, *, dimension: int, delay_seconds: float = 0.0, status_code: int = 200) -> None:
+        self.dimension = dimension
+        self.delay_seconds = delay_seconds
+        self.status_code = status_code
+        self._lock = threading.Lock()
+        self._in_flight = 0
+        self.max_in_flight = 0
+        self.post_count = 0
+
+    def post(self, url, *, headers=None, json=None, timeout=None):
+        with self._lock:
+            self._in_flight += 1
+            self.post_count += 1
+            self.max_in_flight = max(self.max_in_flight, self._in_flight)
+        try:
+            if self.delay_seconds:
+                time.sleep(self.delay_seconds)
+            return FakeQwenResponse(dimension=self.dimension, status_code=self.status_code, text="boom")
+        finally:
+            with self._lock:
+                self._in_flight -= 1
+
+
+class ConcurrentEmbeddingTests(unittest.TestCase):
+    """Phase 1: embed_workers concurrency, ordering, and fail-fast semantics."""
+
+    def test_concurrent_embed_preserves_order_and_overlaps(self) -> None:
+        client = ThreadSafeSlowClient(dimension=2560, delay_seconds=0.05)
+        provider = Qwen3VLEmbeddingProvider(api_key="sk-test", client=client, embed_workers=4)
+        inputs = [
+            EmbeddingInput(input_id=f"doc{i}", text=f"text {i}", role="document") for i in range(8)
+        ]
+
+        vectors = provider.embed(inputs)
+
+        self.assertEqual([item.input_id for item in inputs], [v.input_id for v in vectors])
+        self.assertGreater(client.max_in_flight, 1)
+        self.assertEqual(8, client.post_count)
+
+    def test_default_workers_stays_serial(self) -> None:
+        """embed_workers=1 (the default) must keep the original serial path."""
+        client = ThreadSafeSlowClient(dimension=2560, delay_seconds=0.02)
+        provider = Qwen3VLEmbeddingProvider(api_key="sk-test", client=client)
+        inputs = [
+            EmbeddingInput(input_id=f"doc{i}", text=f"text {i}", role="document") for i in range(4)
+        ]
+
+        vectors = provider.embed(inputs)
+
+        self.assertEqual([item.input_id for item in inputs], [v.input_id for v in vectors])
+        self.assertEqual(1, client.max_in_flight)
+        self.assertEqual(4, client.post_count)
+
+    def test_failure_cancels_queued_inputs(self) -> None:
+        """A systemic failure must not burn through every remaining input with
+        retries: the first error cancels queued (not yet started) tasks."""
+        # 400 is not in the transient set, so every started task fails after
+        # exactly one post.
+        client = ThreadSafeSlowClient(dimension=2560, delay_seconds=0.01, status_code=400)
+        provider = Qwen3VLEmbeddingProvider(api_key="sk-test", client=client, embed_workers=2)
+        inputs = [
+            EmbeddingInput(input_id=f"doc{i}", text=f"text {i}", role="document") for i in range(50)
+        ]
+
+        with self.assertRaises(QwenEmbeddingError):
+            provider.embed(inputs)
+
+        self.assertLess(client.post_count, 50)
+
+    def test_embed_workers_validation(self) -> None:
+        for bad in (0, -1, True, 1.5, "4"):
+            with self.assertRaises(ValueError):
+                Qwen3VLEmbeddingProvider(api_key="sk-test", client=FakeQwenClient(dimension=2560), embed_workers=bad)
+        with self.assertRaises(ValueError):
+            Qwen3VLEmbeddingProvider(
+                api_key="sk-test",
+                client=FakeQwenClient(dimension=2560),
+                rate_limit_per_second=-1.0,
+            )
+        with self.assertRaises(ValueError):
+            Qwen3VLEmbeddingProvider(
+                api_key="sk-test",
+                client=FakeQwenClient(dimension=2560),
+                rate_limit_per_second=True,
+            )
+
+
+class RateLimitTests(unittest.TestCase):
+    """Phase 1: token-bucket pacing, billed per HTTP attempt (retries too)."""
+
+    def _fake_clock(self):
+        clock = [0.0]
+        sleeps: list[float] = []
+
+        def fake_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            clock[0] += seconds
+
+        return clock, sleeps, fake_sleep
+
+    def test_token_bucket_capacity_and_refill(self) -> None:
+        clock, sleeps, fake_sleep = self._fake_clock()
+        with patch("zoterorag.embeddings.qwen.time") as mock_time:
+            mock_time.monotonic.side_effect = lambda: clock[0]
+            mock_time.sleep.side_effect = fake_sleep
+            bucket = _TokenBucket(rate_per_second=2.0, capacity=2.0)
+            bucket.acquire()  # instant (token 1 of 2)
+            bucket.acquire()  # instant (token 2 of 2)
+            bucket.acquire()  # waits 0.5s
+            bucket.acquire()  # waits 0.5s again
+        self.assertEqual([0.5, 0.5], sleeps)
+
+    def test_rate_limit_paces_serial_requests(self) -> None:
+        """workers=1 + rps=2: capacity is 1, so after the first request every
+        attempt waits 0.5s — the serial path is paced too."""
+        clock, sleeps, fake_sleep = self._fake_clock()
+        client = FakeQwenClient(dimension=2560)
+        with patch("zoterorag.embeddings.qwen.time") as mock_time:
+            mock_time.monotonic.side_effect = lambda: clock[0]
+            mock_time.sleep.side_effect = fake_sleep
+            # Construct inside the patch so the bucket clock is the fake one.
+            provider = Qwen3VLEmbeddingProvider(
+                api_key="sk-test",
+                client=client,
+                embed_workers=1,
+                rate_limit_per_second=2.0,
+            )
+            inputs = [
+                EmbeddingInput(input_id=f"doc{i}", text=f"text {i}", role="document") for i in range(5)
+            ]
+            provider.embed(inputs)
+        self.assertEqual(5, len(client.posts))
+        self.assertEqual(4, len(sleeps))
+        self.assertAlmostEqual(2.0, sum(sleeps))
+
+    def test_retries_count_against_the_rate_limit(self) -> None:
+        """Two 500s then a 200 = 3 HTTP attempts; each must acquire a token."""
+        clock, sleeps, fake_sleep = self._fake_clock()
+        responses = [
+            FakeQwenResponse(dimension=2560, status_code=500),
+            FakeQwenResponse(dimension=2560, status_code=500),
+            FakeQwenResponse(dimension=2560, status_code=200),
+        ]
+        client = FakeQwenClient(dimension=2560, responses=responses)
+        with patch("zoterorag.embeddings.qwen.time") as mock_time:
+            mock_time.monotonic.side_effect = lambda: clock[0]
+            mock_time.sleep.side_effect = fake_sleep
+            provider = Qwen3VLEmbeddingProvider(
+                api_key="sk-test",
+                client=client,
+                retry_initial_seconds=0.0,  # keep retry backoff out of the accounting
+                rate_limit_per_second=1.0,
+            )
+            provider.embed([EmbeddingInput(input_id="doc0", text="text", role="document")])
+        # 3 attempts at rps=1 with capacity 1: attempt 1 instant, 2 and 3
+        # each wait 1.0s; the two zero-length backoff sleeps ride along.
+        self.assertEqual(3, len(client.posts))
+        positive_sleeps = [s for s in sleeps if s > 0]
+        self.assertEqual([1.0, 1.0], positive_sleeps)
+
+    def test_build_qwen_provider_passes_concurrency_settings(self) -> None:
+        with workspace_tmpdir("qwen-build-") as tmpdir:
+            env_path = tmpdir / ".env"
+            env_path.write_text("DASHSCOPE_API_KEY=sk-test\n", encoding="utf-8")
+            profile = {
+                "model": "qwen3-vl-embedding",
+                "dimension": 2560,
+                "profile": {"embed_workers": 4, "rate_limit": {"requests_per_second": 10}},
+            }
+            provider = build_qwen_embedding_provider(profile, env_path)
+            self.assertEqual(4, provider.embed_workers)
+            self.assertIsNotNone(provider._rate_bucket)
+            self.assertEqual(10.0, provider._rate_bucket.rate)
+
+    def test_build_qwen_provider_defaults_to_serial_unlimited(self) -> None:
+        with workspace_tmpdir("qwen-build-") as tmpdir:
+            env_path = tmpdir / ".env"
+            env_path.write_text("DASHSCOPE_API_KEY=sk-test\n", encoding="utf-8")
+            provider = build_qwen_embedding_provider(
+                {"model": "qwen3-vl-embedding", "dimension": 2560}, env_path
+            )
+            self.assertEqual(1, provider.embed_workers)
+            self.assertIsNone(provider._rate_bucket)
 
 
 if __name__ == "__main__":

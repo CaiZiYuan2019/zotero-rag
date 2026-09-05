@@ -69,6 +69,9 @@ class EmbeddingProfile:
     batch_size: int = 16
     rate_limit: dict[str, Any] = field(default_factory=dict)
     backend: str = "lancedb"
+    # Phase 1: concurrent embedding workers per profile. 1 (the default)
+    # keeps the original fully serial embed path.
+    embed_workers: int = 1
 
     def __post_init__(self) -> None:
         if not isinstance(self.dimension, int) or self.dimension <= 0:
@@ -82,6 +85,10 @@ class EmbeddingProfile:
         if self.backend not in {"sqlite-local", "lancedb"}:
             raise ValueError(
                 f"embedding profile {self.name!r} backend must be 'sqlite-local' or 'lancedb', got {self.backend!r}"
+            )
+        if isinstance(self.embed_workers, bool) or not isinstance(self.embed_workers, int) or self.embed_workers < 1:
+            raise ValueError(
+                f"embedding profile {self.name!r} embed_workers must be a positive integer, got {self.embed_workers!r}"
             )
 
 
