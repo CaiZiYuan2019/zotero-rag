@@ -1996,8 +1996,13 @@ class StateLedger:
         now = utc_now()
         job_id = job.get("job_id") or str(uuid.uuid4())
         payload_json = json.dumps(job.get("payload", {}), ensure_ascii=False, sort_keys=True, default=str)
-        with self.conn:
-            self.conn.execute(
+        # Phase 2: harvest threads may upsert/poll concurrently; hold the
+        # ledger RLock across the whole upsert+read-back so no statement of
+        # another thread can interleave mid-operation (reentrant, so the
+        # nested `with self.conn:` and get_extract_job calls are safe).
+        with self._lock:
+            with self.conn:
+                self.conn.execute(
                 """
                 INSERT INTO extract_jobs(
                     job_id, attachment_key, pdf_sha256, selected_pages, cache_key,
@@ -2056,36 +2061,43 @@ class StateLedger:
                     payload_json,
                 ),
             )
-        return self.get_extract_job(job_id=job_id) or self.get_extract_job_by_cache_key(job["cache_key"])  # type: ignore[return-value]
+            return self.get_extract_job(job_id=job_id) or self.get_extract_job_by_cache_key(job["cache_key"])  # type: ignore[return-value]
 
     def get_extract_job(self, *, job_id: str) -> dict[str, Any] | None:
-        row = self.conn.execute(
-            """
-            SELECT job_id, attachment_key, pdf_sha256, selected_pages, cache_key,
-                   provider, provider_version, options_hash, api_key_alias,
-                   external_job_id, state, local_stage, zip_path, extract_dir,
-                   artifact_dir, manifest_path, error_code, error_message,
-                   retry_count, submitted_at, last_poll_at, updated_at, payload_json
-            FROM extract_jobs
-            WHERE job_id = ?
-            """,
-            (job_id,),
-        ).fetchone()
+        # The RLock must cover execute+fetchone atomically: pysqlite resets an
+        # unstepped SELECT statement when another thread's statement runs on
+        # the shared connection in between, which transiently returned None
+        # for existing rows under concurrent Phase 2 harvest threads.
+        with self._lock:
+            row = self.conn.execute(
+                """
+                SELECT job_id, attachment_key, pdf_sha256, selected_pages, cache_key,
+                       provider, provider_version, options_hash, api_key_alias,
+                       external_job_id, state, local_stage, zip_path, extract_dir,
+                       artifact_dir, manifest_path, error_code, error_message,
+                       retry_count, submitted_at, last_poll_at, updated_at, payload_json
+                FROM extract_jobs
+                WHERE job_id = ?
+                """,
+                (job_id,),
+            ).fetchone()
         return decode_extract_job_row(row)
 
     def get_extract_job_by_cache_key(self, cache_key: str) -> dict[str, Any] | None:
-        row = self.conn.execute(
-            """
-            SELECT job_id, attachment_key, pdf_sha256, selected_pages, cache_key,
-                   provider, provider_version, options_hash, api_key_alias,
-                   external_job_id, state, local_stage, zip_path, extract_dir,
-                   artifact_dir, manifest_path, error_code, error_message,
-                   retry_count, submitted_at, last_poll_at, updated_at, payload_json
-            FROM extract_jobs
-            WHERE cache_key = ?
-            """,
-            (cache_key,),
-        ).fetchone()
+        # Same atomicity requirement as get_extract_job (see there).
+        with self._lock:
+            row = self.conn.execute(
+                """
+                SELECT job_id, attachment_key, pdf_sha256, selected_pages, cache_key,
+                       provider, provider_version, options_hash, api_key_alias,
+                       external_job_id, state, local_stage, zip_path, extract_dir,
+                       artifact_dir, manifest_path, error_code, error_message,
+                       retry_count, submitted_at, last_poll_at, updated_at, payload_json
+                FROM extract_jobs
+                WHERE cache_key = ?
+                """,
+                (cache_key,),
+            ).fetchone()
         return decode_extract_job_row(row)
 
     def list_extract_jobs(

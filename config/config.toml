@@ -12,6 +12,12 @@ require_api_token = true
 split_large_pdfs = true
 max_pages_per_extraction = 200
 job_max_lifetime_seconds = 21600
+per_key_submit_concurrency = 1
+submit_min_interval_seconds = 1.5
+harvest_workers = 2
+poll_max_per_minute = 600
+poll_interval_seconds = 30
+max_resubmit_attempts = 3
 
 [vectors]
 stale_embedding_batch_hours = 24

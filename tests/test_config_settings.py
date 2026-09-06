@@ -553,3 +553,75 @@ data_dir = "data"
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExtractPhase2ConfigTests(unittest.TestCase):
+    """Phase 2 [extract] pacing/concurrency/resubmit knobs (§2.4)."""
+
+    def _write_config(self, tmpdir: Path, extract_section: str) -> Path:
+        config_path = tmpdir / "config.toml"
+        config_path.write_text(
+            f"""
+[paths]
+zotero_db = "{(tmpdir / 'zotero.sqlite').as_posix()}"
+zotero_storage = "{(tmpdir / 'storage').as_posix()}"
+data_dir = "data"
+
+{extract_section}
+""",
+            encoding="utf-8",
+        )
+        return config_path
+
+    def test_phase2_defaults_and_parsing(self) -> None:
+        with workspace_tmpdir("extract-phase2-config-") as tmpdir:
+            config = load_config(self._write_config(tmpdir, ""))
+            self.assertEqual(1, config.extract.per_key_submit_concurrency)
+            self.assertEqual(1.5, config.extract.submit_min_interval_seconds)
+            self.assertEqual(2, config.extract.harvest_workers)
+            self.assertEqual(600, config.extract.poll_max_per_minute)
+            self.assertEqual(30.0, config.extract.poll_interval_seconds)
+            self.assertEqual(3, config.extract.max_resubmit_attempts)
+        with workspace_tmpdir("extract-phase2-config-") as tmpdir:
+            config = load_config(
+                self._write_config(
+                    tmpdir,
+                    "[extract]\n"
+                    "per_key_submit_concurrency = 2\n"
+                    "submit_min_interval_seconds = 0.5\n"
+                    "harvest_workers = 4\n"
+                    "poll_max_per_minute = 100\n"
+                    "poll_interval_seconds = 5\n"
+                    "max_resubmit_attempts = 5\n",
+                )
+            )
+            self.assertEqual(2, config.extract.per_key_submit_concurrency)
+            self.assertEqual(0.5, config.extract.submit_min_interval_seconds)
+            self.assertEqual(4, config.extract.harvest_workers)
+            self.assertEqual(100, config.extract.poll_max_per_minute)
+            self.assertEqual(5.0, config.extract.poll_interval_seconds)
+            self.assertEqual(5, config.extract.max_resubmit_attempts)
+
+    def test_phase2_validation_rejects_bad_values(self) -> None:
+        with self.assertRaises(ValueError):
+            ExtractConfig(per_key_submit_concurrency=0)
+        with self.assertRaises(ValueError):
+            ExtractConfig(per_key_submit_concurrency=True)
+        with self.assertRaises(ValueError):
+            ExtractConfig(submit_min_interval_seconds=-0.1)
+        with self.assertRaises(ValueError):
+            ExtractConfig(submit_min_interval_seconds=True)
+        with self.assertRaises(ValueError):
+            ExtractConfig(harvest_workers=0)
+        with self.assertRaises(ValueError):
+            ExtractConfig(harvest_workers=True)
+        with self.assertRaises(ValueError):
+            ExtractConfig(poll_max_per_minute=-1)
+        with self.assertRaises(ValueError):
+            ExtractConfig(poll_interval_seconds=0)
+        with self.assertRaises(ValueError):
+            ExtractConfig(poll_interval_seconds=True)
+        with self.assertRaises(ValueError):
+            ExtractConfig(max_resubmit_attempts=-1)
+        with self.assertRaises(ValueError):
+            ExtractConfig(max_resubmit_attempts=True)

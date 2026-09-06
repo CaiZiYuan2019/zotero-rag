@@ -522,7 +522,10 @@ def main(argv: list[str] | None = None) -> int:
                         from .providers import build_mineru_provider
 
                         resolved_env = _resolve_env_path(args.env, project_root)
-                        key_pool = ExtractorKeyPool.from_env_file(resolved_env)
+                        key_pool = ExtractorKeyPool.from_env_file(
+                            resolved_env,
+                            per_key_submit_concurrency=config.extract.per_key_submit_concurrency,
+                        )
                         provider = build_mineru_provider(resolved_env)
                         kwargs["extract_manager"] = ExtractionManager(
                             ledger=ledger,
@@ -530,6 +533,10 @@ def main(argv: list[str] | None = None) -> int:
                             provider=provider,
                             key_pool=key_pool,
                             job_max_lifetime_seconds=config.extract.job_max_lifetime_seconds,
+                            submit_min_interval_seconds=config.extract.submit_min_interval_seconds,
+                            poll_max_per_minute=config.extract.poll_max_per_minute,
+                            poll_interval_seconds=config.extract.poll_interval_seconds,
+                            max_resubmit_attempts=config.extract.max_resubmit_attempts,
                         )
                         kwargs["extract_cache_dir"] = config.paths.extract_cache_dir
                         kwargs["normalized_dir"] = config.paths.normalized_dir
@@ -558,7 +565,10 @@ def main(argv: list[str] | None = None) -> int:
                         from .providers import build_mineru_provider
 
                         resolved_env = _resolve_env_path(args.env, project_root)
-                        key_pool = ExtractorKeyPool.from_env_file(resolved_env)
+                        key_pool = ExtractorKeyPool.from_env_file(
+                            resolved_env,
+                            per_key_submit_concurrency=config.extract.per_key_submit_concurrency,
+                        )
                         provider = build_mineru_provider(resolved_env)
                         kwargs["extract_manager"] = ExtractionManager(
                             ledger=ledger,
@@ -566,6 +576,10 @@ def main(argv: list[str] | None = None) -> int:
                             provider=provider,
                             key_pool=key_pool,
                             job_max_lifetime_seconds=config.extract.job_max_lifetime_seconds,
+                            submit_min_interval_seconds=config.extract.submit_min_interval_seconds,
+                            poll_max_per_minute=config.extract.poll_max_per_minute,
+                            poll_interval_seconds=config.extract.poll_interval_seconds,
+                            max_resubmit_attempts=config.extract.max_resubmit_attempts,
                         )
                         kwargs["extract_cache_dir"] = config.paths.extract_cache_dir
                         kwargs["normalized_dir"] = config.paths.normalized_dir
@@ -786,13 +800,20 @@ def main(argv: list[str] | None = None) -> int:
                 except (FileNotFoundError, ValueError) as exc:
                     emit({"ok": False, "error": str(exc)})
                     return 1
-                key_pool = ExtractorKeyPool.from_env_file(resolved_env)
+                key_pool = ExtractorKeyPool.from_env_file(
+                    resolved_env,
+                    per_key_submit_concurrency=config.extract.per_key_submit_concurrency,
+                )
                 manager = ExtractionManager(
                     ledger=ledger,
                     cache_dir=config.paths.extract_cache_dir,
                     provider=StubExtractorProvider(),
                     key_pool=key_pool,
                     job_max_lifetime_seconds=config.extract.job_max_lifetime_seconds,
+                    submit_min_interval_seconds=config.extract.submit_min_interval_seconds,
+                    poll_max_per_minute=config.extract.poll_max_per_minute,
+                    poll_interval_seconds=config.extract.poll_interval_seconds,
+                    max_resubmit_attempts=config.extract.max_resubmit_attempts,
                 )
                 result = manager.ensure_extraction(
                     ExtractionRequest(

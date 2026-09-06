@@ -110,6 +110,18 @@ class ExtractConfig:
     # 决策1: total lifetime of one extract job, measured from submitted_at.
     # Jobs exceeding it are flipped to failed_manual_review (no auto-resubmit).
     job_max_lifetime_seconds: int = 21600
+    # Phase 2: extraction concurrency and pacing. The ExtractionManager
+    # constructor defaults keep limiters off (0/unlimited); the effective
+    # production values live here and are injected via cli/app wiring.
+    per_key_submit_concurrency: int = 1
+    submit_min_interval_seconds: float = 1.5
+    harvest_workers: int = 2
+    poll_max_per_minute: int = 600
+    poll_interval_seconds: float = 30.0
+    # 决策2: max automatic resubmissions of one extract job (counted across
+    # rounds in payload["resubmit_attempts"]); beyond it the job is flipped
+    # to failed_manual_review.
+    max_resubmit_attempts: int = 3
 
     def __post_init__(self) -> None:
         if not isinstance(self.max_pages_per_extraction, int) or self.max_pages_per_extraction < 1:
@@ -125,6 +137,60 @@ class ExtractConfig:
             raise ValueError(
                 f"extract.job_max_lifetime_seconds must be a positive integer, "
                 f"got {self.job_max_lifetime_seconds!r}"
+            )
+        if (
+            not isinstance(self.per_key_submit_concurrency, int)
+            or isinstance(self.per_key_submit_concurrency, bool)
+            or self.per_key_submit_concurrency < 1
+        ):
+            raise ValueError(
+                f"extract.per_key_submit_concurrency must be a positive integer, "
+                f"got {self.per_key_submit_concurrency!r}"
+            )
+        if (
+            not isinstance(self.submit_min_interval_seconds, (int, float))
+            or isinstance(self.submit_min_interval_seconds, bool)
+            or self.submit_min_interval_seconds < 0
+        ):
+            raise ValueError(
+                f"extract.submit_min_interval_seconds must be a non-negative number "
+                f"(0 disables pacing), got {self.submit_min_interval_seconds!r}"
+            )
+        if (
+            not isinstance(self.harvest_workers, int)
+            or isinstance(self.harvest_workers, bool)
+            or self.harvest_workers < 1
+        ):
+            raise ValueError(
+                f"extract.harvest_workers must be a positive integer, "
+                f"got {self.harvest_workers!r}"
+            )
+        if (
+            not isinstance(self.poll_max_per_minute, int)
+            or isinstance(self.poll_max_per_minute, bool)
+            or self.poll_max_per_minute < 0
+        ):
+            raise ValueError(
+                f"extract.poll_max_per_minute must be a non-negative integer "
+                f"(0 disables the limit), got {self.poll_max_per_minute!r}"
+            )
+        if (
+            not isinstance(self.poll_interval_seconds, (int, float))
+            or isinstance(self.poll_interval_seconds, bool)
+            or self.poll_interval_seconds <= 0
+        ):
+            raise ValueError(
+                f"extract.poll_interval_seconds must be a positive number, "
+                f"got {self.poll_interval_seconds!r}"
+            )
+        if (
+            not isinstance(self.max_resubmit_attempts, int)
+            or isinstance(self.max_resubmit_attempts, bool)
+            or self.max_resubmit_attempts < 0
+        ):
+            raise ValueError(
+                f"extract.max_resubmit_attempts must be a non-negative integer, "
+                f"got {self.max_resubmit_attempts!r}"
             )
 
 
@@ -335,6 +401,12 @@ def load_config(path: str | Path = "config/config.toml") -> AppConfig:
         ),
         max_pages_per_extraction=int(extract_data.get("max_pages_per_extraction", 200)),
         job_max_lifetime_seconds=int(extract_data.get("job_max_lifetime_seconds", 21600)),
+        per_key_submit_concurrency=int(extract_data.get("per_key_submit_concurrency", 1)),
+        submit_min_interval_seconds=float(extract_data.get("submit_min_interval_seconds", 1.5)),
+        harvest_workers=int(extract_data.get("harvest_workers", 2)),
+        poll_max_per_minute=int(extract_data.get("poll_max_per_minute", 600)),
+        poll_interval_seconds=float(extract_data.get("poll_interval_seconds", 30.0)),
+        max_resubmit_attempts=int(extract_data.get("max_resubmit_attempts", 3)),
     )
     vectors = VectorsConfig(
         stale_embedding_batch_hours=float(vectors_data.get("stale_embedding_batch_hours", 24.0)),

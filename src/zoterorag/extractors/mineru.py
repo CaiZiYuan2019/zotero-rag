@@ -159,7 +159,7 @@ class MinerUProvider:
     # Individual HTTP calls must fail fast: MinerU reports progress via
     # polling, so long waits belong in the poll loop, not in request timeouts.
     # The per-job ``timeout_seconds`` option is the overall poll budget only
-    # (see ExtractionManager._resume_poll) and must not inflate these values.
+    # (see ExtractionManager.harvest) and must not inflate these values.
     def _request_timeout_seconds(self, options: dict[str, Any] | None = None) -> int | float:
         return self.request_timeout_seconds
 

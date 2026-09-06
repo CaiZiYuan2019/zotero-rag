@@ -62,6 +62,7 @@ class ExtractorKeyPool:
         env_path: str | Path = ".env",
         *,
         prefixes: tuple[str, ...] = ("MINERU_KEY", "MINERU_API_KEY"),
+        per_key_submit_concurrency: int = 1,
     ) -> "ExtractorKeyPool":
         values = load_dotenv_values(env_path)
         keys: list[ApiKeyRef] = []
@@ -95,7 +96,7 @@ class ExtractorKeyPool:
                     alias = f"{original_alias}_{dedup}"
                 seen_aliases.add(alias)
                 keys.append(ApiKeyRef(alias=alias, secret=secret))
-        return cls(keys)
+        return cls(keys, per_key_submit_concurrency=per_key_submit_concurrency)
 
     def has_keys(self) -> bool:
         return bool(self._keys)
@@ -121,17 +122,33 @@ class ExtractorKeyPool:
             self._next_index += 1
             return key
 
-    def acquire_key(self) -> ApiKeyRef | None:
+    def acquire_key(self, *, prefer_alias: str | None = None) -> ApiKeyRef | None:
         """Reserve a key for a submit/upload worker.
 
         Selection is round-robin but skips keys at their per-key concurrency
         limit or in cooldown. Only aliases should be persisted outside memory.
+
+        Phase 2: ``prefer_alias`` gives the job's submitting key first claim
+        (key affinity). MinerU batches are queried through the account that
+        created them; pooled keys are assumed to belong to one account
+        (MODIFICATION_PLAN_20260904 §2.2: "M keys serve N in-flight jobs"),
+        so a busy/cooling preferred key falls back to any other available
+        key rather than stalling the job.
         """
 
         with self._lock:
             if not self._keys:
                 return None
             now = self._clock()
+            if prefer_alias is not None:
+                preferred = self._states.get(prefer_alias)
+                if (
+                    preferred is not None
+                    and preferred.cooldown_until <= now
+                    and preferred.in_flight < self.per_key_submit_concurrency
+                ):
+                    preferred.in_flight += 1
+                    return next(key for key in self._keys if key.alias == prefer_alias)
             for offset in range(len(self._keys)):
                 index = (self._next_index + offset) % len(self._keys)
                 key = self._keys[index]

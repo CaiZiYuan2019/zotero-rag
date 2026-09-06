@@ -25,6 +25,25 @@ max_pages_per_extraction = 200
 # that outlives this cap is flipped to failed_manual_review and is never
 # auto-resubmitted.
 job_max_lifetime_seconds = 21600
+# Phase 2 extraction concurrency: segments of a split PDF are all submitted
+# first, then harvested concurrently; a key is held only for the duration of
+# a single provider call, so per_key_submit_concurrency bounds in-flight
+# submits/polls per key.
+per_key_submit_concurrency = 1
+# Global minimum interval between two MinerU submissions (quota guard; the
+# quota is 50/min). 0 disables pacing.
+submit_min_interval_seconds = 1.5
+# Number of threads harvesting submitted extraction jobs concurrently.
+harvest_workers = 2
+# Sliding-window cap on MinerU polls per minute (quota is 1000/min). 0
+# disables the limiter.
+poll_max_per_minute = 600
+# Interval between two polls of the same in-flight extraction job.
+poll_interval_seconds = 30
+# 决策2: max automatic resubmissions of one extract job (counted across runs
+# in the job payload). Beyond this cap the job is flipped to
+# failed_manual_review and is never auto-resubmitted.
+max_resubmit_attempts = 3
 
 [vectors]
 # `vectors prune` recycles embedding batches stuck "running" for longer than

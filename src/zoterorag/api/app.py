@@ -291,7 +291,7 @@ def create_app(config_path: str | Path = "config/config.toml") -> Any:
                     config.paths.extract_cache_dir,
                     str(payload.get("env", ".env")),
                     project_root,
-                    job_max_lifetime_seconds=config.extract.job_max_lifetime_seconds,
+                    extract_config=config.extract,
                 )
                 kwargs["extract_cache_dir"] = config.paths.extract_cache_dir
                 kwargs["normalized_dir"] = config.paths.normalized_dir
@@ -701,21 +701,32 @@ def _build_extract_manager(
     env_path: str,
     project_root: Path,
     *,
-    job_max_lifetime_seconds: int = 21600,
+    extract_config: Any = None,
 ) -> Any:
     """Build an ExtractionManager wired to real MinerU provider and key pool."""
     from ..providers import build_mineru_provider
+    from ..config.settings import ExtractConfig
     from ..extractors import ExtractorKeyPool, ExtractionManager
 
+    # Phase 2: the [extract] config carries pacing/concurrency/resubmit knobs;
+    # default to a fresh ExtractConfig when the caller has no config at hand.
+    extract_config = extract_config or ExtractConfig()
     resolved_env_path = _resolve_env_path(env_path, project_root)
-    key_pool = ExtractorKeyPool.from_env_file(resolved_env_path)
+    key_pool = ExtractorKeyPool.from_env_file(
+        resolved_env_path,
+        per_key_submit_concurrency=extract_config.per_key_submit_concurrency,
+    )
     provider = build_mineru_provider(resolved_env_path)
     return ExtractionManager(
         ledger=ledger,
         cache_dir=extract_cache_dir,
         provider=provider,
         key_pool=key_pool,
-        job_max_lifetime_seconds=job_max_lifetime_seconds,
+        job_max_lifetime_seconds=extract_config.job_max_lifetime_seconds,
+        submit_min_interval_seconds=extract_config.submit_min_interval_seconds,
+        poll_max_per_minute=extract_config.poll_max_per_minute,
+        poll_interval_seconds=extract_config.poll_interval_seconds,
+        max_resubmit_attempts=extract_config.max_resubmit_attempts,
     )
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import sys
 import traceback
@@ -996,8 +997,11 @@ def _execute_extract_stage(
     segments = compute_page_segments(total_pages, extract_config.max_pages_per_extraction)
     _progress(f"  extract: splitting PDF into {len(segments)} segments (pages={total_pages})...")
     segment_results: list[Any] = []
-    segment_job_ids: list[str] = []
     try:
+        # Phase 2, pass 1: submit every segment first (in page order) so the
+        # remote batches run in parallel. A failure mid-pass lands in the
+        # except branch below, which persists exactly the submitted segment
+        # jobs for the next resume round.
         for segment in segments:
             request = ExtractionRequest(
                 input_file=Path(file_path),
@@ -1005,11 +1009,17 @@ def _execute_extract_stage(
                 selected_pages=segment.selected_pages,
                 selected_page_count=segment.page_count,
             )
-            result = extract_manager.ensure_extraction(request)
-            result = _drive_extraction_to_completion(result, extract_manager)
-            segment_results.append(result)
-            segment_job_ids.append(result.job["job_id"])
-            _progress(f"  extract: segment {segment.index + 1}/{len(segments)} state={result.job['state']}")
+            segment_results.append(extract_manager.submit_only(request))
+            _progress(f"  extract: segment {segment.index + 1}/{len(segments)} submitted")
+        # Phase 2, pass 2: harvest the submitted segments concurrently. Each
+        # harvest thread holds an extractor key only for the duration of a
+        # single provider call, so M keys can service N in-flight segments.
+        with ThreadPoolExecutor(max_workers=extract_config.harvest_workers) as pool:
+            segment_results = list(
+                pool.map(lambda result: _harvest_one(result, extract_manager), segment_results)
+            )
+        for result in segment_results:
+            _progress(f"  extract: segment state={result.job['state']}")
     except Exception:
         # Persist the segment jobs that were submitted before the failure so
         # that a later resume can pick up where we left off.
@@ -1067,6 +1077,25 @@ def _drive_extraction_to_completion(result: Any, extract_manager: Any) -> Any:
     if result.job["state"] in {"submitted", "running"}:
         result = extract_manager.resume_extraction(result.job["job_id"])
     return result
+
+
+def _harvest_one(result: Any, extract_manager: Any) -> Any:
+    """Drive one freshly submitted segment result to downloaded (Phase 2).
+
+    Jobs already in a DONE state (cache-hit reuse) pass through untouched.
+    Jobs whose local_stage is still "poll" go through harvest(), whose first
+    poll confirms the remote batch state even when submit() already reported
+    "completed" (H1). Anything else — a missing external_job_id (crash
+    between upsert and submit) or an already-confirmed completion — routes
+    through resume_extraction's classify dispatch.
+    """
+
+    job = result.job
+    if job["state"] in DONE_EXTRACT_STATES:
+        return result
+    if job.get("external_job_id") and job.get("local_stage") == "poll":
+        return extract_manager.harvest(job["job_id"])
+    return extract_manager.resume_extraction(job["job_id"])
 
 
 def _all_jobs_downloaded(jobs: list[dict[str, Any]]) -> bool:

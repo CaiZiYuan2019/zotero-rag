@@ -1654,3 +1654,104 @@ class TwoPhaseStubExtractorProvider(MarkdownStubExtractorProvider):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: concurrent harvest of split PDF segments (§2.2 two-pass flow).
+# ---------------------------------------------------------------------------
+
+import threading  # noqa: E402
+
+from zoterorag.extractors.key_pool import ApiKeyRef, ExtractorKeyPool  # noqa: E402
+
+
+class OrderingRecordingProvider(MarkdownStubExtractorProvider):
+    """Thread-safe stub that records submit/poll events in call order.
+
+    submit returns 'running' (so segments stay in flight until harvested)
+    and poll completes immediately on first call.
+    """
+
+    name = "ordering-stub"
+    version = "0"
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.events: list[tuple[str, str]] = []
+
+    def submit(
+        self,
+        input_file: Path,
+        options_hash: str,
+        *,
+        options: dict[str, Any] | None = None,
+        api_key: str | None = None,
+    ) -> ExtractJobState:
+        page_ranges = str((options or {}).get("page_ranges", ""))
+        with self._lock:
+            self.events.append(("submit", page_ranges))
+        return ExtractJobState(external_job_id=f"batch-{page_ranges}", state="running")
+
+    def poll(
+        self,
+        external_job_id: str,
+        *,
+        api_key: str | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> ExtractJobState:
+        with self._lock:
+            self.events.append(("poll", external_job_id))
+        return ExtractJobState(external_job_id=external_job_id, state="completed")
+
+
+class ConcurrentHarvestTests(unittest.TestCase):
+    def test_all_segments_submitted_before_any_poll_and_keys_released(self) -> None:
+        with workspace_tmpdir("ingest-phase2-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                attachment = build_attachment_with_file(tmpdir, "ATT_PHASE2", title="Concurrent Paper")
+                ledger.upsert_attachments([attachment])
+                provider = OrderingRecordingProvider()
+                pool = ExtractorKeyPool(
+                    [
+                        ApiKeyRef(alias="mineru_a", secret="s-a"),
+                        ApiKeyRef(alias="mineru_b", secret="s-b"),
+                    ]
+                )
+                extract_manager = ExtractionManager(
+                    ledger=ledger,
+                    cache_dir=tmpdir / "extract_cache",
+                    provider=provider,
+                    key_pool=pool,
+                    poll_interval_seconds=0.0,
+                )
+                extract_config = ExtractConfig(
+                    split_large_pdfs=True,
+                    max_pages_per_extraction=200,
+                    harvest_workers=2,
+                )
+                with patch("zoterorag.pipeline.ingest.get_pdf_page_count", return_value=250):
+                    result = start_ingest_job(
+                        ledger,
+                        zotero_key="ATT_PHASE2",
+                        include_multimodal=False,
+                        execute=True,
+                        extract_manager=extract_manager,
+                        extract_cache_dir=tmpdir / "extract_cache",
+                        normalized_dir=tmpdir / "normalized",
+                        vector_store_dir=tmpdir / "vectors",
+                        extract_config=extract_config,
+                    )
+
+                self.assertEqual("completed", result["job"]["status"])
+                # Pass 1 submits every segment in page order before pass 2
+                # polls anything (segments-first submission, §2.2).
+                kinds = [kind for kind, _ in provider.events]
+                submits = [value for kind, value in provider.events if kind == "submit"]
+                self.assertEqual(["1-200", "201-250"], submits)
+                self.assertEqual(["submit", "submit"], kinds[:2])
+                self.assertNotIn("poll", kinds[:2])
+                # All keys released after the run (no in-flight leaks).
+                self.assertTrue(all(key["in_flight"] == 0 for key in pool.list_public_keys()))
+            finally:
+                ledger.close()

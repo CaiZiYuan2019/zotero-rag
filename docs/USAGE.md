@@ -83,6 +83,12 @@ require_api_token = true                          # 是否要求 token 鉴权
 split_large_pdfs = true                           # 是否自动拆分超大 PDF
 max_pages_per_extraction = 200                    # 单次 MinerU 转换的最大页数
 job_max_lifetime_seconds = 21600                  # 单个提取任务总寿命上限（秒，自 submitted_at 起算）
+per_key_submit_concurrency = 1                    # 每把 MinerU key 允许的在途提交/轮询并发数
+submit_min_interval_seconds = 1.5                 # 两次 MinerU 提交的最小间隔（秒，配额 50/min 的保护；0=不限）
+harvest_workers = 2                               # 并发收割（poll/download）已提交提取任务的线程数
+poll_max_per_minute = 600                         # MinerU 轮询滑动窗口上限（次/分钟，配额 1000/min；0=不限）
+poll_interval_seconds = 30                        # 同一在途任务两次轮询的间隔（秒）
+max_resubmit_attempts = 3                         # 单个提取任务的最大自动重提次数（跨轮累计，超限转人工裁决）
 
 # 说明：
 # - 当 PDF 页数超过 max_pages_per_extraction 且 split_large_pdfs=true 时，
@@ -93,6 +99,17 @@ job_max_lifetime_seconds = 21600                  # 单个提取任务总寿命�
 #   不算失败：任务保持 running 并保留远端 batch id，下一轮继续 poll 原 batch，
 #   不会重新提交（避免重复计费）；超过 job_max_lifetime_seconds 总寿命的任务转为
 #   failed_manual_review，需人工裁决，不会自动重提。
+# - Phase 2 并发提取：拆分后的全部分段先一次性提交（submit 全量），再由
+#   harvest_workers 个线程并发收割；一把 key 只在单次 provider 调用期间持有，
+#   M 把 key 可服务 N 个在途任务（N≫M，假设多把 key 属于同一 MinerU 账号，
+#   可互相查询 batch；poll/download 优先使用提交该任务的 key，取不到才退化
+#   为任意可用 key）。
+# - 错误分级：429/配额 → key 冷却数分钟、任务保持 running 下轮再试；
+#   401/403 → key 长冷却，全部 key 失效则本轮中止且任务置 failed_retryable
+#   （不会自动重提，待 key 恢复或人工处理）；
+#   网络抖动/5xx → 不冷却，本轮内指数退避续试；远端 batch 真失败 →
+#   failed_retryable 并自动重提，最多 max_resubmit_attempts 次（计数持久化在
+#   任务 payload 中跨轮累计），超限转 failed_manual_review。
 
 [vectors]
 stale_embedding_batch_hours = 24                  # vectors prune 自动回收超过此时长仍卡 running 的嵌入批次

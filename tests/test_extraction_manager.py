@@ -1028,3 +1028,475 @@ class PollTimeoutSemanticsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 (MODIFICATION_PLAN_20260904 §2.2): submit_only/poll_once/harvest
+# primitives, graded error classification, and the 决策2 resubmit budget.
+# ---------------------------------------------------------------------------
+
+from zoterorag.extractors.mineru import MinerUAPIError  # noqa: E402
+
+
+class StatusCodeFailingPollProvider:
+    """Poll raises MinerUAPIError with a fixed HTTP status_code.
+
+    fail_times=None raises forever; otherwise completes after that many
+    failures. Records the api_key secret passed to each poll so tests can
+    assert key affinity/fallback.
+    """
+
+    name = "status-failing"
+    version = "0"
+
+    def __init__(self, status_code: int, fail_times: int | None = None) -> None:
+        self.status_code = status_code
+        self.fail_times = fail_times
+        self.poll_keys: list[str | None] = []
+        self.submit_calls = 0
+
+    def fingerprint(self, input_file, options_hash: str) -> str:
+        return "status-failing"
+
+    def submit(self, input_file, options_hash: str, *, options=None, api_key=None) -> ExtractJobState:
+        self.submit_calls += 1
+        return ExtractJobState(external_job_id="batch-sf", state="running")
+
+    def poll(self, external_job_id: str, *, api_key=None, options=None) -> ExtractJobState:
+        self.poll_keys.append(api_key)
+        if self.fail_times is None or len(self.poll_keys) <= self.fail_times:
+            raise MinerUAPIError(
+                f"http {self.status_code}",
+                stage="poll",
+                batch_id=external_job_id,
+                status_code=self.status_code,
+            )
+        return ExtractJobState(external_job_id=external_job_id, state="completed")
+
+    def download(self, external_job_id, output_dir, *, api_key=None, source_pdf=None, options=None) -> ExtractArtifact:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        manifest = output_dir / "manifest.json"
+        source = Path(source_pdf) if source_pdf is not None else Path(external_job_id)
+        manifest.write_text(json.dumps({"source_pdf": str(source)}, ensure_ascii=False), encoding="utf-8")
+        return ExtractArtifact(source_pdf=source, artifact_dir=output_dir, manifest_path=manifest)
+
+
+class KeyAwarePollProvider:
+    """Poll fails with 401 for one key's secret and completes for any other."""
+
+    name = "key-aware"
+    version = "0"
+
+    def __init__(self, failing_secret: str) -> None:
+        self.failing_secret = failing_secret
+        self.poll_keys: list[str | None] = []
+
+    def fingerprint(self, input_file, options_hash: str) -> str:
+        return "key-aware"
+
+    def submit(self, input_file, options_hash: str, *, options=None, api_key=None) -> ExtractJobState:
+        return ExtractJobState(external_job_id="batch-ka", state="running")
+
+    def poll(self, external_job_id: str, *, api_key=None, options=None) -> ExtractJobState:
+        self.poll_keys.append(api_key)
+        if api_key == self.failing_secret:
+            raise MinerUAPIError("unauthorized", stage="poll", batch_id=external_job_id, status_code=401)
+        return ExtractJobState(external_job_id=external_job_id, state="completed")
+
+    def download(self, external_job_id, output_dir, *, api_key=None, source_pdf=None, options=None) -> ExtractArtifact:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        manifest = output_dir / "manifest.json"
+        source = Path(source_pdf) if source_pdf is not None else Path(external_job_id)
+        manifest.write_text(json.dumps({"source_pdf": str(source)}, ensure_ascii=False), encoding="utf-8")
+        return ExtractArtifact(source_pdf=source, artifact_dir=output_dir, manifest_path=manifest)
+
+
+class RemoteFailingPollProvider:
+    """Poll reports the remote batch as truly failed (state='failed')."""
+
+    name = "remote-failing"
+    version = "0"
+
+    def __init__(self) -> None:
+        self.submit_calls = 0
+        self.poll_calls = 0
+
+    def fingerprint(self, input_file, options_hash: str) -> str:
+        return "remote-failing"
+
+    def submit(self, input_file, options_hash: str, *, options=None, api_key=None) -> ExtractJobState:
+        self.submit_calls += 1
+        return ExtractJobState(external_job_id=f"batch-rf-{self.submit_calls}", state="running")
+
+    def poll(self, external_job_id: str, *, api_key=None, options=None) -> ExtractJobState:
+        self.poll_calls += 1
+        return ExtractJobState(external_job_id=external_job_id, state="failed", message="remote exploded")
+
+    def download(self, external_job_id, output_dir, *, api_key=None, source_pdf=None, options=None) -> ExtractArtifact:
+        raise AssertionError("download should not be called")
+
+
+class SubmitCompletedPollFailedProvider:
+    """submit() reports completed but the confirmation poll reports failed
+    (H1: the first harvest poll must confirm even a 'completed' submit)."""
+
+    name = "submit-completed"
+    version = "0"
+
+    def fingerprint(self, input_file, options_hash: str) -> str:
+        return "submit-completed"
+
+    def submit(self, input_file, options_hash: str, *, options=None, api_key=None) -> ExtractJobState:
+        return ExtractJobState(external_job_id="batch-sc", state="completed")
+
+    def poll(self, external_job_id: str, *, api_key=None, options=None) -> ExtractJobState:
+        return ExtractJobState(external_job_id=external_job_id, state="failed", message="died after submit")
+
+    def download(self, external_job_id, output_dir, *, api_key=None, source_pdf=None, options=None) -> ExtractArtifact:
+        raise AssertionError("download should not be called")
+
+
+def _phase2_manager(tmpdir: Path, provider: Any, secrets: list[str], **kwargs: Any):
+    """Build ledger/pool/manager for Phase 2 tests (poll_interval=0 so
+    harvest loops never really sleep)."""
+    ledger = StateLedger(tmpdir / "state.sqlite")
+    pool = ExtractorKeyPool(
+        [ApiKeyRef(alias=f"mineru_{chr(97 + i)}", secret=secret) for i, secret in enumerate(secrets)],
+        clock=FakeClock().now,
+    )
+    manager = ExtractionManager(
+        ledger=ledger,
+        cache_dir=tmpdir / "cache",
+        provider=provider,
+        key_pool=pool,
+        poll_interval_seconds=0.0,
+        **kwargs,
+    )
+    return ledger, pool, manager
+
+
+class Phase2PrimitiveTests(unittest.TestCase):
+    def test_submit_only_releases_key_immediately(self) -> None:
+        with workspace_tmpdir("phase2-submit-only-") as tmpdir:
+            provider = RecordingProvider()
+            ledger, pool, manager = _phase2_manager(tmpdir, provider, ["s-a"])
+            try:
+                input_file = tmpdir / "doc.pdf"
+                input_file.write_bytes(b"%PDF-1.4")
+                result = manager.submit_only(
+                    ExtractionRequest(input_file=input_file, attachment_key="ATT1")
+                )
+                self.assertFalse(result.cache_hit)
+                self.assertEqual("running", result.job["state"])
+                self.assertEqual("poll", result.job["local_stage"])
+                self.assertEqual("batch-1", result.job["external_job_id"])
+                # Phase 2: the key is released right after the submit call,
+                # not held across the poll loop.
+                self.assertEqual(0, pool.list_public_keys()[0]["in_flight"])
+                self.assertEqual(0.0, pool.cooldown_remaining("mineru_a"))
+            finally:
+                ledger.close()
+
+    def test_ensure_confirms_submit_completed_with_poll(self) -> None:
+        with workspace_tmpdir("phase2-h1-") as tmpdir:
+            provider = SubmitCompletedPollFailedProvider()
+            ledger, pool, manager = _phase2_manager(tmpdir, provider, [])
+            try:
+                input_file = tmpdir / "doc.pdf"
+                input_file.write_bytes(b"%PDF-1.4")
+                with self.assertRaises(MinerUAPIError):
+                    manager.ensure_extraction(
+                        ExtractionRequest(input_file=input_file, attachment_key="ATT2")
+                    )
+                job = ledger.list_extract_jobs()[0]
+                self.assertEqual("failed_retryable", job["state"])
+                self.assertEqual("died after submit", job["error_message"])
+            finally:
+                ledger.close()
+
+    def test_poll_once_returns_none_when_no_key_available(self) -> None:
+        with workspace_tmpdir("phase2-nokey-") as tmpdir:
+            provider = RecordingProvider()
+            ledger, pool, manager = _phase2_manager(tmpdir, provider, ["s-a"])
+            try:
+                input_file = tmpdir / "doc.pdf"
+                input_file.write_bytes(b"%PDF-1.4")
+                submitted = manager.submit_only(
+                    ExtractionRequest(input_file=input_file, attachment_key="ATT3")
+                )
+                held = pool.acquire_key()
+                self.assertIsNotNone(held)
+                # The only key is checked out: poll_once must return None
+                # (harvest then sleeps) instead of failing the job.
+                self.assertIsNone(manager.poll_once(submitted.job["job_id"]))
+                job = ledger.get_extract_job(job_id=submitted.job["job_id"])
+                self.assertEqual("running", job["state"])
+                pool.release_key(held.alias)
+            finally:
+                ledger.close()
+
+    def test_poll_once_key_affinity_and_fallback(self) -> None:
+        with workspace_tmpdir("phase2-affinity-") as tmpdir:
+            provider = StatusCodeFailingPollProvider(503, fail_times=0)
+            ledger, pool, manager = _phase2_manager(tmpdir, provider, ["s-a", "s-b"])
+            try:
+                input_file = tmpdir / "doc.pdf"
+                input_file.write_bytes(b"%PDF-1.4")
+                submitted = manager.submit_only(
+                    ExtractionRequest(input_file=input_file, attachment_key="ATT4")
+                )
+                job_id = submitted.job["job_id"]
+                # submit grabbed mineru_a (round-robin first): the poll
+                # prefers the same key (single-account key affinity).
+                manager.poll_once(job_id)
+                self.assertEqual(["s-a"], provider.poll_keys)
+                # Preferred key busy -> fall back to any available key.
+                held = pool.acquire_key(prefer_alias="mineru_a")
+                self.assertEqual("mineru_a", held.alias)
+                manager.poll_once(job_id)
+                self.assertEqual(["s-a", "s-b"], provider.poll_keys)
+                pool.release_key(held.alias)
+            finally:
+                ledger.close()
+
+    def test_submit_pace_enforces_min_interval(self) -> None:
+        with workspace_tmpdir("phase2-pace-") as tmpdir:
+            provider = RecordingProvider()
+            ledger, pool, manager = _phase2_manager(
+                tmpdir, provider, [], submit_min_interval_seconds=5.0
+            )
+            try:
+                clock = FakeClock()
+                sleeps: list[float] = []
+
+                def fake_sleep(seconds: float) -> None:
+                    sleeps.append(seconds)
+                    clock.advance(seconds)
+
+                first = tmpdir / "a.pdf"
+                first.write_bytes(b"%PDF-1.4")
+                with patch("time.monotonic", clock.now), patch("time.sleep", fake_sleep):
+                    manager.submit_only(ExtractionRequest(input_file=first, attachment_key="A"))
+                    manager.submit_only(
+                        ExtractionRequest(
+                            input_file=first,
+                            attachment_key="B",
+                            selected_pages="1-2",
+                            selected_page_count=2,
+                        )
+                    )
+                # The second submit waits out the full 5s interval.
+                self.assertEqual([5.0], sleeps)
+            finally:
+                ledger.close()
+
+    def test_poll_rate_limiter_waits_when_window_full(self) -> None:
+        with workspace_tmpdir("phase2-ratelimit-") as tmpdir:
+            provider = RecordingProvider()
+            ledger, pool, manager = _phase2_manager(tmpdir, provider, [], poll_max_per_minute=2)
+            try:
+                clock = FakeClock()
+                sleeps: list[float] = []
+
+                def fake_sleep(seconds: float) -> None:
+                    sleeps.append(seconds)
+                    clock.advance(seconds)
+
+                with patch("time.monotonic", clock.now), patch("time.sleep", fake_sleep):
+                    manager._poll_rate_wait()
+                    manager._poll_rate_wait()
+                    manager._poll_rate_wait()  # window full: must wait ~60s
+                self.assertTrue(sleeps)
+                self.assertAlmostEqual(60.0, sum(sleeps), delta=1.0)
+            finally:
+                ledger.close()
+
+
+class Phase2ErrorClassificationTests(unittest.TestCase):
+    def test_429_stands_down_and_cools_key(self) -> None:
+        with workspace_tmpdir("phase2-429-") as tmpdir:
+            provider = StatusCodeFailingPollProvider(429)
+            ledger, pool, manager = _phase2_manager(tmpdir, provider, ["s-a"])
+            try:
+                input_file = tmpdir / "doc.pdf"
+                input_file.write_bytes(b"%PDF-1.4")
+                # 429 stands the round down (no exception): job stays running
+                # with the batch id, key cools for rate_limit_cooldown_seconds.
+                result = manager.ensure_extraction(
+                    ExtractionRequest(input_file=input_file, attachment_key="ATT5")
+                )
+                self.assertEqual("running", result.job["state"])
+                self.assertEqual("rate-limited", result.job["error_code"])
+                self.assertEqual("batch-sf", result.job["external_job_id"])
+                self.assertEqual(180.0, pool.cooldown_remaining("mineru_a"))
+            finally:
+                ledger.close()
+
+    def test_401_single_key_fails_job(self) -> None:
+        with workspace_tmpdir("phase2-401-") as tmpdir:
+            provider = StatusCodeFailingPollProvider(401)
+            ledger, pool, manager = _phase2_manager(tmpdir, provider, ["s-a"])
+            try:
+                input_file = tmpdir / "doc.pdf"
+                input_file.write_bytes(b"%PDF-1.4")
+                # The only key fails auth -> pool effectively disabled -> the
+                # job fails (M9 surfaces it as a blocked document).
+                with self.assertRaises(MinerUAPIError):
+                    manager.ensure_extraction(
+                        ExtractionRequest(input_file=input_file, attachment_key="ATT6")
+                    )
+                job = ledger.list_extract_jobs()[0]
+                self.assertEqual("failed_retryable", job["state"])
+                self.assertEqual("no-keys-available", job["error_code"])
+                self.assertEqual(3600.0, pool.cooldown_remaining("mineru_a"))
+            finally:
+                ledger.close()
+
+    def test_401_falls_back_to_other_key(self) -> None:
+        with workspace_tmpdir("phase2-401-fallback-") as tmpdir:
+            provider = KeyAwarePollProvider("s-a")
+            ledger, pool, manager = _phase2_manager(tmpdir, provider, ["s-a", "s-b"])
+            try:
+                input_file = tmpdir / "doc.pdf"
+                input_file.write_bytes(b"%PDF-1.4")
+                result = manager.ensure_extraction(
+                    ExtractionRequest(input_file=input_file, attachment_key="ATT7")
+                )
+                self.assertEqual("downloaded", result.job["state"])
+                # First poll used the submitting key (affinity) and got 401;
+                # the retry fell back to the second key and completed.
+                self.assertEqual(["s-a", "s-b"], provider.poll_keys)
+                self.assertEqual(3600.0, pool.cooldown_remaining("mineru_a"))
+                self.assertEqual(0.0, pool.cooldown_remaining("mineru_b"))
+            finally:
+                ledger.close()
+
+    def test_503_retries_with_backoff_then_completes(self) -> None:
+        with workspace_tmpdir("phase2-503-") as tmpdir:
+            provider = StatusCodeFailingPollProvider(503, fail_times=2)
+            ledger, pool, manager = _phase2_manager(tmpdir, provider, ["s-a"])
+            try:
+                input_file = tmpdir / "doc.pdf"
+                input_file.write_bytes(b"%PDF-1.4")
+                result = manager.ensure_extraction(
+                    ExtractionRequest(input_file=input_file, attachment_key="ATT8")
+                )
+                self.assertEqual("downloaded", result.job["state"])
+                # 2 transient failures + the successful third poll, and the
+                # key was never cooled (5xx is not the key's fault).
+                self.assertEqual(3, len(provider.poll_keys))
+                self.assertEqual(0.0, pool.cooldown_remaining("mineru_a"))
+            finally:
+                ledger.close()
+
+    def test_unclassified_400_goes_catchall(self) -> None:
+        with workspace_tmpdir("phase2-400-") as tmpdir:
+            provider = StatusCodeFailingPollProvider(400)
+            ledger, pool, manager = _phase2_manager(tmpdir, provider, ["s-a"])
+            try:
+                input_file = tmpdir / "doc.pdf"
+                input_file.write_bytes(b"%PDF-1.4")
+                with self.assertRaises(MinerUAPIError):
+                    manager.ensure_extraction(
+                        ExtractionRequest(input_file=input_file, attachment_key="ATT9")
+                    )
+                job = ledger.list_extract_jobs()[0]
+                self.assertEqual("failed_retryable", job["state"])
+                self.assertEqual("MinerUAPIError", job["error_code"])
+                # Unclassified errors keep the historical failure cooldown.
+                self.assertEqual(60.0, pool.cooldown_remaining("mineru_a"))
+            finally:
+                ledger.close()
+
+    def test_remote_batch_failure_does_not_cool_key(self) -> None:
+        with workspace_tmpdir("phase2-remotefail-") as tmpdir:
+            provider = RemoteFailingPollProvider()
+            ledger, pool, manager = _phase2_manager(tmpdir, provider, ["s-a"])
+            try:
+                input_file = tmpdir / "doc.pdf"
+                input_file.write_bytes(b"%PDF-1.4")
+                with self.assertRaises(MinerUAPIError):
+                    manager.ensure_extraction(
+                        ExtractionRequest(input_file=input_file, attachment_key="ATT10")
+                    )
+                job = ledger.list_extract_jobs()[0]
+                self.assertEqual("failed_retryable", job["state"])
+                self.assertEqual("remote exploded", job["error_message"])
+                # §2.2 error table: a truly failed remote batch does not cool
+                # the key (deliberate change from the old 60s catch-all).
+                self.assertEqual(0.0, pool.cooldown_remaining("mineru_a"))
+            finally:
+                ledger.close()
+
+
+class Phase2ResubmitBudgetTests(unittest.TestCase):
+    def test_resume_resubmit_capped_and_counted(self) -> None:
+        with workspace_tmpdir("phase2-resubmit-cap-") as tmpdir:
+            provider = RemoteFailingPollProvider()
+            ledger, pool, manager = _phase2_manager(tmpdir, provider, [])
+            try:
+                input_file = tmpdir / "doc.pdf"
+                input_file.write_bytes(b"%PDF-1.4")
+                request = ExtractionRequest(input_file=input_file, attachment_key="ATT11")
+                with self.assertRaises(MinerUAPIError):
+                    manager.ensure_extraction(request)
+                job = ledger.list_extract_jobs()[0]
+                job_id = job["job_id"]
+                # 决策2: each resume resubmits once (attempts 1..3), then the
+                # next resume flips the job to failed_manual_review.
+                for expected_attempts in (1, 2, 3):
+                    with self.assertRaises(MinerUAPIError):
+                        manager.resume_extraction(job_id)
+                    job = ledger.get_extract_job(job_id=job_id)
+                    self.assertEqual("failed_retryable", job["state"])
+                    self.assertEqual(expected_attempts, job["payload"]["resubmit_attempts"])
+                with self.assertRaises(RuntimeError):
+                    manager.resume_extraction(job_id)
+                job = ledger.get_extract_job(job_id=job_id)
+                self.assertEqual("failed_manual_review", job["state"])
+                self.assertEqual("max-resubmit-attempts", job["error_code"])
+                # 1 initial submit + 3 resubmits; the capped round submitted
+                # nothing new.
+                self.assertEqual(4, provider.submit_calls)
+            finally:
+                ledger.close()
+
+    def test_ensure_resubmit_carries_count_and_respects_cap(self) -> None:
+        with workspace_tmpdir("phase2-ensure-cap-") as tmpdir:
+            provider = RemoteFailingPollProvider()
+            ledger, pool, manager = _phase2_manager(tmpdir, provider, [])
+            try:
+                input_file = tmpdir / "doc.pdf"
+                input_file.write_bytes(b"%PDF-1.4")
+                request = ExtractionRequest(input_file=input_file, attachment_key="ATT12")
+                with self.assertRaises(MinerUAPIError):
+                    manager.ensure_extraction(request)
+                job = ledger.list_extract_jobs()[0]
+                job_id = job["job_id"]
+                self.assertEqual(0, job["payload"].get("resubmit_attempts", 0))
+                # ensure-path resubmission carries the count in the payload
+                # (upsert would otherwise reset it every round).
+                with self.assertRaises(MinerUAPIError):
+                    manager.ensure_extraction(request)
+                job = ledger.get_extract_job(job_id=job_id)
+                self.assertEqual(1, job["payload"]["resubmit_attempts"])
+                # Push the counter to the cap: ensure must now refuse to
+                # resubmit and flip the job to failed_manual_review.
+                payload = dict(job["payload"])
+                payload["resubmit_attempts"] = 3
+                ledger.set_extract_job_state(
+                    job_id,
+                    state="failed_retryable",
+                    local_stage="error",
+                    payload=payload,
+                )
+                with self.assertRaises(RuntimeError):
+                    manager.ensure_extraction(request)
+                job = ledger.get_extract_job(job_id=job_id)
+                self.assertEqual("failed_manual_review", job["state"])
+                self.assertEqual("max-resubmit-attempts", job["error_code"])
+                self.assertEqual(2, provider.submit_calls)
+            finally:
+                ledger.close()
