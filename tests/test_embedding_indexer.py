@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import base64
 from datetime import datetime, timedelta, timezone
+import hashlib
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 from tests._support import workspace_tmpdir
 from zoterorag.config import EmbeddingProfile
@@ -11,11 +13,17 @@ from zoterorag.db import StateLedger
 from zoterorag.embeddings import (
     EmbeddingInput,
     EmbeddingVector,
+    IndexResult,
+    StagedDocument,
     StubEmbeddingProvider,
     index_normalized_document,
+    publish_staged_documents,
     search_vector_index,
+    stage_indexed_document,
 )
+from zoterorag.embeddings.indexer import vector_path_for_profile
 from zoterorag.embeddings.profile import embedding_profile_hash
+from zoterorag.index import open_vector_store
 from zoterorag.normalize import normalize_markdown_document
 
 
@@ -159,7 +167,12 @@ class EmbeddingIndexerTests(unittest.TestCase):
                 self.assertEqual("completed", batches[0]["status"])
                 self.assertEqual(text_result.embedding_batch_hash, batches[0]["batch_hash"])
                 text_index = next(index for index in ledger.list_vector_indexes() if index["profile_name"] == "stub_text")
-                self.assertEqual(text_result.embedding_batch_hash, text_index["active_version"])
+                # Phase 3: the published version is named by the run hash
+                # (sha256 of the batch hash), not the batch hash itself.
+                self.assertEqual(
+                    hashlib.sha256(text_result.embedding_batch_hash.encode("utf-8")).hexdigest(),
+                    text_index["active_version"],
+                )
                 self.assertEqual(
                     [chunk["chunk_id"] for chunk in ledger.list_chunks("DOC1", chunk_type="text")],
                     batches[0]["payload"]["input_ids"],
@@ -852,5 +865,352 @@ class VectorIndexPruneTests(unittest.TestCase):
                         stale_batch_seconds=None,
                     )
                 self.assertIn("running", str(ctx.exception))
+            finally:
+                ledger.close()
+
+
+class BatchPublishTests(unittest.TestCase):
+    """Phase 3: stage/publish split — one publish per run per profile."""
+
+    def _make_ledger(self, tmpdir: Path, *, backend: str = "sqlite-local") -> StateLedger:
+        ledger = StateLedger(tmpdir / "state.sqlite")
+        ledger.upsert_embedding_profiles(
+            [
+                EmbeddingProfile(
+                    name="stub_text",
+                    provider="stub",
+                    model="stub",
+                    dimension=8,
+                    modality="text",
+                    enabled=True,
+                    default_for_text=True,
+                    backend=backend,
+                )
+            ]
+        )
+        return ledger
+
+    def _stage(self, ledger: StateLedger, tmpdir: Path, document_id: str):
+        return stage_indexed_document(
+            ledger=ledger,
+            vector_store_dir=tmpdir / "vectors",
+            profile_name="stub_text",
+            document_id=document_id,
+        )
+
+    def _open_store(self, tmpdir: Path, *, backend: str = "sqlite-local"):
+        return open_vector_store(
+            vector_path_for_profile(tmpdir / "vectors", "stub_text", backend=backend),
+            profile_name="stub_text",
+            dimension=8,
+            backend=backend,
+        )
+
+    def test_three_documents_stage_then_publish_once(self) -> None:
+        with workspace_tmpdir("batch-publish-") as tmpdir:
+            ledger = self._make_ledger(tmpdir)
+            try:
+                # A pre-existing published document the run-level publish must
+                # carry forward (so copied == its chunk count).
+                seed_markdown_document(tmpdir, ledger, document_id="DOC_SEED", text="seed carried evidence")
+                index_normalized_document(
+                    ledger=ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="stub_text",
+                    document_id="DOC_SEED",
+                )
+                for doc_id in ("DOC_A", "DOC_B", "DOC_C"):
+                    seed_markdown_document(tmpdir, ledger, document_id=doc_id, text=f"{doc_id} unique evidence")
+
+                staged = [self._stage(ledger, tmpdir, doc_id) for doc_id in ("DOC_A", "DOC_B", "DOC_C")]
+                self.assertTrue(all(isinstance(item, StagedDocument) for item in staged))
+                # Staging alone must not complete batches, register indexes, or
+                # write "indexed" checkpoints.
+                for item in staged:
+                    self.assertEqual("running", ledger.get_embedding_batch(item.batch_hash)["status"])
+                    self.assertNotEqual(
+                        "indexed",
+                        (ledger.get_checkpoint(item.document_id, "embed:stub_text") or {}).get("status"),
+                    )
+                # Staging must not have touched the registered index: it still
+                # points at the seed document's version.
+                registered_before = next(
+                    i for i in ledger.list_vector_indexes() if i["profile_name"] == "stub_text"
+                )
+                store = self._open_store(tmpdir)
+                try:
+                    pre_active = store.active_version()
+                    pre_counts = store.counts()
+                finally:
+                    store.close()
+                self.assertEqual(1, pre_counts["chunks"])
+                self.assertEqual(pre_active, registered_before["active_version"])
+
+                results = publish_staged_documents(ledger=ledger, staged=staged)
+
+                self.assertEqual(["DOC_A", "DOC_B", "DOC_C"], [r.document_id for r in results])
+                self.assertTrue(all(not r.reused_existing for r in results))
+                self.assertEqual([1, 1, 1], [r.indexed_chunks for r in results])
+
+                run_hash = hashlib.sha256(
+                    "\n".join(sorted(item.batch_hash for item in staged)).encode("utf-8")
+                ).hexdigest()
+                store = self._open_store(tmpdir)
+                try:
+                    # Exactly one new version, now active; the pre-run active
+                    # version was superseded and removed by publish.
+                    self.assertEqual([run_hash], store.list_versions())
+                    self.assertEqual(run_hash, store.active_version())
+                    self.assertNotEqual(pre_active, run_hash)
+                    counts = store.counts()
+                finally:
+                    store.close()
+                self.assertEqual({"documents": 4, "chunks": 4}, counts)
+
+                for item in staged:
+                    batch = ledger.get_embedding_batch(item.batch_hash)
+                    self.assertEqual("completed", batch["status"])
+                    self.assertEqual(run_hash, batch["payload"]["index_version"])
+                    # Run-level carry-forward: the seed document's 1 chunk.
+                    self.assertEqual(1, batch["payload"]["carried_forward_chunks"])
+                    checkpoint = ledger.get_checkpoint(item.document_id, "embed:stub_text")
+                    self.assertEqual("indexed", checkpoint["status"])
+                    self.assertEqual(run_hash, checkpoint["payload"]["index_version"])
+                index = next(i for i in ledger.list_vector_indexes() if i["profile_name"] == "stub_text")
+                self.assertEqual(run_hash, index["active_version"])
+                self.assertEqual(4, index["document_count"])
+                self.assertEqual(4, index["chunk_count"])
+            finally:
+                ledger.close()
+
+    def test_crash_after_publish_reruns_without_duplicate_rows(self) -> None:
+        with workspace_tmpdir("batch-publish-crash-") as tmpdir:
+            ledger = self._make_ledger(tmpdir)
+            try:
+                for doc_id in ("DOC_X", "DOC_Y"):
+                    seed_markdown_document(tmpdir, ledger, document_id=doc_id, text=f"{doc_id} crash evidence")
+                staged = [self._stage(ledger, tmpdir, doc_id) for doc_id in ("DOC_X", "DOC_Y")]
+
+                # Simulate a crash in the bookkeeping window: publish committed,
+                # the first "completed" batch upsert fails.
+                original_upsert = ledger.upsert_embedding_batch
+                crash_state = {"raised": False}
+
+                def crashing_upsert(*args, **kwargs):
+                    if kwargs.get("status") == "completed" and not crash_state["raised"]:
+                        crash_state["raised"] = True
+                        raise RuntimeError("simulated crash after publish")
+                    return original_upsert(*args, **kwargs)
+
+                with patch.object(ledger, "upsert_embedding_batch", side_effect=crashing_upsert):
+                    with self.assertRaises(RuntimeError):
+                        publish_staged_documents(ledger=ledger, staged=staged)
+
+                store = self._open_store(tmpdir)
+                try:
+                    counts_after_crash = store.counts()
+                    versions_after_crash = store.list_versions()
+                finally:
+                    store.close()
+                self.assertEqual({"documents": 2, "chunks": 2}, counts_after_crash)
+                # Batch rows stayed "running": the reuse fast path must miss.
+                for item in staged:
+                    self.assertEqual("running", ledger.get_embedding_batch(item.batch_hash)["status"])
+
+                # Re-run stage + publish; the deterministic run hash makes the
+                # second publish land on the same version.
+                restaged = [self._stage(ledger, tmpdir, doc_id) for doc_id in ("DOC_X", "DOC_Y")]
+                results = publish_staged_documents(ledger=ledger, staged=restaged)
+
+                store = self._open_store(tmpdir)
+                try:
+                    self.assertEqual(counts_after_crash, store.counts())
+                    self.assertEqual(versions_after_crash, store.list_versions())
+                    for doc_id in ("DOC_X", "DOC_Y"):
+                        self.assertEqual(1, store.document_counts(doc_id, modality="text")["chunks"])
+                finally:
+                    store.close()
+                self.assertEqual(2, len(results))
+                for item in restaged:
+                    self.assertEqual("completed", ledger.get_embedding_batch(item.batch_hash)["status"])
+            finally:
+                ledger.close()
+
+    def test_reuse_fast_path_returns_result_without_publish(self) -> None:
+        with workspace_tmpdir("batch-publish-reuse-") as tmpdir:
+            ledger = self._make_ledger(tmpdir)
+            try:
+                seed_markdown_document(tmpdir, ledger, document_id="DOC_R", text="reuse evidence")
+                first = index_normalized_document(
+                    ledger=ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="stub_text",
+                    document_id="DOC_R",
+                )
+                store = self._open_store(tmpdir)
+                try:
+                    version_before = store.active_version()
+                finally:
+                    store.close()
+
+                with patch("zoterorag.embeddings.indexer.publish_staged_documents") as publish_spy:
+                    outcome = self._stage(ledger, tmpdir, "DOC_R")
+
+                self.assertIsInstance(outcome, IndexResult)
+                self.assertTrue(outcome.reused_existing)
+                self.assertEqual(first.embedding_batch_hash, outcome.embedding_batch_hash)
+                publish_spy.assert_not_called()
+                store = self._open_store(tmpdir)
+                try:
+                    self.assertEqual(version_before, store.active_version())
+                finally:
+                    store.close()
+            finally:
+                ledger.close()
+
+    def test_publish_sweeps_leftover_staged_versions(self) -> None:
+        with workspace_tmpdir("batch-publish-sweep-") as tmpdir:
+            ledger = self._make_ledger(tmpdir)
+            try:
+                seed_markdown_document(tmpdir, ledger, document_id="DOC_S1", text="sweep base evidence")
+                index_normalized_document(
+                    ledger=ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="stub_text",
+                    document_id="DOC_S1",
+                )
+                # A leftover staged version from a crashed earlier run.
+                from zoterorag.index.local_vector import VectorRecord
+
+                store = self._open_store(tmpdir)
+                try:
+                    store.upsert(
+                        [
+                            VectorRecord(
+                                record_id="stub_text:orphan-chunk",
+                                document_id="DOC_ORPHAN",
+                                chunk_id="orphan-chunk",
+                                vector=[0.0] * 8,
+                                text="orphan",
+                                modality="text",
+                            )
+                        ],
+                        index_version="orphan-version",
+                    )
+                    self.assertIn("orphan-version", store.list_versions())
+                finally:
+                    store.close()
+
+                seed_markdown_document(tmpdir, ledger, document_id="DOC_S2", text="sweep new evidence")
+                staged = [self._stage(ledger, tmpdir, "DOC_S2")]
+                publish_staged_documents(ledger=ledger, staged=staged)
+
+                store = self._open_store(tmpdir)
+                try:
+                    versions = store.list_versions()
+                    self.assertNotIn("orphan-version", versions)
+                    self.assertEqual([store.active_version()], versions)
+                    # The pre-existing document was carried forward.
+                    self.assertEqual({"documents": 2, "chunks": 2}, store.counts())
+                finally:
+                    store.close()
+            finally:
+                ledger.close()
+
+    def test_single_document_wrapper_matches_split_flow(self) -> None:
+        with workspace_tmpdir("batch-publish-wrapper-") as tmpdir:
+            ledger = self._make_ledger(tmpdir)
+            try:
+                seed_markdown_document(tmpdir, ledger, document_id="DOC_W", text="wrapper evidence")
+                result = index_normalized_document(
+                    ledger=ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="stub_text",
+                    document_id="DOC_W",
+                )
+                run_hash = hashlib.sha256(result.embedding_batch_hash.encode("utf-8")).hexdigest()
+                self.assertFalse(result.reused_existing)
+                self.assertEqual(1, result.indexed_chunks)
+                checkpoint = ledger.get_checkpoint("DOC_W", "embed:stub_text")
+                self.assertEqual("indexed", checkpoint["status"])
+                self.assertEqual(result.embedding_batch_hash, checkpoint["payload"]["embedding_batch_hash"])
+                self.assertEqual(run_hash, checkpoint["payload"]["index_version"])
+                index = next(i for i in ledger.list_vector_indexes() if i["profile_name"] == "stub_text")
+                self.assertEqual(run_hash, index["active_version"])
+                store = self._open_store(tmpdir)
+                try:
+                    self.assertEqual(run_hash, store.active_version())
+                    self.assertEqual({"documents": 1, "chunks": 1}, store.counts())
+                finally:
+                    store.close()
+                hits = search_vector_index(
+                    ledger=ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="stub_text",
+                    query="wrapper evidence",
+                    mode="text",
+                )
+                self.assertEqual("DOC_W", hits[0]["document_id"])
+            finally:
+                ledger.close()
+
+    def test_publish_orchestration_against_lancedb_profile_with_fake_store(self) -> None:
+        """The lancedb backend itself is covered by tests/test_lancedb_vector.py;
+        here a minimal fake store verifies the indexer orchestration (grouping,
+        leftover sweep, single stage_and_publish, ledger bookkeeping) when the
+        profile backend is lancedb."""
+        with workspace_tmpdir("batch-publish-lancedb-") as tmpdir:
+            ledger = self._make_ledger(tmpdir, backend="lancedb")
+            try:
+                for doc_id in ("DOC_L1", "DOC_L2"):
+                    seed_markdown_document(tmpdir, ledger, document_id=doc_id, text=f"{doc_id} lancedb evidence")
+                staged = [self._stage(ledger, tmpdir, doc_id) for doc_id in ("DOC_L1", "DOC_L2")]
+                self.assertTrue(all(item.backend == "lancedb" for item in staged))
+
+                class FakeStore:
+                    def __init__(self) -> None:
+                        self.active = "legacy"
+                        self.deleted: list[str] = []
+                        self.published_records = None
+                        self.excluded: list[str] = []
+                        self.closed = False
+
+                    def list_versions(self):
+                        return ["orphan-version"]
+
+                    def version_is_active(self, version):
+                        return version == self.active
+
+                    def delete_version(self, version):
+                        self.deleted.append(version)
+                        return 1
+
+                    def stage_and_publish(self, records, *, index_version, exclude_document_ids=()):
+                        self.published_records = list(records)
+                        self.excluded = list(exclude_document_ids)
+                        self.active = index_version
+                        return 0, len(self.published_records), {"documents": 2, "chunks": len(self.published_records)}
+
+                    def close(self):
+                        self.closed = True
+
+                fake = FakeStore()
+                with patch("zoterorag.embeddings.indexer.open_vector_store", return_value=fake):
+                    results = publish_staged_documents(ledger=ledger, staged=staged)
+
+                run_hash = hashlib.sha256(
+                    "\n".join(sorted(item.batch_hash for item in staged)).encode("utf-8")
+                ).hexdigest()
+                self.assertEqual(["orphan-version"], fake.deleted)
+                self.assertEqual(run_hash, fake.active)
+                self.assertEqual(2, len(fake.published_records))
+                self.assertEqual({"DOC_L1", "DOC_L2"}, set(fake.excluded))
+                self.assertTrue(fake.closed)
+                self.assertEqual(["DOC_L1", "DOC_L2"], [r.document_id for r in results])
+                index = next(i for i in ledger.list_vector_indexes() if i["profile_name"] == "stub_text")
+                self.assertEqual("lancedb", index["backend"])
+                self.assertEqual(run_hash, index["active_version"])
+                for item in staged:
+                    self.assertEqual(run_hash, ledger.get_embedding_batch(item.batch_hash)["payload"]["index_version"])
             finally:
                 ledger.close()

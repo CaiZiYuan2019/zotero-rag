@@ -143,7 +143,17 @@ def vector_index_provenance(ledger: StateLedger, index: dict[str, Any]) -> dict[
     )
     active_version = str(index.get("active_version") or "")
     matching_active_version = [
-        batch for batch in batches if active_version and batch["batch_hash"] == active_version
+        batch
+        for batch in batches
+        if active_version
+        and (
+            batch["batch_hash"] == active_version
+            # Phase 3: batch-published runs name the active version with a
+            # per-run hash rather than a per-document batch_hash; the link
+            # back to each batch row lives in payload["index_version"]
+            # (list_embedding_batches rows carry the payload already parsed).
+            or (batch.get("payload") or {}).get("index_version") == active_version
+        )
     ]
     if int(index.get("chunk_count") or 0) == 0:
         status = "empty"

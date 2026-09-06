@@ -9,7 +9,12 @@ from typing import Any, Literal
 
 from ..db import JobEvent, StateLedger
 from ..embeddings.profile import embedding_profile_hash
-from ..embeddings.indexer import index_normalized_document
+from ..embeddings.indexer import (
+    IndexResult,
+    index_normalized_document,
+    publish_staged_documents,
+    stage_indexed_document,
+)
 from ..normalize.markdown import normalize_markdown_document, sanitize_id
 from ..normalize.merge_extract_segments import (
     merge_extract_segments,
@@ -92,6 +97,7 @@ def start_ingest_job(
     normalized_dir: str | Path | None = None,
     vector_store_dir: str | Path | None = None,
     extract_config: ExtractConfig | None = None,
+    batch_publish: bool = True,
 ) -> dict[str, Any]:
     """Create a persisted ingest job and optionally execute it.
 
@@ -101,6 +107,10 @@ def start_ingest_job(
     When execute=True, the function processes documents stage by stage:
     extract → normalize → embed(text) → embed(multimodal). Each stage
     checks checkpoints before re-executing so interrupted runs can resume.
+
+    Phase 3: with batch_publish=True (the default), embed stages only stage
+    vectors per document and the whole run is published once per profile at
+    the end; batch_publish=False falls back to per-document publishing.
     """
 
     if execute:
@@ -153,6 +163,7 @@ def start_ingest_job(
             normalized_dir=normalized_dir,
             vector_store_dir=vector_store_dir,
             extract_config=extract_config,
+            batch_publish=batch_publish,
         )
 
 
@@ -188,6 +199,7 @@ def _execute_ingest_documents(
     normalized_dir: str | Path,
     vector_store_dir: str | Path,
     extract_config: ExtractConfig | None,
+    batch_publish: bool = True,
 ) -> dict[str, Any]:
     """Shared execution body of start_ingest_job and resume --execute (M7).
 
@@ -195,6 +207,11 @@ def _execute_ingest_documents(
     be held by the caller. Writes the terminal status (completed /
     completed_with_errors / blocked / interrupted / failed) before
     returning/raising.
+
+    Phase 3: with batch_publish=True, embed stages collect StagedDocuments
+    into embed_collector and every group is published once per profile after
+    the document loop; a document joins ``executed`` only after all its staged
+    profiles published successfully.
     """
     extract_cache_dir = Path(extract_cache_dir)
     normalized_dir = Path(normalized_dir)
@@ -206,6 +223,13 @@ def _execute_ingest_documents(
     skipped: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
+    # Phase 3 batch publish bookkeeping: embed stages append staged vectors to
+    # embed_collector instead of publishing per document; documents with
+    # staged-but-unpublished embeds wait in awaiting_publish until the
+    # run-level publish after the loop confirms them (or fails them).
+    embed_collector: list[dict[str, Any]] = []
+    awaiting_publish: dict[str, dict[str, Any]] = {}
+    failed_doc_ids: set[str] = set()
     # M9 circuit breaker: consecutive failures sharing the same exception
     # class almost always mean a systemic problem (e.g. a revoked API key
     # fails 100% of documents). Abort the run as "failed" instead of
@@ -235,6 +259,7 @@ def _execute_ingest_documents(
                     normalized_dir=normalized_dir,
                     vector_store_dir=vector_store_dir,
                     extract_config=extract_config,
+                    embed_collector=embed_collector if batch_publish else None,
                 )
                 if result.get("blocked"):
                     # Not a failure: remote extraction is still running and
@@ -254,12 +279,22 @@ def _execute_ingest_documents(
                         )
                     )
                 else:
-                    executed.append(result)
+                    # Phase 3: with batch publish, embed stages only staged
+                    # vectors; the document joins ``executed`` only after the
+                    # run-level publish below confirms every staged profile.
+                    if result.get("staged_embeds"):
+                        awaiting_publish[document["document_id"]] = {
+                            "document": document,
+                            "result": result,
+                        }
+                    else:
+                        executed.append(result)
                     breaker_kind = None
                     breaker_streak = 0
                     _progress("  -> done\n")
             except (FileNotFoundError, ValueError, RuntimeError, RerankNotSupportedError) as exc:
                 failed.append({"document": document, "error": str(exc)})
+                failed_doc_ids.add(document["document_id"])
                 _progress(f"  -> FAILED: {exc}\n")
                 ledger.add_event(
                     JobEvent(
@@ -279,6 +314,7 @@ def _execute_ingest_documents(
                 # Catch-all: a single misbehaving document must not abort the job.
                 error_text = traceback.format_exc()
                 failed.append({"document": document, "error": str(exc), "traceback": error_text})
+                failed_doc_ids.add(document["document_id"])
                 _progress(f"  -> FAILED (unexpected): {exc}\n")
                 ledger.add_event(
                     JobEvent(
@@ -294,6 +330,53 @@ def _execute_ingest_documents(
                 )
                 if breaker_tripped:
                     break
+
+        # Phase 3: batch publish. Runs after the document loop no matter how
+        # the loop ended (including a circuit-breaker break), so staged
+        # vectors are never abandoned without an accounting outcome. One
+        # publish per profile group replaces the historical per-document
+        # publish (O(N^2) copying). Per-group failures are isolated: a failed
+        # group fails its documents, other groups still publish.
+        publish_group_count = 0
+        publish_failed_groups = 0
+        if embed_collector:
+            publish_outcomes = _publish_collected_embeds(
+                ledger,
+                job_id=job_id,
+                embed_collector=embed_collector,
+            )
+            publish_group_count = publish_outcomes["group_count"]
+            publish_failed_groups = publish_outcomes["failed_groups"]
+            # Merge awaiting_publish into executed/failed. Documents already
+            # counted as failed by the per-document exception path are skipped
+            # here so they are never double-counted.
+            for document_id, awaiting in awaiting_publish.items():
+                if document_id in failed_doc_ids:
+                    continue
+                entry_outcomes = [
+                    outcome
+                    for index, outcome in enumerate(publish_outcomes["entries"])
+                    if embed_collector[index]["document_id"] == document_id
+                ]
+                if entry_outcomes and all(entry_outcomes):
+                    executed.append(awaiting["result"])
+                else:
+                    failed_profiles = sorted(
+                        embed_collector[index]["profile_name"]
+                        for index, outcome in enumerate(publish_outcomes["entries"])
+                        if embed_collector[index]["document_id"] == document_id and not outcome
+                    )
+                    error = f"embed publish failed for profile(s): {', '.join(failed_profiles)}"
+                    failed.append({"document": awaiting["document"], "error": error})
+                    ledger.add_event(
+                        JobEvent(
+                            job_id=job_id,
+                            stage="document_error",
+                            status="failed",
+                            message=f"{document_id}: {error}",
+                            payload={"document": awaiting["document"], "error": error},
+                        )
+                    )
 
         if breaker_tripped:
             final_status = "failed"
@@ -316,6 +399,25 @@ def _execute_ingest_documents(
                         "processed": len(executed) + len(blocked) + len(failed),
                         "remaining": total - len(executed) - len(blocked) - len(failed) - len(skipped),
                     },
+                )
+            )
+        elif embed_collector and publish_group_count and publish_failed_groups == publish_group_count and not executed:
+            # Phase 3: every publish group failed and no document completed
+            # independently — publishing itself is systemically broken (same
+            # spirit as the circuit breaker), so the run is "failed" rather
+            # than "completed_with_errors". Partial group failures still land
+            # on the failed-driven completed_with_errors path below.
+            final_status = "failed"
+            ledger.add_event(
+                JobEvent(
+                    job_id=job_id,
+                    stage="embed_publish",
+                    status="failed",
+                    message=(
+                        f"all {publish_group_count} embed publish group(s) failed; "
+                        "treating the run as failed (systemic publish fault)"
+                    ),
+                    payload={"groups": publish_group_count, "failed_groups": publish_failed_groups},
                 )
             )
         elif failed:
@@ -382,6 +484,64 @@ def _execute_ingest_documents(
         raise
 
 
+def _publish_collected_embeds(
+    ledger: StateLedger,
+    *,
+    job_id: str,
+    embed_collector: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Publish every staged embed of this run, one publish per profile (Phase 3).
+
+    Returns {"group_count", "failed_groups", "entries"} where ``entries`` is a
+    per-collector-entry boolean list (True = its profile group published).
+    Group failures are caught here so one broken profile cannot abort the
+    run; the caller folds the outcomes into executed/failed.
+    """
+    groups: dict[str, list[int]] = {}
+    for index, entry in enumerate(embed_collector):
+        groups.setdefault(entry["profile_name"], []).append(index)
+
+    entries: list[bool] = [False] * len(embed_collector)
+    failed_groups = 0
+    for profile_name, indexes in groups.items():
+        try:
+            results = publish_staged_documents(
+                ledger=ledger,
+                staged=[embed_collector[index]["staged"] for index in indexes],
+            )
+        except Exception as exc:
+            failed_groups += 1
+            ledger.add_event(
+                JobEvent(
+                    job_id=job_id,
+                    stage="embed_publish",
+                    status="failed",
+                    message=f"batch publish failed for {profile_name}: {exc}",
+                    payload={
+                        "profile_name": profile_name,
+                        "document_ids": [embed_collector[index]["document_id"] for index in indexes],
+                        "error": str(exc),
+                        "traceback": traceback.format_exc(),
+                    },
+                )
+            )
+            continue
+        # The completed event deferred by _execute_embed_stage is written only
+        # now, once the vectors are actually visible to search.
+        for index, index_result in zip(indexes, results):
+            entries[index] = True
+            ledger.add_event(
+                JobEvent(
+                    job_id=job_id,
+                    stage=f"embed:{profile_name}",
+                    status="completed",
+                    message=f"indexed {index_result.indexed_chunks} chunks for {embed_collector[index]['document_id']}",
+                    payload=index_result.to_dict(),
+                )
+            )
+    return {"group_count": len(groups), "failed_groups": failed_groups, "entries": entries}
+
+
 def _record_ingest_plan(
     ledger: StateLedger, *, job_id: str, plan: dict[str, Any], execute: bool
 ) -> None:
@@ -430,12 +590,16 @@ def resume_ingest_job(
     normalized_dir: str | Path | None = None,
     vector_store_dir: str | Path | None = None,
     extract_config: ExtractConfig | None = None,
+    batch_publish: bool = True,
 ) -> dict[str, Any]:
     """Rebuild the plan for an existing ingest job; with execute=True, also run it.
 
     M7: previously resume only re-planned and returned, leaving the job in
     "planned" with no consumer — the crash-recovery chain was broken. The
     execute path takes over the existing job under the runner lock.
+
+    Phase 3: batch_publish is forwarded to the execution body; see
+    start_ingest_job.
     """
     job = require_ingest_job(ledger, job_id)
     payload = dict(job.get("payload") or {})
@@ -525,6 +689,7 @@ def resume_ingest_job(
             normalized_dir=normalized_dir,
             vector_store_dir=vector_store_dir,
             extract_config=extract_config,
+            batch_publish=batch_publish,
         )
 
 
@@ -824,6 +989,7 @@ def _execute_document_stages(
     normalized_dir: Path,
     vector_store_dir: Path,
     extract_config: ExtractConfig,
+    embed_collector: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Execute pending stages for a single document, resuming from checkpoints.
 
@@ -831,10 +997,16 @@ def _execute_document_stages(
     batches still running), normalize/embed are short-circuited so an
     incomplete extraction is never normalized (silent content truncation),
     and the returned dict carries blocked=True for the main loop's accounting.
+
+    Phase 3: when embed_collector is given, embed stages append staged vectors
+    to it instead of publishing; the returned dict's "staged_embeds" counts
+    how many entries this document added so the main loop can hold the
+    document back until the run-level publish.
     """
 
     attachment_key = document["attachment_key"]
     document_id = document["document_id"]
+    staged_before = len(embed_collector) if embed_collector is not None else 0
 
     for stage in document["stages"]:
         stage_name = stage["stage"]
@@ -858,6 +1030,9 @@ def _execute_document_stages(
                     "title": document.get("title"),
                     "blocked": True,
                     "blocked_stage": "extract",
+                    # Extract blocked before any embed stage ran, so this is 0
+                    # unless a future stage order changes that.
+                    "staged_embeds": (len(embed_collector) - staged_before) if embed_collector is not None else 0,
                 }
         elif stage_name == "normalize":
             _execute_normalize_stage(
@@ -876,12 +1051,14 @@ def _execute_document_stages(
                 document_id=document_id,
                 profile_name=profile_name,
                 vector_store_dir=vector_store_dir,
+                embed_collector=embed_collector,
             )
 
     return {
         "attachment_key": attachment_key,
         "document_id": document_id,
         "title": document.get("title"),
+        "staged_embeds": (len(embed_collector) - staged_before) if embed_collector is not None else 0,
     }
 
 
@@ -1469,8 +1646,16 @@ def _execute_embed_stage(
     document_id: str,
     profile_name: str,
     vector_store_dir: Path,
+    embed_collector: list[dict[str, Any]] | None = None,
 ) -> None:
-    """Run embedding for one document under one profile."""
+    """Run embedding for one document under one profile.
+
+    Phase 3: when embed_collector is None (batch_publish=False), the document
+    is published immediately via index_normalized_document — the historical
+    behavior. Otherwise vectors are only staged and appended to the collector;
+    the "completed" event is deferred to the run-level publish, which is the
+    earliest point the vectors are actually visible to search.
+    """
 
     _progress(f"  embed:{profile_name}: {document_id}...")
     ledger.checkpoint(
@@ -1488,24 +1673,53 @@ def _execute_embed_stage(
         )
     )
 
-    index_result = index_normalized_document(
+    if embed_collector is None:
+        index_result = index_normalized_document(
+            ledger=ledger,
+            vector_store_dir=vector_store_dir,
+            profile_name=profile_name,
+            document_id=document_id,
+            # Provider is auto-resolved from profile by _resolve_embedding_provider
+        )
+        _progress(f"  embed:{profile_name}: {index_result.indexed_chunks} chunks (reused={index_result.reused_existing})")
+        ledger.add_event(
+            JobEvent(
+                job_id=job_id,
+                stage=f"embed:{profile_name}",
+                status="completed",
+                message=f"indexed {index_result.indexed_chunks} chunks for {document_id}",
+                payload=index_result.to_dict(),
+            )
+        )
+        return
+
+    # Exceptions from staging propagate to the main loop's per-document
+    # failure accounting, exactly as index_normalized_document's did.
+    staged = stage_indexed_document(
         ledger=ledger,
         vector_store_dir=vector_store_dir,
         profile_name=profile_name,
         document_id=document_id,
         # Provider is auto-resolved from profile by _resolve_embedding_provider
     )
-    _progress(f"  embed:{profile_name}: {index_result.indexed_chunks} chunks (reused={index_result.reused_existing})")
-
-    ledger.add_event(
-        JobEvent(
-            job_id=job_id,
-            stage=f"embed:{profile_name}",
-            status="completed",
-            message=f"indexed {index_result.indexed_chunks} chunks for {document_id}",
-            payload=index_result.to_dict(),
+    if isinstance(staged, IndexResult):
+        # Reuse fast path: already published, so the completed event is due
+        # immediately (nothing was deferred).
+        _progress(f"  embed:{profile_name}: {staged.indexed_chunks} chunks (reused={staged.reused_existing})")
+        ledger.add_event(
+            JobEvent(
+                job_id=job_id,
+                stage=f"embed:{profile_name}",
+                status="completed",
+                message=f"indexed {staged.indexed_chunks} chunks for {document_id}",
+                payload=staged.to_dict(),
+            )
         )
+        return
+    embed_collector.append(
+        {"document_id": document_id, "profile_name": profile_name, "staged": staged}
     )
+    _progress(f"  embed:{profile_name}: {len(staged.records)} chunks staged (publish deferred)")
 
 
 def _find_source_markdown(artifact_dir: Path) -> Path | None:

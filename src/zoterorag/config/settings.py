@@ -104,6 +104,20 @@ class McpConfig:
 
 
 @dataclass(frozen=True)
+class IngestConfig:
+    # Phase 3: batch vector publishing. True (the default) stages all
+    # documents of a run and publishes once per profile; False falls back to
+    # the historical per-document publish.
+    batch_publish: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.batch_publish, bool):
+            raise TypeError(
+                f"ingest.batch_publish must be a boolean, got {self.batch_publish!r}"
+            )
+
+
+@dataclass(frozen=True)
 class ExtractConfig:
     split_large_pdfs: bool = True
     max_pages_per_extraction: int = 200
@@ -220,6 +234,7 @@ class AppConfig:
     mcp: McpConfig = field(default_factory=McpConfig)
     extract: ExtractConfig = field(default_factory=ExtractConfig)
     vectors: VectorsConfig = field(default_factory=VectorsConfig)
+    ingest: IngestConfig = field(default_factory=IngestConfig)
     embedding_profiles: tuple[EmbeddingProfile, ...] = ()
 
     def ensure_runtime_dirs(self) -> None:
@@ -358,6 +373,7 @@ def load_config(path: str | Path = "config/config.toml") -> AppConfig:
     mcp_data = data.get("mcp", {})
     extract_data = data.get("extract", {})
     vectors_data = data.get("vectors", {})
+    ingest_data = data.get("ingest", {})
     profiles_data = data.get("embedding_profiles", [])
 
     missing_paths = [
@@ -411,11 +427,15 @@ def load_config(path: str | Path = "config/config.toml") -> AppConfig:
     vectors = VectorsConfig(
         stale_embedding_batch_hours=float(vectors_data.get("stale_embedding_batch_hours", 24.0)),
     )
+    ingest = IngestConfig(
+        batch_publish=_parse_bool(ingest_data.get("batch_publish", True), "ingest.batch_publish"),
+    )
     return AppConfig(
         paths=paths,
         server=server,
         mcp=mcp,
         extract=extract,
         vectors=vectors,
+        ingest=ingest,
         embedding_profiles=profiles,
     )

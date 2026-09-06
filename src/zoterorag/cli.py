@@ -542,6 +542,7 @@ def main(argv: list[str] | None = None) -> int:
                         kwargs["normalized_dir"] = config.paths.normalized_dir
                         kwargs["vector_store_dir"] = config.paths.vector_store_dir
                         kwargs["extract_config"] = config.extract
+                        kwargs["batch_publish"] = config.ingest.batch_publish
                     emit(start_ingest_job(ledger, **kwargs))
                     return 0
                 except RerankNotSupportedError as exc:
@@ -585,6 +586,7 @@ def main(argv: list[str] | None = None) -> int:
                         kwargs["normalized_dir"] = config.paths.normalized_dir
                         kwargs["vector_store_dir"] = config.paths.vector_store_dir
                         kwargs["extract_config"] = config.extract
+                        kwargs["batch_publish"] = config.ingest.batch_publish
                     emit(resume_ingest_job(ledger, **kwargs))
                     return 0
                 except RerankNotSupportedError as exc:

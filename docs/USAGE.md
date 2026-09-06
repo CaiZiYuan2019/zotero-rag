@@ -115,6 +115,10 @@ max_resubmit_attempts = 3                         # 单个提取任务的最大�
 stale_embedding_batch_hours = 24                  # vectors prune 自动回收超过此时长仍卡 running 的嵌入批次
                                                   # （崩溃残留），转为 failed；新鲜 running 批次仍会阻止 prune
 
+[ingest]
+batch_publish = true                              # Phase 3 批量发布：一轮按 profile 合并一次发布（O(N²)→O(N) 复制）；
+                                                  # false 回退为逐篇发布（旧行为）
+
 [[embedding_profiles]]
 name = "qwen3vl_cloud_2560_text"
 provider = "dashscope"

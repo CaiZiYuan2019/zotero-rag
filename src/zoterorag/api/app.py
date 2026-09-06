@@ -297,6 +297,7 @@ def create_app(config_path: str | Path = "config/config.toml") -> Any:
                 kwargs["normalized_dir"] = config.paths.normalized_dir
                 kwargs["vector_store_dir"] = config.paths.vector_store_dir
                 kwargs["extract_config"] = config.extract
+                kwargs["batch_publish"] = config.ingest.batch_publish
             return start_ingest_job(ledger, **kwargs)
         except NotImplementedError as exc:
             raise HTTPException(status_code=501, detail=str(exc)) from exc

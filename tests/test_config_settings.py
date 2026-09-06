@@ -5,7 +5,7 @@ from pathlib import Path
 import unittest
 
 from tests._support import workspace_tmpdir
-from zoterorag.config import EmbeddingProfile, ExtractConfig, ServerConfig, VectorsConfig, load_config
+from zoterorag.config import EmbeddingProfile, ExtractConfig, IngestConfig, ServerConfig, VectorsConfig, load_config
 from zoterorag.runtime import config_as_public_dict, vector_store_path_for_profile
 
 
@@ -625,3 +625,41 @@ data_dir = "data"
             ExtractConfig(max_resubmit_attempts=-1)
         with self.assertRaises(ValueError):
             ExtractConfig(max_resubmit_attempts=True)
+
+
+class IngestConfigTests(unittest.TestCase):
+    """Phase 3 [ingest] batch_publish knob."""
+
+    def _write_config(self, tmpdir: Path, ingest_section: str) -> Path:
+        config_path = tmpdir / "config.toml"
+        config_path.write_text(
+            f"""
+[paths]
+zotero_db = "{(tmpdir / 'zotero.sqlite').as_posix()}"
+zotero_storage = "{(tmpdir / 'storage').as_posix()}"
+data_dir = "data"
+
+{ingest_section}
+""",
+            encoding="utf-8",
+        )
+        return config_path
+
+    def test_batch_publish_defaults_to_true(self) -> None:
+        with workspace_tmpdir("ingest-config-default-") as tmpdir:
+            config = load_config(self._write_config(tmpdir, ""))
+            self.assertTrue(config.ingest.batch_publish)
+        self.assertTrue(IngestConfig().batch_publish)
+
+    def test_batch_publish_explicit_false(self) -> None:
+        with workspace_tmpdir("ingest-config-false-") as tmpdir:
+            config = load_config(self._write_config(tmpdir, "[ingest]\nbatch_publish = false\n"))
+            self.assertFalse(config.ingest.batch_publish)
+
+    def test_batch_publish_rejects_non_boolean(self) -> None:
+        with workspace_tmpdir("ingest-config-bad-") as tmpdir:
+            with self.assertRaises(ValueError) as ctx:
+                load_config(self._write_config(tmpdir, '[ingest]\nbatch_publish = "yes"\n'))
+            self.assertIn("ingest.batch_publish", str(ctx.exception))
+        with self.assertRaises(TypeError):
+            IngestConfig(batch_publish=1)

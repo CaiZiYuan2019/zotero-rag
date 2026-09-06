@@ -51,6 +51,12 @@ max_resubmit_attempts = 3
 # while no indexing job is active.
 stale_embedding_batch_hours = 24
 
+[ingest]
+# Phase 3 batch vector publishing: true (default) stages all documents of a
+# run and publishes once per profile; false falls back to per-document
+# publishing (the legacy behavior).
+batch_publish = true
+
 [[embedding_profiles]]
 name = "qwen3vl_cloud_2560_text"
 provider = "dashscope"

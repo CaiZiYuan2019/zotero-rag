@@ -22,6 +22,11 @@ max_resubmit_attempts = 3
 [vectors]
 stale_embedding_batch_hours = 24
 
+[ingest]
+# Phase 3: 批量向量发布开关。true（默认）时一轮 ingest 按 profile 合并为一次发布；
+# false 回退为逐篇发布（旧行为）。
+batch_publish = true
+
 [[embedding_profiles]]
 name = "qwen3vl_cloud_2560_text"
 provider = "dashscope"

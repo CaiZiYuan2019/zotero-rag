@@ -106,7 +106,9 @@ class ReembedPipelineTests(unittest.TestCase):
                 seed_profiles(ledger)
                 seed_normalized_document(tmpdir, ledger)
 
-                with patch("zoterorag.pipeline.reembed.index_normalized_document", side_effect=KeyboardInterrupt):
+                # Phase 3: the execution loop stages via stage_indexed_document
+                # now; interrupting it exercises the same propagation path.
+                with patch("zoterorag.pipeline.reembed.stage_indexed_document", side_effect=KeyboardInterrupt):
                     with self.assertRaises(KeyboardInterrupt):
                         start_reembed_job(
                             ledger,
@@ -295,3 +297,80 @@ def seed_normalized_document(tmpdir, ledger: StateLedger):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReembedBatchPublishTests(unittest.TestCase):
+    """Phase 3: batch-published reembed must produce the same store content as
+    per-document index_normalized_document calls."""
+
+    def test_batch_reembed_matches_per_document_indexing(self) -> None:
+        with workspace_tmpdir("reembed-batch-a-") as tmpdir_a, workspace_tmpdir("reembed-batch-b-") as tmpdir_b:
+            ledger_a = StateLedger(tmpdir_a / "state.sqlite")
+            ledger_b = StateLedger(tmpdir_b / "state.sqlite")
+            try:
+                seed_profiles(ledger_a)
+                seed_profiles(ledger_b)
+                for doc_id, text in (("DOC_B1", "first batch evidence"), ("DOC_B2", "second batch evidence")):
+                    _seed_text_document(tmpdir_a, ledger_a, doc_id, text)
+                    _seed_text_document(tmpdir_b, ledger_b, doc_id, text)
+
+                batch_run = start_reembed_job(
+                    ledger_a,
+                    vector_store_dir=tmpdir_a / "vectors",
+                    profile_name="stub_text",
+                    execute=True,
+                )
+                self.assertEqual("completed", batch_run["job"]["status"])
+                self.assertEqual(2, len(batch_run["indexed"]))
+
+                for doc_id in ("DOC_B1", "DOC_B2"):
+                    index_normalized_document(
+                        ledger=ledger_b,
+                        vector_store_dir=tmpdir_b / "vectors",
+                        profile_name="stub_text",
+                        document_id=doc_id,
+                    )
+
+                rows_a, counts_a = _dump_active_store(tmpdir_a)
+                rows_b, counts_b = _dump_active_store(tmpdir_b)
+                self.assertEqual(counts_a, counts_b)
+                self.assertEqual(rows_a, rows_b)
+            finally:
+                ledger_a.close()
+                ledger_b.close()
+
+
+def _seed_text_document(tmpdir, ledger: StateLedger, document_id: str, text: str):
+    source_dir = tmpdir / f"mineru-{document_id}"
+    source_dir.mkdir(parents=True)
+    markdown = source_dir / "full.md"
+    markdown.write_text(f"# {document_id}\n\n{text}\n", encoding="utf-8")
+    normalized = normalize_markdown_document(
+        source_markdown=markdown,
+        output_root=tmpdir / "normalized",
+        document_id=document_id,
+        attachment_key=f"ATT_{document_id}",
+    )
+    ledger.upsert_normalized_artifact(normalized.ledger_artifact())
+    ledger.replace_document_chunks(normalized.document_id, normalized.chunks)
+    return normalized
+
+
+def _dump_active_store(tmpdir):
+    from zoterorag.index.local_vector import LocalVectorStore
+
+    store = LocalVectorStore(
+        tmpdir / "vectors" / "stub_text" / "vectors.sqlite",
+        profile_name="stub_text",
+        dimension=8,
+    )
+    try:
+        active = store.active_version()
+        rows = store.conn.execute(
+            "SELECT document_id, chunk_id, vector_json, text FROM vectors "
+            "WHERE profile_name = ? AND index_version = ? ORDER BY document_id, chunk_id",
+            ("stub_text", active),
+        ).fetchall()
+        return [tuple(row) for row in rows], store.counts(index_version=active)
+    finally:
+        store.close()

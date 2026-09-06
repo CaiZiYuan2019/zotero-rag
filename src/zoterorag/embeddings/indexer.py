@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 import hashlib
 import json
@@ -46,6 +47,31 @@ class IndexResult:
         }
 
 
+@dataclass(frozen=True)
+class StagedDocument:
+    """Phase 3: carrier between the stage and publish halves of indexing.
+
+    ``stage_indexed_document`` fills this with computed vectors without
+    touching the vector store; ``publish_staged_documents`` later publishes
+    a whole run of these in one ``stage_and_publish`` per profile store.
+    """
+
+    profile_name: str
+    document_id: str
+    chunk_type: str
+    profile_modality: str
+    profile_hash: str
+    batch_hash: str
+    records: list[VectorRecord]
+    provider_name: str
+    provider_model: str
+    dimension: int
+    backend: str
+    vector_path: Path
+    input_ids: list[str]
+    profile_enabled: bool
+
+
 def _resolve_embedding_provider(
     *,
     provider: EmbeddingProvider | None,
@@ -69,7 +95,7 @@ def _resolve_embedding_provider(
     return build_qwen_embedding_provider(profile)
 
 
-def index_normalized_document(
+def stage_indexed_document(
     *,
     ledger: StateLedger,
     vector_store_dir: str | Path,
@@ -78,7 +104,19 @@ def index_normalized_document(
     provider: EmbeddingProvider | None = None,
     allow_stub_provider: bool = False,
     vector_backend: str | None = None,
-) -> IndexResult:
+) -> IndexResult | StagedDocument:
+    """Compute embeddings for one document without publishing them (Phase 3).
+
+    This is the first half of the historical ``index_normalized_document``:
+    profile/artifact resolution, the reuse fast path, provider embedding, and
+    the "running" batch row. When the reuse fast path hits, an ``IndexResult``
+    is returned directly (the document is already fully published); otherwise
+    a ``StagedDocument`` carrying the computed vectors is returned for a later
+    run-level ``publish_staged_documents`` call. The staging path never opens
+    the store for writing, never completes the batch row, and never registers
+    the index or writes the "indexed" checkpoint — that all happens at
+    publish time.
+    """
     profile = require_embedding_profile(ledger, profile_name)
     vector_backend = vector_backend or profile.get("backend", "lancedb")
     artifact = ledger.get_normalized_artifact(document_id)
@@ -101,6 +139,8 @@ def index_normalized_document(
     # For expensive providers, a completed batch plus matching active vectors is
     # enough proof to skip the provider entirely. This keeps accidental reruns
     # from repeating qwen calls after a long indexing job has already published.
+    # Phase 3: this fast path is identical to the historical behavior — it
+    # publishes nothing new, so it bypasses the stage/publish split.
     existing_batch = ledger.get_embedding_batch(batch_hash)
     if (
         existing_batch is not None
@@ -197,73 +237,194 @@ def index_normalized_document(
         for chunk in chunks
     ]
 
-    store = open_vector_store(vector_path, profile_name=profile_name, dimension=int(profile["dimension"]), backend=vector_backend)
-    try:
-        # Stage records under the deterministic batch hash first. Search only
-        # sees this rebuild after publish_version commits, so interrupted
-        # embedding/index runs cannot expose a half-written vector set. For
-        # incremental single-document indexing, carry forward the existing
-        # active records for other documents so publishing this batch does not
-        # hide previously indexed evidence in the same profile.
-        # M6: copy -> upsert -> publish runs as one cross-process locked
-        # sequence; two writers must never interleave it.
-        copied, indexed, counts = store.stage_and_publish(
-            records,
-            index_version=batch_hash,
-            exclude_document_ids=[document_id],
-        )
-    finally:
-        store.close()
-
-    ledger.upsert_embedding_batch(
-        batch_hash=batch_hash,
+    # Phase 3: stop before opening the store. Completing the batch row,
+    # registering the vector index, and writing the "indexed" checkpoint are
+    # deferred to publish_staged_documents so a whole run publishes once per
+    # profile instead of once per document.
+    return StagedDocument(
         profile_name=profile_name,
-        profile_hash=profile_hash,
         document_id=document_id,
         chunk_type=chunk_type,
-        chunk_count=len(inputs),
-        status="completed",
-        provider=embedding_provider.name,
-        model=embedding_provider.model,
-        payload={
-            "input_ids": [item.input_id for item in inputs],
-            "dimension": embedding_provider.dimension,
-            "indexed_chunks": indexed,
-            "carried_forward_chunks": copied,
-            "vector_path": str(vector_path),
-        },
-    )
-    ledger.register_vector_index(
-        profile_name=profile_name,
+        profile_modality=profile_modality,
+        profile_hash=profile_hash,
+        batch_hash=batch_hash,
+        records=records,
+        provider_name=embedding_provider.name,
+        provider_model=embedding_provider.model,
+        dimension=embedding_provider.dimension,
         backend=vector_backend,
-        path=vector_path,
-        document_count=counts["documents"],
-        chunk_count=counts["chunks"],
-        active=bool(profile["enabled"]),
-        active_version=batch_hash,
+        vector_path=vector_path,
+        input_ids=[item.input_id for item in inputs],
+        profile_enabled=bool(profile["enabled"]),
     )
-    ledger.checkpoint(
-        document_id,
-        f"embed:{profile_name}",
-        "indexed",
-        {
-            "chunks": indexed,
-            "carried_forward_chunks": copied,
-            "profile_modality": profile_modality,
-            "chunk_type": chunk_type,
-            "profile_hash": profile_hash,
-            "embedding_batch_hash": batch_hash,
-        },
-    )
-    return IndexResult(
+
+
+def publish_staged_documents(
+    *,
+    ledger: StateLedger,
+    staged: Sequence[StagedDocument],
+) -> list[IndexResult]:
+    """Publish staged documents, one ``stage_and_publish`` per store (Phase 3).
+
+    Documents are grouped by (profile_name, backend, vector_path); each group
+    publishes every staged record in a single locked copy -> upsert -> publish
+    sequence, replacing the historical per-document publish whose copy step
+    made N documents O(N^2). Returns one ``IndexResult`` per input document,
+    in input order (also across groups).
+    """
+    if not staged:
+        return []
+
+    groups: dict[tuple[str, str, Path], list[tuple[int, StagedDocument]]] = {}
+    for position, document in enumerate(staged):
+        key = (document.profile_name, document.backend, document.vector_path)
+        groups.setdefault(key, []).append((position, document))
+
+    results: dict[int, IndexResult] = {}
+    for (profile_name, backend, vector_path), members in groups.items():
+        documents = [document for _, document in members]
+        # Phase 3: the published version is named by a per-run hash over the
+        # group's batch hashes instead of a single document's batch_hash. The
+        # 64-hex shape is unchanged so version-name handling elsewhere behaves
+        # identically, and the hash is deterministic: re-running the same
+        # batch recomputes the same name, so a crash between publish and
+        # bookkeeping self-heals on the next run.
+        run_hash = hashlib.sha256(
+            "\n".join(sorted(document.batch_hash for document in documents)).encode("utf-8")
+        ).hexdigest()
+        store = open_vector_store(
+            vector_path,
+            profile_name=profile_name,
+            dimension=documents[0].dimension,
+            backend=backend,
+        )
+        try:
+            # Sweep leftover staged versions before staging this run. The
+            # run_hash version cannot exist yet, so no exemption is needed;
+            # delete_version itself refuses to delete the active version; and
+            # when a crashed run is retried with the same documents, the
+            # leftover non-active same-named version is exactly what gets
+            # removed here.
+            for version in store.list_versions():
+                if not store.version_is_active(version):
+                    store.delete_version(version)
+            records = [record for document in documents for record in document.records]
+            # Stage records under the deterministic run hash first. Search only
+            # sees this rebuild after publish_version commits, so interrupted
+            # embedding/index runs cannot expose a half-written vector set.
+            # Carrying forward the existing active records for other documents
+            # keeps previously indexed evidence visible in the same profile.
+            # M6: copy -> upsert -> publish runs as one cross-process locked
+            # sequence; two writers must never interleave it.
+            copied, indexed, counts = store.stage_and_publish(
+                records,
+                index_version=run_hash,
+                exclude_document_ids=[document.document_id for document in documents],
+            )
+        finally:
+            store.close()
+
+        # Bookkeeping after publish. A crash inside this window leaves the
+        # group's batch rows "running", so the reuse fast path does not hit on
+        # the next run and the documents are re-embedded and re-published.
+        # That re-publish produces no duplicate rows: the upsert is idempotent
+        # per record_id and the copy step excludes this run's documents. Same
+        # failure-window semantics as the historical single-document path, now
+        # spanning the whole run.
+        for document in documents:
+            ledger.upsert_embedding_batch(
+                batch_hash=document.batch_hash,
+                profile_name=document.profile_name,
+                profile_hash=document.profile_hash,
+                document_id=document.document_id,
+                chunk_type=document.chunk_type,
+                chunk_count=len(document.input_ids),
+                status="completed",
+                provider=document.provider_name,
+                model=document.provider_model,
+                payload={
+                    "input_ids": document.input_ids,
+                    "dimension": document.dimension,
+                    "indexed_chunks": len(document.records),
+                    # Run-level copy count: one stage_and_publish carried every
+                    # member of the group, so each document reports the same
+                    # value.
+                    "carried_forward_chunks": copied,
+                    "vector_path": str(document.vector_path),
+                    # Phase 3: links this batch row to the published version
+                    # (named by run_hash, not batch_hash); consumed by
+                    # diagnostics.vector_index_provenance.
+                    "index_version": run_hash,
+                },
+            )
+        ledger.register_vector_index(
+            profile_name=profile_name,
+            backend=backend,
+            path=vector_path,
+            document_count=counts["documents"],
+            chunk_count=counts["chunks"],
+            # All group members share the same profile, hence the same flag.
+            active=documents[0].profile_enabled,
+            active_version=run_hash,
+        )
+        for position, document in members:
+            ledger.checkpoint(
+                document.document_id,
+                f"embed:{document.profile_name}",
+                "indexed",
+                {
+                    "chunks": len(document.records),
+                    "carried_forward_chunks": copied,
+                    "profile_modality": document.profile_modality,
+                    "chunk_type": document.chunk_type,
+                    "profile_hash": document.profile_hash,
+                    "embedding_batch_hash": document.batch_hash,
+                    "index_version": run_hash,
+                },
+            )
+            results[position] = IndexResult(
+                profile_name=document.profile_name,
+                document_id=document.document_id,
+                indexed_chunks=len(document.records),
+                vector_path=document.vector_path,
+                modality=document.chunk_type,
+                profile_hash=document.profile_hash,
+                embedding_batch_hash=document.batch_hash,
+                reused_existing=False,
+            )
+    return [results[position] for position in range(len(staged))]
+
+
+def index_normalized_document(
+    *,
+    ledger: StateLedger,
+    vector_store_dir: str | Path,
+    profile_name: str,
+    document_id: str,
+    provider: EmbeddingProvider | None = None,
+    allow_stub_provider: bool = False,
+    vector_backend: str | None = None,
+) -> IndexResult:
+    """Index one normalized document into the profile's vector store.
+
+    Phase 3: thin wrapper over the stage/publish split — stage the document,
+    then immediately publish it as a one-document run. Behavior is unchanged
+    except the published version name: it is now the run hash (sha256 of the
+    single batch hash) instead of the batch hash itself.
+    """
+    staged = stage_indexed_document(
+        ledger=ledger,
+        vector_store_dir=vector_store_dir,
         profile_name=profile_name,
         document_id=document_id,
-        indexed_chunks=indexed,
-        vector_path=vector_path,
-        modality=chunk_type,
-        profile_hash=profile_hash,
-        embedding_batch_hash=batch_hash,
+        provider=provider,
+        allow_stub_provider=allow_stub_provider,
+        vector_backend=vector_backend,
     )
+    if isinstance(staged, IndexResult):
+        # Reuse fast path: already completed and published; nothing to do.
+        return staged
+    return publish_staged_documents(ledger=ledger, staged=[staged])[0]
 
 
 def active_vectors_match_embedding_batch(

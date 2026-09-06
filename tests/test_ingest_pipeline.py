@@ -1755,3 +1755,122 @@ class ConcurrentHarvestTests(unittest.TestCase):
                 self.assertTrue(all(key["in_flight"] == 0 for key in pool.list_public_keys()))
             finally:
                 ledger.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: run-level batch publish of embed stages (ingest.batch_publish).
+# ---------------------------------------------------------------------------
+
+from zoterorag.pipeline import ingest as ingest_module  # noqa: E402
+
+
+class BatchPublishIngestTests(unittest.TestCase):
+    def _run_ingest(self, tmpdir: Path, ledger: StateLedger, *, batch_publish: bool = True):
+        extract_manager = ExtractionManager(
+            ledger=ledger,
+            cache_dir=tmpdir / "extract_cache",
+            provider=MarkdownStubExtractorProvider(),
+        )
+        return start_ingest_job(
+            ledger,
+            include_multimodal=True,
+            execute=True,
+            extract_manager=extract_manager,
+            extract_cache_dir=tmpdir / "extract_cache",
+            normalized_dir=tmpdir / "normalized",
+            vector_store_dir=tmpdir / "vectors",
+            batch_publish=batch_publish,
+        )
+
+    def _seed_two_attachments(self, tmpdir: Path, ledger: StateLedger) -> None:
+        seed_profiles(ledger)
+        for key in ("ATT_BP1", "ATT_BP2"):
+            ledger.upsert_attachments([build_attachment_with_file(tmpdir, key, title=f"Paper {key}")])
+
+    def test_batch_publish_publishes_once_per_profile(self) -> None:
+        with workspace_tmpdir("ingest-batch-publish-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                self._seed_two_attachments(tmpdir, ledger)
+                real_publish = ingest_module.publish_staged_documents
+                with patch(
+                    "zoterorag.pipeline.ingest.publish_staged_documents",
+                    side_effect=real_publish,
+                ) as publish_spy:
+                    result = self._run_ingest(tmpdir, ledger)
+
+                self.assertEqual("completed", result["job"]["status"])
+                self.assertEqual(2, len(result["executed"]))
+                self.assertEqual(0, len(result["failed"]))
+                # 2 documents x 2 profiles would be 4 per-document publishes;
+                # batch publish does exactly one per profile.
+                self.assertEqual(2, publish_spy.call_count)
+                for key in ("ATT_BP1", "ATT_BP2"):
+                    self.assertEqual("indexed", ledger.get_checkpoint(key, "embed:text-profile")["status"])
+                    self.assertEqual("indexed", ledger.get_checkpoint(key, "embed:mm-profile")["status"])
+            finally:
+                ledger.close()
+
+    def test_batch_publish_false_falls_back_to_per_document_publish(self) -> None:
+        with workspace_tmpdir("ingest-batch-publish-off-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                self._seed_two_attachments(tmpdir, ledger)
+                real_index = ingest_module.index_normalized_document
+                with patch(
+                    "zoterorag.pipeline.ingest.index_normalized_document",
+                    side_effect=real_index,
+                ) as index_spy, patch(
+                    "zoterorag.pipeline.ingest.publish_staged_documents",
+                ) as publish_spy:
+                    result = self._run_ingest(tmpdir, ledger, batch_publish=False)
+
+                self.assertEqual("completed", result["job"]["status"])
+                self.assertEqual(2, len(result["executed"]))
+                # Legacy path: one index call per document per profile, and
+                # the run-level batch publish never engages.
+                self.assertEqual(4, index_spy.call_count)
+                publish_spy.assert_not_called()
+                for key in ("ATT_BP1", "ATT_BP2"):
+                    self.assertEqual("indexed", ledger.get_checkpoint(key, "embed:text-profile")["status"])
+                    self.assertEqual("indexed", ledger.get_checkpoint(key, "embed:mm-profile")["status"])
+            finally:
+                ledger.close()
+
+    def test_partial_publish_failure_marks_only_failed_groups_documents(self) -> None:
+        with workspace_tmpdir("ingest-batch-publish-partial-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                self._seed_two_attachments(tmpdir, ledger)
+                real_publish = ingest_module.publish_staged_documents
+
+                def failing_publish(*, ledger, staged):
+                    if staged and staged[0].profile_name == "mm-profile":
+                        raise RuntimeError("simulated mm publish failure")
+                    return real_publish(ledger=ledger, staged=staged)
+
+                with patch(
+                    "zoterorag.pipeline.ingest.publish_staged_documents",
+                    side_effect=failing_publish,
+                ):
+                    result = self._run_ingest(tmpdir, ledger)
+
+                self.assertEqual("completed_with_errors", result["job"]["status"])
+                # Both documents staged the mm profile, so both fail; the text
+                # profile group published fine.
+                self.assertEqual(2, len(result["failed"]))
+                self.assertEqual(0, len(result["executed"]))
+                for key in ("ATT_BP1", "ATT_BP2"):
+                    # Text profile published; mm stays "running" so the next
+                    # run retries it.
+                    self.assertEqual("indexed", ledger.get_checkpoint(key, "embed:text-profile")["status"])
+                    self.assertEqual("running", ledger.get_checkpoint(key, "embed:mm-profile")["status"])
+                events = ledger.list_job_events(result["job"]["job_id"])
+                publish_failures = [
+                    event for event in events
+                    if event["stage"] == "embed_publish" and event["status"] == "failed"
+                ]
+                self.assertEqual(1, len(publish_failures))
+                self.assertEqual("mm-profile", publish_failures[0]["payload"]["profile_name"])
+            finally:
+                ledger.close()

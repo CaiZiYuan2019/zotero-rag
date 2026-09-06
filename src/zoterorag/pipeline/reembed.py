@@ -6,7 +6,7 @@ import traceback
 from typing import Any
 
 from ..db import JobEvent, StateLedger
-from ..embeddings import index_normalized_document
+from ..embeddings import IndexResult, publish_staged_documents, stage_indexed_document
 from ..embeddings.indexer import require_embedding_profile, vector_path_for_profile
 from ..embeddings.profile import embedding_profile_hash
 from ..index import open_vector_store
@@ -69,8 +69,11 @@ def start_reembed_job(
 
     When execute=True, each pending document is re-embedded using the configured
     profile. The embedding provider is auto-resolved from the profile and
-    environment by ``index_normalized_document``. Set ``allow_stub_provider=True``
+    environment by ``stage_indexed_document``. Set ``allow_stub_provider=True``
     to force stub embeddings even for non-stub profiles (useful for testing).
+
+    Phase 3: documents are staged one by one and the whole run is published
+    once via ``publish_staged_documents`` instead of publishing per document.
     """
 
     require_embedding_profile(ledger, profile_name)
@@ -109,6 +112,9 @@ def start_reembed_job(
         executed = []
         skipped = []
         failed = []
+        # Phase 3: staged (document, StagedDocument) pairs awaiting the
+        # run-level publish after the loop.
+        staged_docs: list[tuple[dict[str, Any], Any]] = []
         ledger.set_job_status(job_id, "running")
         try:
             for document in plan["documents"]:
@@ -125,24 +131,30 @@ def start_reembed_job(
                     )
                     continue
                 try:
-                    result = index_normalized_document(
+                    outcome = stage_indexed_document(
                         ledger=ledger,
                         vector_store_dir=vector_store_dir,
                         profile_name=profile_name,
                         document_id=document["document_id"],
                         allow_stub_provider=allow_stub_provider,
                     )
-                    result_payload = result.to_dict()
-                    executed.append(result_payload)
-                    ledger.add_event(
-                        JobEvent(
-                            job_id=job_id,
-                            stage=f"embed:{profile_name}",
-                            status="indexed",
-                            message=f"indexed {result.indexed_chunks} chunks for {document['document_id']}",
-                            payload=result_payload,
+                    if isinstance(outcome, IndexResult):
+                        # Reuse fast path: already published; count it now.
+                        result_payload = outcome.to_dict()
+                        executed.append(result_payload)
+                        ledger.add_event(
+                            JobEvent(
+                                job_id=job_id,
+                                stage=f"embed:{profile_name}",
+                                status="indexed",
+                                message=f"indexed {outcome.indexed_chunks} chunks for {document['document_id']}",
+                                payload=result_payload,
+                            )
                         )
-                    )
+                    else:
+                        # Staged only; executed/event deferred to the publish
+                        # below, when the vectors are actually visible.
+                        staged_docs.append((document, outcome))
                 except (FileNotFoundError, KeyError, ValueError, RuntimeError, RerankNotSupportedError) as exc:
                     failed.append({"document": document, "error": str(exc)})
                     ledger.add_event(
@@ -167,6 +179,43 @@ def start_reembed_job(
                             payload={"document": document, "error": str(exc), "traceback": error_text},
                         )
                     )
+
+            # Phase 3: publish every staged document of this run in one go. A
+            # publish failure marks all staged documents failed (their batch
+            # rows stay "running", so the next run retries them) and the final
+            # status naturally lands on completed_with_errors.
+            if staged_docs:
+                try:
+                    publish_results = publish_staged_documents(
+                        ledger=ledger,
+                        staged=[outcome for _, outcome in staged_docs],
+                    )
+                except Exception as exc:
+                    error_text = traceback.format_exc()
+                    for document, _ in staged_docs:
+                        failed.append({"document": document, "error": str(exc), "traceback": error_text})
+                        ledger.add_event(
+                            JobEvent(
+                                job_id=job_id,
+                                stage=f"embed:{profile_name}",
+                                status="failed",
+                                message=f"{document['document_id']}: publish failed: {exc}",
+                                payload={"document": document, "error": str(exc), "traceback": error_text},
+                            )
+                        )
+                else:
+                    for (document, _), result in zip(staged_docs, publish_results):
+                        result_payload = result.to_dict()
+                        executed.append(result_payload)
+                        ledger.add_event(
+                            JobEvent(
+                                job_id=job_id,
+                                stage=f"embed:{profile_name}",
+                                status="indexed",
+                                message=f"indexed {result.indexed_chunks} chunks for {document['document_id']}",
+                                payload=result_payload,
+                            )
+                        )
 
             final_status = "completed" if not failed else "completed_with_errors"
             ledger.add_event(

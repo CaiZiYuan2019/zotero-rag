@@ -216,3 +216,55 @@ default_for_multimodal = false
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VectorProvenanceRunHashTests(unittest.TestCase):
+    def test_active_run_hash_matches_via_payload_index_version(self) -> None:
+        """Phase 3: batch-published versions are named by a per-run hash, so
+        provenance must follow payload["index_version"] back to batch rows."""
+        with workspace_tmpdir("diagnostics-provenance-runhash-") as tmpdir:
+            ledger = StateLedger(tmpdir / "state.sqlite")
+            try:
+                ledger.upsert_embedding_profiles(
+                    [
+                        EmbeddingProfile(
+                            name="stub_text",
+                            provider="stub",
+                            model="stub",
+                            dimension=8,
+                            modality="text",
+                            enabled=True,
+                            default_for_text=True,
+                            backend="sqlite-local",
+                        )
+                    ]
+                )
+                ledger.register_vector_index(
+                    profile_name="stub_text",
+                    backend="sqlite-local",
+                    path=tmpdir / "vectors" / "stub_text" / "vectors.sqlite",
+                    document_count=2,
+                    chunk_count=4,
+                    active=True,
+                    active_version="run-hash-abc",
+                )
+                ledger.upsert_embedding_batch(
+                    batch_hash="batch-doc-1",
+                    profile_name="stub_text",
+                    profile_hash="profile-hash",
+                    document_id="DOC1",
+                    chunk_type="text",
+                    chunk_count=2,
+                    status="completed",
+                    provider="stub",
+                    model="stub",
+                    payload={"index_version": "run-hash-abc"},
+                )
+                config = make_config(tmpdir)
+                build_minimal_zotero_db(config.paths.shadow_db)
+
+                item = run_runtime_diagnostics(config, ledger)["checks"]["vectors"]["indexes"][0]
+                self.assertEqual("tracked_active_version", item["provenance"]["status"])
+                self.assertTrue(item["provenance"]["active_version_has_completed_batch"])
+            finally:
+                ledger.close()
