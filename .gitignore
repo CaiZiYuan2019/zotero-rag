@@ -47,6 +47,7 @@ Thumbs.db
 .vscode/
 .tmp/
 .tmp-test-work/
+.temp/
 
 # Build artifacts
 *.egg-info/
@@ -60,3 +61,9 @@ docs/CODEBASE_AUDIT_REPORT.md
 
 # search report
 report/
+
+#sensitive
+docs/DATA_HYGIENE_ISSUES_20260909.md
+
+#lock
+uv.lock
