@@ -48,6 +48,7 @@ Thumbs.db
 .tmp/
 .tmp-test-work/
 .temp/
+.temp_docs/
 
 # Build artifacts
 *.egg-info/
