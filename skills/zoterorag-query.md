@@ -25,7 +25,7 @@
 - **简单查询（默认）**：查某篇文献、列出集合命中或定位一段解析文本时，主代理直接选用下列命令，给出结果与出处。需要报告时再执行步骤 8。
 - **精确查询**：用户要求精查、跨文献综合、独立复核或逐次查询可追溯时，主代理界定范围并发起检索，再把命中文档交给精读者。精读完成后，另派专职复核者独立核查重要结论，最后由主代理评估两方证据、完成报告。分派前阅读[精确查询流程与子代理提示词](zoterorag-query/precise-query.md)。
 
-主代理和各子代理只用项目台账、已有书目元数据副本、解析文档及其图像。`document.md` 是解析文本。源 Zotero 库和原始 PDF 仅供用户本人手工阅读、核对或写作。查询跳过既有 `report/`。
+主代理和各子代理只用项目台账、已有书目元数据副本、解析文档及其图像。`document.md` 是解析文本。源 Zotero 库和原始 PDF 仅供用户本人手工阅读、核对或写作。若用户未提及，默认跳过 `report/` 中的内容。
 
 ## 标准查询流程
 
@@ -83,7 +83,7 @@
 .conda/Scripts/zoterorag.exe search-by-collection 26TP7I8G --include-children --query "bat"
 ```
 
-默认**不**包含子集合。负例校验：在「超微结构」搜只存在于「杂」的词（如 deepseek）应为空。
+默认**不**包含子集合。
 
 ### 步骤 3：全文检索（方法学术语优先）
 
@@ -172,14 +172,13 @@ FTS 无命中时会 LIKE 回退；该路径无 BM25，会降级为自定义分�
 | 目标 | 优先手段 |
 |------|----------|
 | 作者 / 年份 / 题名 / DOI / 文件夹 | `search-metadata` 或 `search-by-collection` |
-| 固定液、试剂、方法细节（如 glutaraldehyde、戊二醛） | `search-fulltext`（必要时再向量） |
+| 固定液、试剂、方法细节| `search-fulltext`（必要时再向量） |
 | 语义问题、机制描述 | `search-vector --mode text` |
-| 图示 / 超微结构图像 | `search-vector --mode multimodal` |
+| 图示 / 图像 | `search-vector --mode multimodal` |
 | 排序对比 | 同一查询分别跑 `--sort-by score` 与 `--sort-by bm25` |
 
-实库抽检（超微结构 `26TP7I8G`）：
+## 可能的问题参考
 
-- `glutaraldehyde` + `sort-by bm25`：元数据/集合内可命中（如 Nakajima 1971）；全文 BM25 正常且分数 > 0。
 - `戊二醛`：元数据常为 0；全文可命中（可能走 LIKE，BM25 分数形态接近加权分）。
 - `Glutaric dialdehyde`：文献多用 `glutaraldehyde`，前者可能 0 命中——应改用常用英文拼写。
 - `GA`：高度歧义（GABA 等）；`score` 可用，`bm25` 可能因 FTS→LIKE 回退而为 0——改用完整词。
