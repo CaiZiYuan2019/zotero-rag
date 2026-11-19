@@ -8,14 +8,14 @@
 
 - Zotero 中新增或修改了文献，需要把变化增量入库；
 - 需要先看计划、确认待处理量，再决定是否真正执行；
-- 建库耗时较长（MinerU 提取 + 向量化），需要在**另一个上下文**里持续跟踪进度而不阻塞主流程；
+- 建库耗时较长（OCR 提取 + 向量化），需要在**另一个上下文**里持续跟踪进度而不阻塞主流程；
 - 中断/崩溃后需要判断当前状态并续跑。
 
 ## 前置条件
 
 1. 工作目录为 ZoteroRAG 项目根目录（如 `E:/ZoteroRAG`）。
 2. `.conda` 环境可用（`.conda/python.exe`）。
-3. `.env` 中已配置 `MINERU_KEY`（可多把，逗号分隔）与 `BAILIAN_KEY`。
+3. 按配置文件的 `extract.provider` 准备 OCR 密钥。默认 `deepseek` 使用 `.env` 中单个 `DEEPSEEK_KEY`，选择 `mineru` 时使用 `MINERU_KEY`（可多把，逗号分隔）。向量化使用 `BAILIAN_KEY`。
 4. 执行前确认没有其他 ingest/reembed 在跑（runner 锁 `data/state/ingest_runner.lock` 不应存在）。
 
 ## 标准流程
@@ -26,7 +26,7 @@
 .conda/python.exe -m zoterorag providers status
 ```
 
-确认 MinerU key 数量、冷却状态（`cooldown_remaining_seconds` 应为 0）以及 `BAILIAN_KEY` 已配置。
+确认所选 OCR 与 `qwen3vl_embedding` 的 `configured` 均为 `true`。
 
 ### 步骤 1：扫描（**必须先做**）
 
@@ -135,7 +135,7 @@ print('executed', len(d['executed']), 'skipped', len(d['skipped']),
 ## 监视器已知盲区
 
 **按 `attachment_key` 统计，重复附件会漏计。**
-若同一份 PDF 在 Zotero 中被导入两次（字节完全相同 ⇒ `pdf_sha256` 相同 ⇒ `cache_key` 相同），MinerU 提取会被缓存去重：两个文档**共享同一批 segment job**，而 job 行只挂在其中一个 `attachment_key` 下。此时监视器会把另一个附件一直显示为 `none`，得出错误的 `7/8`。
+若同一份 PDF 在 Zotero 中被导入两次（字节完全相同 ⇒ `pdf_sha256` 相同 ⇒ `cache_key` 相同），同一 OCR 配置的提取会被缓存去重：两个文档**共享同一批 segment job**，而 job 行只挂在其中一个 `attachment_key` 下。此时监视器会把另一个附件一直显示为 `none`，得出错误的 `7/8`。
 
 **判据**：若终态时某篇仍为 `none`，但 `ingest_execute_*.err` 里该 key 有完整的 `normalize:` / `embed:` 行，则大概率是重复附件，而非失败。可查 `checkpoints` 表的 `extract` 阶段 `segment_job_ids` 确认两个文档是否指向同一批 job。
 

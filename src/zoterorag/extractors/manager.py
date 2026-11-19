@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +20,7 @@ from .cache import (
     sha256_file,
     stable_options_hash,
 )
+from .deepseek import DeepSeekIncompleteResult, DeepSeekOCRError
 from .mineru import MinerUAPIError, PollTimeoutError
 from .recovery import classify_extract_job
 from .key_pool import ApiKeyRef, ExtractorKeyPool
@@ -86,7 +87,9 @@ def extraction_cache_context(
     selected_pages = canonical_selected_pages(request.selected_pages)
     options = dict(request.options or {})
     if "timeout_seconds" not in options:
-        options["timeout_seconds"] = recommended_mineru_timeout_seconds(request.selected_page_count)
+        options["timeout_seconds"] = (
+            210 if provider.name == "deepseek" else recommended_mineru_timeout_seconds(request.selected_page_count)
+        )
     options_hash = stable_options_hash(options)
     endpoint_url = getattr(provider, "apply_upload_url", "") or getattr(provider, "endpoint", "")
     cache_key = extractor_cache_key(
@@ -139,8 +142,10 @@ class ExtractionManager:
         max_resubmit_attempts: int = 3,
         rate_limit_cooldown_seconds: float = 180.0,
         auth_failure_cooldown_seconds: float = 3600.0,
+        resume_manager_for: Callable[[str], ExtractionManager] | None = None,
     ) -> None:
         self.ledger = ledger
+        self.resume_manager_for = resume_manager_for
         self.cache_dir = Path(cache_dir)
         self.provider = provider or StubExtractorProvider()
         self.key_pool = key_pool or ExtractorKeyPool()
@@ -254,7 +259,7 @@ class ExtractionManager:
         # MinerUAPIError branch: PollTimeoutError is a subclass).
         if isinstance(exc, PollTimeoutError):
             return 0.0
-        if isinstance(exc, MinerUAPIError):
+        if isinstance(exc, (MinerUAPIError, DeepSeekOCRError)):
             if exc.status_code == 429:
                 return float(self.rate_limit_cooldown_seconds)
             if exc.status_code in (401, 403):
@@ -381,6 +386,8 @@ class ExtractionManager:
         existing = self.ledger.get_extract_job_by_cache_key(cache_key)
         if existing is not None and existing["state"] in REUSABLE_EXTRACT_STATES:
             return ExtractionResult(job=existing, cache_hit=True)
+        if existing is not None and existing["state"] == "failed_manual_review":
+            raise RuntimeError(f"extract job {existing['job_id']} requires manual review: {existing.get('error_message')}")
         if existing is not None and self._lifetime_exceeded(existing):
             # 决策1: a non-reusable job past its lifetime cap must not be
             # auto-resubmitted; upsert_extract_job COALESCEs submitted_at, so
@@ -731,6 +738,12 @@ class ExtractionManager:
                 job=self.ledger.get_extract_job(job_id=job["job_id"]) or job,
                 cache_hit=False,
             )
+        except DeepSeekIncompleteResult as exc:
+            self.ledger.set_extract_job_state(
+                job["job_id"], state="failed_manual_review", local_stage="error",
+                error_code=type(exc).__name__, error_message=str(exc),
+            )
+            raise
         except Exception as exc:
             # Download-stage catch-all (same historical semantics as before).
             if api_key is not None:
@@ -780,6 +793,9 @@ class ExtractionManager:
         job = self.ledger.get_extract_job(job_id=job_id)
         if job is None:
             raise KeyError(f"extract job not found: {job_id}")
+        recorded_provider = job.get("provider")
+        if self.resume_manager_for and recorded_provider and recorded_provider != self.provider.name:
+            return self.resume_manager_for(recorded_provider).resume_extraction(job_id)
         recovery = classify_extract_job(job)
         if recovery.action == "skip":
             return ExtractionResult(job=job, cache_hit=True)

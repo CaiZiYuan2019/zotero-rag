@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..db import StateLedger
+from .identity import document_identities
 from .results import SearchResult, ensure_rerank_disabled, sanitize_results_for_consumer
 
 
@@ -32,6 +33,7 @@ def fulltext_search(
         sort_by=sort_by,
         match_mode=match_mode,
     )
+    identities = document_identities(ledger, (row["document_id"] for row in rows))
     results = []
     for row in rows:
         images = []
@@ -44,22 +46,21 @@ def fulltext_search(
                     "file_ref": metadata.get("image_path"),
                 }
             )
-        results.append(
-            SearchResult(
-                document_id=row["document_id"],
-                chunk_id=row["chunk_id"],
-                title=row["document_id"],
-                text=row["text"],
-                score=float(row.get("score", 0.0)),
-                metadata={
-                    **metadata,
-                    "chunk_type": row["chunk_type"],
-                    "heading_path": row.get("heading_path", []),
-                    "updated_at": row.get("updated_at"),
-                },
-                images=images,
-            )
+        result = SearchResult(
+            document_id=row["document_id"],
+            chunk_id=row["chunk_id"],
+            title=row["document_id"],
+            text=row["text"],
+            score=float(row.get("score", 0.0)),
+            metadata={
+                **metadata,
+                "chunk_type": row["chunk_type"],
+                "heading_path": row.get("heading_path", []),
+                "updated_at": row.get("updated_at"),
+            },
+            images=images,
         )
+        results.append(identities[row["document_id"]].enrich_result(result.to_dict()))
     return sanitize_results_for_consumer(
         results,
         consumer=consumer,  # type: ignore[arg-type]

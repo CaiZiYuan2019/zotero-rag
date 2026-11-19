@@ -61,6 +61,7 @@ class LanceDBVectorStoreBehaviorTests(unittest.TestCase):
     def setUp(self) -> None:
         self.mock_db = MagicMock()
         clear_lancedb_cache()
+        self.vector_dir = self.enterContext(workspace_tmpdir("lancedb-behavior-")) / "vectors"
 
     def test_active_version_returns_legacy_when_meta_table_missing(self) -> None:
         self.mock_db.open_table.side_effect = RuntimeError("table not found")
@@ -70,7 +71,7 @@ class LanceDBVectorStoreBehaviorTests(unittest.TestCase):
             "zoterorag.index.lancedb_vector._import_lancedb",
             return_value=self._mock_lancedb_module(),
         ):
-            store = LanceDBVectorStore("/tmp/vectors", profile_name="p1", dimension=3)
+            store = LanceDBVectorStore(self.vector_dir, profile_name="p1", dimension=3)
             self.assertEqual("legacy", store.active_version())
 
     def test_active_version_returns_legacy_when_only_legacy_table(self) -> None:
@@ -81,7 +82,7 @@ class LanceDBVectorStoreBehaviorTests(unittest.TestCase):
             "zoterorag.index.lancedb_vector._import_lancedb",
             return_value=self._mock_lancedb_module(),
         ):
-            store = LanceDBVectorStore("/tmp/vectors", profile_name="p1", dimension=3)
+            store = LanceDBVectorStore(self.vector_dir, profile_name="p1", dimension=3)
             self.assertEqual("legacy", store.active_version())
 
     def test_active_version_raises_when_meta_lost_but_versioned_tables_exist(
@@ -96,7 +97,7 @@ class LanceDBVectorStoreBehaviorTests(unittest.TestCase):
             "zoterorag.index.lancedb_vector._import_lancedb",
             return_value=self._mock_lancedb_module(),
         ):
-            store = LanceDBVectorStore("/tmp/vectors", profile_name="p1", dimension=3)
+            store = LanceDBVectorStore(self.vector_dir, profile_name="p1", dimension=3)
             with self.assertRaises(RuntimeError) as ctx:
                 store.active_version()
             self.assertIn("vectors verify --profile p1", str(ctx.exception))
@@ -112,7 +113,7 @@ class LanceDBVectorStoreBehaviorTests(unittest.TestCase):
             "zoterorag.index.lancedb_vector._import_lancedb",
             return_value=self._mock_lancedb_module(),
         ):
-            store = LanceDBVectorStore("/tmp/vectors", profile_name="p1", dimension=3)
+            store = LanceDBVectorStore(self.vector_dir, profile_name="p1", dimension=3)
             self.assertEqual("legacy", store.active_version())
 
     def test_active_version_raises_on_severe_error(self) -> None:
@@ -121,7 +122,7 @@ class LanceDBVectorStoreBehaviorTests(unittest.TestCase):
             "zoterorag.index.lancedb_vector._import_lancedb",
             return_value=self._mock_lancedb_module(),
         ):
-            store = LanceDBVectorStore("/tmp/vectors", profile_name="p1", dimension=3)
+            store = LanceDBVectorStore(self.vector_dir, profile_name="p1", dimension=3)
             with self.assertRaises(RuntimeError):
                 store.active_version()
 
@@ -131,7 +132,7 @@ class LanceDBVectorStoreBehaviorTests(unittest.TestCase):
             "zoterorag.index.lancedb_vector._import_lancedb",
             return_value=self._mock_lancedb_module(),
         ):
-            store = LanceDBVectorStore("/tmp/vectors", profile_name="p1", dimension=3)
+            store = LanceDBVectorStore(self.vector_dir, profile_name="p1", dimension=3)
             self.assertEqual([], store.search([1.0, 0.0, 0.0]))
 
     def test_search_raises_on_severe_open_error(self) -> None:
@@ -140,7 +141,7 @@ class LanceDBVectorStoreBehaviorTests(unittest.TestCase):
             "zoterorag.index.lancedb_vector._import_lancedb",
             return_value=self._mock_lancedb_module(),
         ):
-            store = LanceDBVectorStore("/tmp/vectors", profile_name="p1", dimension=3)
+            store = LanceDBVectorStore(self.vector_dir, profile_name="p1", dimension=3)
             with self.assertRaises(RuntimeError):
                 store.search([1.0, 0.0, 0.0])
 
@@ -151,7 +152,7 @@ class LanceDBVectorStoreBehaviorTests(unittest.TestCase):
             "zoterorag.index.lancedb_vector._import_lancedb",
             return_value=self._mock_lancedb_module(),
         ):
-            store = LanceDBVectorStore("/tmp/vectors", profile_name="p1", dimension=3)
+            store = LanceDBVectorStore(self.vector_dir, profile_name="p1", dimension=3)
             with self.assertRaises(RuntimeError):
                 store._delete_records(table, ["p1:c1"])
 
@@ -161,7 +162,7 @@ class LanceDBVectorStoreBehaviorTests(unittest.TestCase):
             "zoterorag.index.lancedb_vector._import_lancedb",
             return_value=self._mock_lancedb_module(),
         ):
-            store = LanceDBVectorStore("/tmp/vectors", profile_name="p1", dimension=3)
+            store = LanceDBVectorStore(self.vector_dir, profile_name="p1", dimension=3)
             with self.assertRaises(RuntimeError):
                 store._ensure_table("vectors_v1", [])
 
@@ -171,7 +172,7 @@ class LanceDBVectorStoreBehaviorTests(unittest.TestCase):
             "zoterorag.index.lancedb_vector._import_lancedb",
             return_value=self._mock_lancedb_module(),
         ):
-            store = LanceDBVectorStore("/tmp/vectors", profile_name="p1", dimension=3)
+            store = LanceDBVectorStore(self.vector_dir, profile_name="p1", dimension=3)
             with self.assertRaises(RuntimeError):
                 store.counts()
 
@@ -193,7 +194,7 @@ class LanceDBVectorStoreBehaviorTests(unittest.TestCase):
             "zoterorag.index.lancedb_vector._import_lancedb",
             return_value=self._mock_lancedb_module(),
         ):
-            store = LanceDBVectorStore("/tmp/vectors", profile_name="p1", dimension=3)
+            store = LanceDBVectorStore(self.vector_dir, profile_name="p1", dimension=3)
             self.assertEqual(
                 0, store.copy_active_records_to_version(index_version="v2")
             )

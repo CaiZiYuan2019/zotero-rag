@@ -8,7 +8,9 @@ from urllib.parse import urlparse
 
 from .embeddings import Qwen3VLEmbeddingProvider
 from .embeddings.qwen import DASHSCOPE_MULTIMODAL_EMBEDDING_URL, DEFAULT_DOCUMENT_INSTRUCTION, DEFAULT_QUERY_INSTRUCTION
-from .extractors import ExtractorKeyPool, MinerUProvider
+from .config.settings import ExtractConfig
+from .db import StateLedger
+from .extractors import ApiKeyRef, ExtractionManager, ExtractorKeyPool, MinerUProvider
 from .extractors.key_pool import load_dotenv_values
 from .extractors.mineru import APPLY_UPLOAD_URL, BATCH_RESULT_URL
 
@@ -61,6 +63,7 @@ def provider_readiness(env_path: str | Path = ".env") -> dict[str, Any]:
     return {
         "env_path": str(env.env_path),
         "env_exists": env.env_path.is_file(),
+        "deepseek": {"configured": env.first_present(("DEEPSEEK_KEY",)) is not None},
         "mineru": {
             "configured": mineru_pool.has_keys(),
             "key_count": len(mineru_pool.list_public_keys()),
@@ -113,6 +116,38 @@ def build_mineru_provider(env_path: str | Path = ".env", *, client: Any = None) 
         apply_upload_url=apply_upload_url,
         batch_result_url=batch_result_url,
     )
+
+
+def build_extraction_manager(
+    ledger: StateLedger, cache_dir: Path, env_path: Path, config: ExtractConfig,
+) -> ExtractionManager:
+    """Use the configured OCR service for new work and the recorded one on resume."""
+    def manager_for(provider_name: str) -> ExtractionManager:
+        if provider_name == "deepseek":
+            from .extractors.deepseek import DeepSeekOCRProvider
+
+            provider = DeepSeekOCRProvider()
+            key = ProviderEnvironment.load(env_path).first_present(("DEEPSEEK_KEY",))
+            keys = [ApiKeyRef("deepseek", key[1])] if key else []
+            pool = ExtractorKeyPool(keys, per_key_submit_concurrency=config.deepseek_concurrency)
+        elif provider_name == "mineru":
+            provider = build_mineru_provider(env_path)
+            pool = ExtractorKeyPool.from_env_file(
+                env_path, per_key_submit_concurrency=config.per_key_submit_concurrency,
+            )
+        else:
+            raise ValueError(f"unsupported OCR provider for extraction job: {provider_name}")
+        return ExtractionManager(
+            ledger=ledger, cache_dir=cache_dir, provider=provider, key_pool=pool,
+            resume_manager_for=manager_for,
+            submit_min_interval_seconds=config.submit_min_interval_seconds if provider_name == "mineru" else 0,
+            poll_max_per_minute=config.poll_max_per_minute if provider_name == "mineru" else 0,
+            job_max_lifetime_seconds=config.job_max_lifetime_seconds,
+            poll_interval_seconds=config.poll_interval_seconds,
+            max_resubmit_attempts=config.max_resubmit_attempts,
+        )
+
+    return manager_for(config.provider)
 
 
 def build_qwen_embedding_provider(

@@ -22,7 +22,7 @@ from ..normalize.merge_extract_segments import (
 )
 from ..pdf_pages import get_pdf_page_count
 from ..search.results import RerankNotSupportedError
-from ..extractors.segments import compute_page_segments
+from ..extractors.segments import PageSegment, compute_page_segments
 from ..extractors.cache import UNKNOWN_PAGE_COUNT_FALLBACK, sha256_file
 from ..config.settings import ExtractConfig
 from .runner import acquire_runner_lock
@@ -98,6 +98,7 @@ def start_ingest_job(
     vector_store_dir: str | Path | None = None,
     extract_config: ExtractConfig | None = None,
     batch_publish: bool = True,
+    embedding_env_path: str | Path = ".env",
 ) -> dict[str, Any]:
     """Create a persisted ingest job and optionally execute it.
 
@@ -156,6 +157,7 @@ def start_ingest_job(
         ledger.set_job_status(job_id, "running")
         return _execute_ingest_documents(
             ledger,
+            embedding_env_path=embedding_env_path,
             job_id=job_id,
             plan=plan,
             extract_manager=extract_manager,
@@ -200,6 +202,7 @@ def _execute_ingest_documents(
     vector_store_dir: str | Path,
     extract_config: ExtractConfig | None,
     batch_publish: bool = True,
+    embedding_env_path: str | Path = ".env",
 ) -> dict[str, Any]:
     """Shared execution body of start_ingest_job and resume --execute (M7).
 
@@ -251,6 +254,7 @@ def _execute_ingest_documents(
             try:
                 _progress(f"[{idx}/{total}] {title}")
                 result = _execute_document_stages(
+                    embedding_env_path=embedding_env_path,
                     ledger=ledger,
                     job_id=job_id,
                     document=document,
@@ -591,6 +595,7 @@ def resume_ingest_job(
     vector_store_dir: str | Path | None = None,
     extract_config: ExtractConfig | None = None,
     batch_publish: bool = True,
+    embedding_env_path: str | Path = ".env",
 ) -> dict[str, Any]:
     """Rebuild the plan for an existing ingest job; with execute=True, also run it.
 
@@ -682,6 +687,7 @@ def resume_ingest_job(
         ledger.set_job_status(job_id, "running")
         return _execute_ingest_documents(
             ledger,
+            embedding_env_path=embedding_env_path,
             job_id=job_id,
             plan=plan,
             extract_manager=extract_manager,
@@ -792,7 +798,8 @@ def stage_for_extract(
     segment_job_ids = (checkpoint.get("payload") or {}).get("segment_job_ids") if checkpoint else None
     if segment_job_ids and not force:
         all_done, segment_jobs = _all_segment_jobs_done(segment_job_ids, ledger)
-        if all_done:
+        merged_md = Path(checkpoint["payload"].get("merged_markdown") or "")
+        if all_done and checkpoint["status"] == "done" and merged_md.is_file():
             return {
                 "stage": "extract",
                 "status": "done",
@@ -820,6 +827,11 @@ def stage_for_extract(
             "segment_job_ids": segment_job_ids,
         }
 
+    # A crash can leave downloaded segments in the ledger before the merge.
+    # Recover the saved plan instead of treating a single segment as a document.
+    if checkpoint and not force and (checkpoint.get("payload") or {}).get("segment_size"):
+        return {"stage": "extract", "status": "pending", "reason": "segments_in_progress"}
+    extract_jobs = [job for job in extract_jobs if not job.get("selected_pages")]
     done = next((job for job in extract_jobs if job["state"] in DONE_EXTRACT_STATES), None)
     if done is not None and not force:
         return {"stage": "extract", "status": "done", "job_id": done["job_id"], "state": done["state"]}
@@ -834,9 +846,13 @@ def stage_for_extract(
             "reason": "completed_artifact_not_downloaded",
             "job_id": completed_job["job_id"],
         }
+    if artifact is None and not force:
+        active_job = next((job for job in extract_jobs if job["state"] in {"submitted", "running", "empty-result"}), None)
+        if active_job:
+            return {"stage": "extract", "status": "pending", "reason": "resume_in_progress", "job_id": active_job["job_id"]}
     if artifact is not None and not force:
         return {"stage": "extract", "status": "done", "reason": "normalized_artifact_exists"}
-    return {"stage": "extract", "status": "pending", "reason": "full_rebuild" if force and done else "no_cached_extract"}
+    return {"stage": "extract", "status": "pending", "reason": "full_rebuild" if force else "no_cached_extract"}
 
 
 def stage_for_artifact(artifact: dict[str, Any] | None, *, force: bool) -> dict[str, Any]:
@@ -990,6 +1006,7 @@ def _execute_document_stages(
     vector_store_dir: Path,
     extract_config: ExtractConfig,
     embed_collector: list[dict[str, Any]] | None = None,
+    embedding_env_path: str | Path = ".env",
 ) -> dict[str, Any]:
     """Execute pending stages for a single document, resuming from checkpoints.
 
@@ -1046,6 +1063,7 @@ def _execute_document_stages(
         elif stage_name.startswith("embed:"):
             profile_name = stage_name[len("embed:"):]
             _execute_embed_stage(
+                embedding_env_path=embedding_env_path,
                 ledger=ledger,
                 job_id=job_id,
                 document_id=document_id,
@@ -1072,7 +1090,7 @@ def _execute_extract_stage(
     extract_cache_dir: Path,
     extract_config: ExtractConfig,
 ) -> str:
-    """Run MinerU extraction for one attachment, splitting large PDFs into segments.
+    """Run OCR extraction for one attachment, splitting large PDFs into segments.
 
     M9: returns "done" when a complete extraction artifact is checkpointed, or
     "blocked" when remote batches are still running and the checkpoint records
@@ -1080,7 +1098,7 @@ def _execute_extract_stage(
     document failures).
     """
 
-    from ..extractors.manager import ExtractionRequest
+    from ..extractors.manager import ExtractionRequest, ExtractionResult
 
     extract_stage = next((s for s in document["stages"] if s["stage"] == "extract"), None)
     if extract_stage is None or extract_stage["status"] not in {"pending", "blocked"}:
@@ -1101,54 +1119,46 @@ def _execute_extract_stage(
     # split extractions can be resumed without relying on the checkpoint
     # that we are about to overwrite with the "running" status.
     segment_job_ids = extract_stage.get("segment_job_ids")
-    merged_artifact_dir = extract_stage.get("merged_artifact_dir")
     is_full_rebuild = extract_stage.get("reason") == "full_rebuild"
 
-    running_payload: dict[str, Any] = {"job_id": job_id, "input_file": str(file_path)}
-    if segment_job_ids is not None:
-        running_payload["segment_job_ids"] = segment_job_ids
-    if merged_artifact_dir is not None:
-        running_payload["merged_artifact_dir"] = merged_artifact_dir
-
-    ledger.checkpoint(
-        attachment_key,
-        "extract",
-        "running",
-        running_payload,
-    )
-
-    # If a previous run already split this attachment, resume the segments.
-    if segment_job_ids and not is_full_rebuild:
-        _progress(f"  extract: resuming {len(segment_job_ids)} segments...")
-        segment_jobs = _resume_segment_jobs(segment_job_ids, extract_manager, ledger)
-        if _all_jobs_downloaded(segment_jobs):
-            _merge_and_checkpoint_segments(
-                ledger=ledger,
-                job_id=job_id,
-                attachment_key=attachment_key,
-                segment_jobs=segment_jobs,
-                extract_cache_dir=extract_cache_dir,
-                merged_artifact_dir=merged_artifact_dir,
-                # This branch only runs when not is_full_rebuild (guard at
-                # the top), so force is always False here; passed explicitly
-                # to keep the contract visible.
-                force=is_full_rebuild,
-            )
-            return "done"
-        _checkpoint_segment_blocked(
-            ledger=ledger,
-            job_id=job_id,
-            attachment_key=attachment_key,
-            segment_jobs=segment_jobs,
-        )
-        return "blocked"
-
     total_pages = get_pdf_page_count(file_path)
-    should_split = (
-        extract_config.split_large_pdfs
-        and total_pages is not None
-        and total_pages > extract_config.max_pages_per_extraction
+    previous = ledger.get_checkpoint(attachment_key, "extract") if not is_full_rebuild else None
+    saved = (previous or {}).get("payload") or {}
+    previous_jobs = [ledger.get_extract_job(job_id=key) for key in (segment_job_ids or [])]
+    if any(job is None for job in previous_jobs):
+        raise ValueError(f"missing segment job for {attachment_key}")
+    previous_job = ledger.get_extract_job(job_id=extract_stage["job_id"]) if extract_stage.get("job_id") else None
+    pdf_sha256 = sha256_file(file_path)
+    if previous_job and previous_job["pdf_sha256"] == pdf_sha256 and not previous_job.get("selected_pages"):
+        result = extract_manager.resume_extraction(previous_job["job_id"])
+        return _checkpoint_single_extract_result(ledger=ledger, job_id=job_id, attachment_key=attachment_key, result=result)
+
+    if saved.get("pdf_sha256", pdf_sha256) != pdf_sha256 or any(job["pdf_sha256"] != pdf_sha256 for job in previous_jobs):
+        saved, previous_jobs = {}, []
+    recorded_provider = saved.get("ocr_provider") or (previous_jobs[0]["provider"] if previous_jobs else None)
+    if recorded_provider and recorded_provider != extract_manager.provider.name:
+        if extract_manager.resume_manager_for is None:
+            raise ValueError(f"extract job requires its original OCR provider {recorded_provider}")
+        extract_manager = extract_manager.resume_manager_for(recorded_provider)
+    deepseek = extract_manager.provider.name == "deepseek"
+    segment_size = extract_config.deepseek_pages_per_request if deepseek else extract_config.max_pages_per_extraction
+    if saved.get("segment_size"):
+        segment_size = saved["segment_size"]
+    elif previous_jobs:
+        # Legacy checkpoints persisted contiguous ranges but no split size.
+        start, end = min(previous_jobs, key=_segment_page_start)["selected_pages"].split("-")
+        segment_size = int(end) - int(start) + 1
+    should_split = bool(previous_jobs or saved.get("segment_size")) or (
+        extract_config.split_large_pdfs and total_pages is not None and total_pages > segment_size
     )
+    running_payload = {"job_id": job_id, "input_file": str(file_path)}
+    if should_split:
+        if total_pages is None:
+            raise ValueError(f"cannot verify segment page coverage for {attachment_key}")
+        running_payload.update(segment_size=segment_size, ocr_provider=extract_manager.provider.name, pdf_sha256=pdf_sha256)
+        if previous_jobs:
+            running_payload["segment_job_ids"] = [job["job_id"] for job in previous_jobs]
+    ledger.checkpoint(attachment_key, "extract", "running", running_payload)
 
     if not should_split:
         _progress("  extract: submitting...")
@@ -1160,6 +1170,7 @@ def _execute_extract_stage(
         request = ExtractionRequest(
             input_file=Path(file_path),
             attachment_key=attachment_key,
+            pdf_sha256=pdf_sha256,
             selected_page_count=total_pages if total_pages is not None else UNKNOWN_PAGE_COUNT_FALLBACK,
         )
         result = extract_manager.ensure_extraction(request)
@@ -1171,30 +1182,27 @@ def _execute_extract_stage(
             result=result,
         )
 
-    segments = compute_page_segments(total_pages, extract_config.max_pages_per_extraction)
+    segments = compute_page_segments(total_pages, segment_size)
     _progress(f"  extract: splitting PDF into {len(segments)} segments (pages={total_pages})...")
-    segment_results: list[Any] = []
+    existing_segments = {job["selected_pages"]: job for job in previous_jobs}
+
+    def submit_segment(segment: PageSegment) -> ExtractionResult:
+        existing = existing_segments.get(segment.selected_pages)
+        if existing:
+            # Keep remote IDs through a retry. A cache-key resubmit here can
+            # duplicate work for a remote batch with a transient poll failure.
+            return ExtractionResult(job=existing, cache_hit=True)
+        return extract_manager.submit_only(ExtractionRequest(
+            input_file=Path(file_path), attachment_key=attachment_key, pdf_sha256=pdf_sha256,
+            selected_pages=segment.selected_pages, selected_page_count=segment.page_count,
+        ))
+
     try:
-        # Phase 2, pass 1: submit every segment first (in page order) so the
-        # remote batches run in parallel. A failure mid-pass lands in the
-        # except branch below, which persists exactly the submitted segment
-        # jobs for the next resume round.
-        for segment in segments:
-            request = ExtractionRequest(
-                input_file=Path(file_path),
-                attachment_key=attachment_key,
-                selected_pages=segment.selected_pages,
-                selected_page_count=segment.page_count,
-            )
-            segment_results.append(extract_manager.submit_only(request))
-            _progress(f"  extract: segment {segment.index + 1}/{len(segments)} submitted")
-        # Phase 2, pass 2: harvest the submitted segments concurrently. Each
-        # harvest thread holds an extractor key only for the duration of a
-        # single provider call, so M keys can service N in-flight segments.
-        with ThreadPoolExecutor(max_workers=extract_config.harvest_workers) as pool:
-            segment_results = list(
-                pool.map(lambda result: _harvest_one(result, extract_manager), segment_results)
-            )
+        workers = extract_config.deepseek_concurrency if deepseek else extract_config.harvest_workers
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            # DeepSeek queues its local job here and sends the HTTP request in harvest.
+            segment_results = [submit_segment(segment) for segment in segments]
+            segment_results = list(pool.map(lambda result: _harvest_one(result, extract_manager), segment_results))
         for result in segment_results:
             _progress(f"  extract: segment state={result.job['state']}")
     except Exception:
@@ -1238,10 +1246,10 @@ def _execute_extract_stage(
         attachment_key=attachment_key,
         segment_jobs=segment_jobs,
         extract_cache_dir=extract_cache_dir,
-        merged_artifact_dir=merged_artifact_dir,
+        merged_artifact_dir=extract_stage.get("merged_artifact_dir"),
         # H2: a full rebuild must re-merge unconditionally so it can repair a
         # truncated/stale merged_full.md left behind by a killed run.
-        force=is_full_rebuild,
+        force=is_full_rebuild or bool(previous_jobs) or bool(saved.get("segment_size")),
     )
     return "done"
 
@@ -1259,7 +1267,7 @@ def _drive_extraction_to_completion(result: Any, extract_manager: Any) -> Any:
 def _harvest_one(result: Any, extract_manager: Any) -> Any:
     """Drive one freshly submitted segment result to downloaded (Phase 2).
 
-    Jobs already in a DONE state (cache-hit reuse) pass through untouched.
+    Completed jobs and jobs awaiting manual review pass through untouched.
     Jobs whose local_stage is still "poll" go through harvest(), whose first
     poll confirms the remote batch state even when submit() already reported
     "completed" (H1). Anything else — a missing external_job_id (crash
@@ -1268,7 +1276,7 @@ def _harvest_one(result: Any, extract_manager: Any) -> Any:
     """
 
     job = result.job
-    if job["state"] in DONE_EXTRACT_STATES:
+    if job["state"] in DONE_EXTRACT_STATES or job["state"] == "failed_manual_review":
         return result
     if job.get("external_job_id") and job.get("local_stage") == "poll":
         return extract_manager.harvest(job["job_id"])
@@ -1277,25 +1285,6 @@ def _harvest_one(result: Any, extract_manager: Any) -> Any:
 
 def _all_jobs_downloaded(jobs: list[dict[str, Any]]) -> bool:
     return all(job["state"] in DONE_EXTRACT_STATES for job in jobs)
-
-
-def _resume_segment_jobs(
-    segment_job_ids: list[str],
-    extract_manager: Any,
-    ledger: StateLedger,
-) -> list[dict[str, Any]]:
-    """Resume each segment job and return refreshed job records."""
-
-    jobs: list[dict[str, Any]] = []
-    for job_id in segment_job_ids:
-        job = ledger.get_extract_job(job_id=job_id)
-        if job is None:
-            raise ValueError(f"segment extract job not found: {job_id}")
-        if job["state"] not in DONE_EXTRACT_STATES:
-            result = extract_manager.resume_extraction(job_id)
-            job = result.job
-        jobs.append(job)
-    return jobs
 
 
 def _merged_artifact_dir(extract_cache_dir: Path, attachment_key: str) -> Path:
@@ -1332,11 +1321,6 @@ def _find_segment_jobs(
     excluded. Segments whose job was never persisted (the failure happened
     before upsert_extract_job) are skipped.
 
-    Known limitation (pre-existing, recorded in MODIFICATION_PLAN_20260904
-    follow-ups): the resume path trusts the persisted segment_job_ids subset
-    and never re-plans the full segment set, so a failure that struck before
-    later segments were persisted leaves them unsubmitted until a full
-    rebuild.
     """
 
     from ..extractors.manager import ExtractionRequest, extraction_cache_context
@@ -1503,6 +1487,7 @@ def _checkpoint_segment_blocked(
         "blocked",
         {
             "job_id": job_id,
+            **((ledger.get_checkpoint(attachment_key, "extract") or {}).get("payload") or {}),
             "segment_job_ids": segment_job_ids,
             "states": [job["state"] for job in segment_jobs],
             "reason": f"segment jobs not all downloaded: {failed_states}",
@@ -1568,7 +1553,7 @@ def _execute_normalize_stage(
     if extract_job is None:
         extract_jobs = [
             j for j in ledger.list_extract_jobs(limit=None)
-            if j.get("attachment_key") == attachment_key and j["state"] in DONE_EXTRACT_STATES
+            if j.get("attachment_key") == attachment_key and not j.get("selected_pages") and j["state"] in DONE_EXTRACT_STATES
         ]
         if not extract_jobs:
             raise ValueError(f"no completed extract job for {attachment_key}; run extraction first")
@@ -1647,6 +1632,7 @@ def _execute_embed_stage(
     profile_name: str,
     vector_store_dir: Path,
     embed_collector: list[dict[str, Any]] | None = None,
+    embedding_env_path: str | Path = ".env",
 ) -> None:
     """Run embedding for one document under one profile.
 
@@ -1675,6 +1661,7 @@ def _execute_embed_stage(
 
     if embed_collector is None:
         index_result = index_normalized_document(
+            embedding_env_path=embedding_env_path,
             ledger=ledger,
             vector_store_dir=vector_store_dir,
             profile_name=profile_name,
@@ -1696,6 +1683,7 @@ def _execute_embed_stage(
     # Exceptions from staging propagate to the main loop's per-document
     # failure accounting, exactly as index_normalized_document's did.
     staged = stage_indexed_document(
+        embedding_env_path=embedding_env_path,
         ledger=ledger,
         vector_store_dir=vector_store_dir,
         profile_name=profile_name,

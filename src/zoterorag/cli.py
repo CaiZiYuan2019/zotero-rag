@@ -10,7 +10,7 @@ from .backup import create_backup, plan_restore_backup, resolve_backup_manifest,
 from .api.server import serve_api, validate_serve_access
 from .diagnostics import run_runtime_diagnostics
 from .documents import get_document, list_documents
-from .embeddings import index_normalized_document, search_vector_index
+from .embeddings import EmbeddingProvider, StubEmbeddingProvider, index_normalized_document, search_vector_index
 from .embeddings.indexer import prune_vector_index_versions, require_embedding_profile, select_profile
 from .extractors import (
     ExtractionManager,
@@ -31,7 +31,7 @@ from .pipeline import (
     start_ingest_job,
     start_reembed_job,
 )
-from .providers import build_qwen_embedding_provider, provider_readiness
+from .providers import build_extraction_manager, build_qwen_embedding_provider, provider_readiness
 from .review import explain_attachment_review
 from .runtime import (
     config_as_public_dict,
@@ -87,6 +87,17 @@ def emit(data: object) -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     print(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def _embedding_provider(profile: dict[str, Any], args: argparse.Namespace, project_root: Path) -> EmbeddingProvider:
+    selected = args.embedding_provider
+    if selected is None:
+        selected = "stub" if getattr(args, "allow_stub_provider", False) else profile["provider"]
+    if selected == "stub":
+        return StubEmbeddingProvider(dimension=int(profile["dimension"]))
+    if selected in ("dashscope", "qwen3vl"):
+        return build_qwen_embedding_provider(profile, _resolve_env_path(args.env, project_root))
+    raise ValueError(f"unsupported embedding provider: {selected}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -164,7 +175,7 @@ def build_parser() -> argparse.ArgumentParser:
     ingest_start.add_argument(
         "--execute",
         action="store_true",
-        help="Execute the ingest pipeline (extract -> normalize -> embed). Uses real MinerU and Qwen APIs when keys are configured.",
+        help="Execute the ingest pipeline (extract -> normalize -> embed). Uses the configured OCR provider and Qwen embeddings.",
     )
     ingest_start.add_argument("--env", default=".env", help="Env file for API keys when executing.")
     ingest_pause = ingest_sub.add_parser("pause")
@@ -309,7 +320,7 @@ def build_parser() -> argparse.ArgumentParser:
     normalize_chunks.add_argument("--chunk-type", default=None, choices=("text", "image"))
     normalize_chunks.add_argument("--limit", type=int, default=20)
 
-    embed = sub.add_parser("embed", help="Offline embedding/index commands. Defaults to stub provider.")
+    embed = sub.add_parser("embed", help="Index normalized chunks using the configured embedding profile.")
     embed_sub = embed.add_subparsers(dest="embed_command", required=True)
     embed_index = embed_sub.add_parser("index-normalized", help="Index normalized chunks into a local vector store.")
     embed_index.add_argument("--document-id", required=True)
@@ -322,8 +333,8 @@ def build_parser() -> argparse.ArgumentParser:
     embed_index.add_argument(
         "--embedding-provider",
         choices=("stub", "qwen3vl"),
-        default="stub",
-        help="Provider used for vector creation. qwen3vl makes real API calls and must be selected explicitly.",
+        default=None,
+        help="Override the embedding provider configured for this profile.",
     )
     embed_index.add_argument("--env", default=".env", help="Env file containing qwen credentials when using qwen3vl.")
     embed_batches = embed_sub.add_parser("batches", help="List persisted embedding batch progress.")
@@ -338,7 +349,8 @@ def build_parser() -> argparse.ArgumentParser:
     reembed.add_argument("--document-id", default=None)
     reembed.add_argument("--force", action="store_true")
     reembed.add_argument("--plan-only", action="store_true", help="Return a read-only rebuild plan without creating a job.")
-    reembed.add_argument("--execute", action="store_true", help="Execute local stub indexing for pending documents.")
+    reembed.add_argument("--execute", action="store_true", help="Index pending documents with the selected profile.")
+    reembed.add_argument("--env", default=".env", help="Project env file for embedding credentials when executing.")
     reembed.add_argument(
         "--allow-stub-provider",
         action="store_true",
@@ -365,8 +377,8 @@ def build_parser() -> argparse.ArgumentParser:
         parser.add_argument(
             "--embedding-provider",
             choices=("stub", "qwen3vl"),
-            default="stub",
-            help="Provider used for query embedding. qwen3vl makes real API calls and must be selected explicitly.",
+            default=None,
+            help="Override the embedding provider configured for this profile.",
         )
         parser.add_argument("--env", default=".env", help="Env file containing qwen credentials when using qwen3vl.")
 
@@ -519,24 +531,10 @@ def main(argv: list[str] | None = None) -> int:
                         execute=args.execute,
                     )
                     if args.execute:
-                        from .providers import build_mineru_provider
-
-                        resolved_env = _resolve_env_path(args.env, project_root)
-                        key_pool = ExtractorKeyPool.from_env_file(
-                            resolved_env,
-                            per_key_submit_concurrency=config.extract.per_key_submit_concurrency,
-                        )
-                        provider = build_mineru_provider(resolved_env)
-                        kwargs["extract_manager"] = ExtractionManager(
-                            ledger=ledger,
-                            cache_dir=config.paths.extract_cache_dir,
-                            provider=provider,
-                            key_pool=key_pool,
-                            job_max_lifetime_seconds=config.extract.job_max_lifetime_seconds,
-                            submit_min_interval_seconds=config.extract.submit_min_interval_seconds,
-                            poll_max_per_minute=config.extract.poll_max_per_minute,
-                            poll_interval_seconds=config.extract.poll_interval_seconds,
-                            max_resubmit_attempts=config.extract.max_resubmit_attempts,
+                        env_path = _resolve_env_path(args.env, project_root)
+                        kwargs["embedding_env_path"] = env_path
+                        kwargs["extract_manager"] = build_extraction_manager(
+                            ledger, config.paths.extract_cache_dir, env_path, config.extract
                         )
                         kwargs["extract_cache_dir"] = config.paths.extract_cache_dir
                         kwargs["normalized_dir"] = config.paths.normalized_dir
@@ -562,25 +560,10 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     kwargs: dict[str, Any] = dict(job_id=args.job_id, reason=args.reason, execute=args.execute)
                     if args.execute:
-                        # M7: same execution dependency wiring as `ingest start`.
-                        from .providers import build_mineru_provider
-
-                        resolved_env = _resolve_env_path(args.env, project_root)
-                        key_pool = ExtractorKeyPool.from_env_file(
-                            resolved_env,
-                            per_key_submit_concurrency=config.extract.per_key_submit_concurrency,
-                        )
-                        provider = build_mineru_provider(resolved_env)
-                        kwargs["extract_manager"] = ExtractionManager(
-                            ledger=ledger,
-                            cache_dir=config.paths.extract_cache_dir,
-                            provider=provider,
-                            key_pool=key_pool,
-                            job_max_lifetime_seconds=config.extract.job_max_lifetime_seconds,
-                            submit_min_interval_seconds=config.extract.submit_min_interval_seconds,
-                            poll_max_per_minute=config.extract.poll_max_per_minute,
-                            poll_interval_seconds=config.extract.poll_interval_seconds,
-                            max_resubmit_attempts=config.extract.max_resubmit_attempts,
+                        env_path = _resolve_env_path(args.env, project_root)
+                        kwargs["embedding_env_path"] = env_path
+                        kwargs["extract_manager"] = build_extraction_manager(
+                            ledger, config.paths.extract_cache_dir, env_path, config.extract
                         )
                         kwargs["extract_cache_dir"] = config.paths.extract_cache_dir
                         kwargs["normalized_dir"] = config.paths.normalized_dir
@@ -880,11 +863,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "embed":
             if args.embed_command == "index-normalized":
                 try:
-                    provider = None
-                    if args.embedding_provider == "qwen3vl":
-                        profile = require_embedding_profile(ledger, args.profile)
-                        resolved_env = _resolve_env_path(args.env, project_root)
-                        provider = build_qwen_embedding_provider(profile, resolved_env)
+                    profile = require_embedding_profile(ledger, args.profile)
+                    provider = _embedding_provider(profile, args, project_root)
                     result = index_normalized_document(
                         ledger=ledger,
                         vector_store_dir=config.paths.vector_store_dir,
@@ -893,7 +873,7 @@ def main(argv: list[str] | None = None) -> int:
                         provider=provider,
                         allow_stub_provider=args.allow_stub_provider,
                     )
-                except (KeyError, RuntimeError, ValueError, RerankNotSupportedError) as exc:
+                except (FileNotFoundError, KeyError, RuntimeError, ValueError, RerankNotSupportedError) as exc:
                     emit({"ok": False, "error": str(exc)})
                     return 1
                 emit(result.to_dict())
@@ -932,6 +912,11 @@ def main(argv: list[str] | None = None) -> int:
                         )
                     )
                     return 0
+                execution_options = {}
+                if args.execute and not args.allow_stub_provider:
+                    profile = require_embedding_profile(ledger, args.profile)
+                    if profile["provider"] != "stub":
+                        execution_options["embedding_env_path"] = _resolve_env_path(args.env, project_root)
                 emit(
                     start_reembed_job(
                         ledger,
@@ -941,12 +926,13 @@ def main(argv: list[str] | None = None) -> int:
                         force=args.force,
                         execute=args.execute,
                         allow_stub_provider=args.allow_stub_provider,
+                        **execution_options,
                     )
                 )
                 return 0
             # RuntimeError: the M10 runner lock / active-job guard is an
             # expected user-facing error, not a traceback.
-            except (KeyError, ValueError, RuntimeError, RerankNotSupportedError) as exc:
+            except (FileNotFoundError, KeyError, ValueError, RuntimeError, RerankNotSupportedError) as exc:
                 emit({"ok": False, "error": str(exc)})
                 return 1
 
@@ -969,18 +955,12 @@ def main(argv: list[str] | None = None) -> int:
                     emit({"ok": False, "error": str(exc)})
                     return 1
             try:
-                provider = None
                 profile = select_profile(ledger, profile_name=args.profile, mode=args.mode)
-                if args.embedding_provider == "qwen3vl":
-                    resolved_env = _resolve_env_path(args.env, project_root)
-                    provider = build_qwen_embedding_provider(profile, resolved_env)
-                elif args.embedding_provider == "stub":
-                    from .embeddings import StubEmbeddingProvider
-                    provider = StubEmbeddingProvider(dimension=int(profile["dimension"]))
+                provider = _embedding_provider(profile, args, project_root)
                 results = search_vector_index(
                     ledger=ledger,
                     vector_store_dir=config.paths.vector_store_dir,
-                    profile_name=args.profile,
+                    profile_name=profile["name"],
                     query=args.query,
                     mode=args.mode,
                     top_k=args.top_k,
@@ -1029,7 +1009,7 @@ def _find_project_root_for_env(start: Path) -> Path:
     for parent in [path, *path.parents]:
         if (parent / "pyproject.toml").is_file() or (parent / ".git").is_dir():
             return parent
-    return path
+    return path.parent if path.name == "config" else path
 
 
 if __name__ == "__main__":

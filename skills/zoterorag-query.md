@@ -2,13 +2,13 @@
 
 ## 描述
 
-使用项目内 `.conda` 环境中的 `zoterorag` CLI，对当前已建库的 ZoteroRAG 文献库进行多维度检索（元数据 / 集合分区 / 全文 / 向量），并将结果整理为结构化报告。
+使用项目内 `.conda` 环境中的 `zoterorag` CLI，对当前已建库的 ZoteroRAG 文献库进行多维度检索（元数据 / 集合分区 / 全文 / 向量），回答问题或按需生成可存档的 Markdown 报告。
 
 ## 适用场景
 
 - 需要基于本地已建库文献回答具体科研问题；
 - 需要按 Zotero 文件夹（集合）缩小检索范围；
-- 需要查找某个主题、功能、结构或方法相关的原文证据；
+- 需要查找某个主题、功能、结构或方法相关的解析文本或图像证据；
 - 需要综合向量检索、全文检索和元数据检索来交叉验证；
 - 最终输出需要形成可存档的 Markdown 报告。
 
@@ -18,17 +18,18 @@
 2. 项目内已存在 `.conda` 独立环境，且 `zoterorag` 可执行文件位于 `.conda/Scripts/zoterorag.exe`（也可用 `python -m zoterorag.cli`）。
 3. 向量库已完成建库（`zoterorag status` 中 `vector_indexes` 状态为 ready）——仅向量检索需要；元数据/全文/集合检索不需要 embedding。
 4. 默认文本向量 profile 为 `qwen3vl_cloud_2560_text`（查询前可通过 `zoterorag models list` 确认）。
-5. 若要用作者/集合/DOI 等新元数据能力，确认已执行过 `resync-metadata`（见步骤 0）。
+5. 作者、集合、DOI 等过滤依赖已复制到台账的书目字段。字段缺失时记录缺口。
+
+## 选择查询方式
+
+- **简单查询（默认）**：查某篇文献、列出集合命中或定位一段解析文本时，主代理直接选用下列命令，给出结果与出处。需要报告时再执行步骤 8。
+- **精确查询**：用户要求精查、跨文献综合、独立复核或逐次查询可追溯时，主代理界定范围并发起检索，再把命中文档交给精读者。精读完成后，另派专职复核者独立核查重要结论，最后由主代理评估两方证据、完成报告。分派前阅读[精确查询流程与子代理提示词](zoterorag-query/precise-query.md)。
+
+主代理和各子代理只用项目台账、已有书目元数据副本、解析文档及其图像。`document.md` 是解析文本。源 Zotero 库和原始 PDF 仅供用户本人手工阅读、核对或写作。查询跳过既有 `report/`。
 
 ## 标准查询流程
 
-### 步骤 0：同步书目元数据与集合（按需）
-
-只写 `state.sqlite` 与 FTS，**不**触发 MinerU / 嵌入：
-
-```bash
-.conda/Scripts/zoterorag.exe resync-metadata --no-refresh-shadow --rebuild-fts
-```
+### 步骤 0：查看已入库的集合（按需）
 
 列出集合 key（后续 `--collection` / `search-by-collection` 使用）：
 
@@ -122,24 +123,21 @@ FTS 无命中时会 LIKE 回退；该路径无 BM25，会降级为自定义分�
   --max-images 10
 ```
 
-`images[].file_ref` 相对路径完整位于 `data/normalized/<document_id>/images/<file_ref>`。建议与文本向量或全文交叉验证，并查看图像确认。
+从 `documents show <document_id> --consumer manual` 取 `document.artifact.artifact_dir`。`images[].file_ref` 为相对路径时按此目录解析。建议与文本向量或全文交叉验证，并查看图像确认。
 
-### 步骤 6：定位关键文档并精读原文
+### 步骤 6：定位关键文档并精读解析文本
+
+对元数据、集合、全文和向量命中，直接用返回的 `document_id` 调用 `documents show`。`attachment_key` 标识具体附件，`parent_key`（同 `parent_item_key`）标识父条目。同一父条目可有多个附件，各自保留其文档 ID。仅当 `document_kind` 为 `normalized` 时读取对应解析文件。若为 `metadata_only`，可检查台账中同篇其他附件的解析状态。
 
 ```bash
 .conda/Scripts/zoterorag.exe documents show <document_id>
 ```
 
-```bash
-# 读取原文（前 400 行）
-Read data/normalized/<document_id>/document.md
-```
-
-可用 `Grep` 在文档内定位关键词，再分段精读。
+从 `documents show <document_id> --consumer manual` 取得 `document.artifact.document_md`，在该解析文件中定位关键词，再读完整段落和相邻图注。引用时注明解析文件名、章节或行号。
 
 ### 步骤 7：交叉验证
 
-对核心结论应至少通过两种检索方式验证：
+简单查询可按问题选取以下检索面交叉比对；精确查询还需把重要结论交给独立复核者。
 
 - 元数据 / 集合分区：确认文献归属、作者、年份；
 - 全文：确认术语出现频率和上下文（方法词尤其重要）；
@@ -158,7 +156,6 @@ Read data/normalized/<document_id>/document.md
 
 | 用途 | 命令 |
 |------|------|
-| 同步元数据/集合/FTS | `.conda/Scripts/zoterorag.exe resync-metadata --no-refresh-shadow --rebuild-fts` |
 | 列出集合 | `.conda/Scripts/zoterorag.exe list-collections` |
 | 检查全局状态 | `.conda/Scripts/zoterorag.exe status` |
 | 元数据检索 | `.conda/Scripts/zoterorag.exe search-metadata "关键词"` |
@@ -168,7 +165,7 @@ Read data/normalized/<document_id>/document.md
 | 向量检索（文本） | `.conda/Scripts/zoterorag.exe search-vector "问题" --mode text --top-k 20 --embedding-provider qwen3vl --consumer llm_text --image-return none` |
 | 向量检索（多模态） | `.conda/Scripts/zoterorag.exe search-vector "图像描述" --mode multimodal --top-k 15 --embedding-provider qwen3vl --consumer llm_multimodal --image-return file_ref` |
 | 查看文档信息 | `.conda/Scripts/zoterorag.exe documents show <document_id>` |
-| 文档内关键词定位 | `Grep --path data/normalized/<document_id>/document.md --pattern "关键词" --output_mode content -n` |
+| 文档内关键词定位 | `Grep --path <返回的 document_md 路径> --pattern "关键词" --output_mode content -n` |
 
 ## 检索手段选择建议
 
@@ -187,12 +184,12 @@ Read data/normalized/<document_id>/document.md
 - `Glutaric dialdehyde`：文献多用 `glutaraldehyde`，前者可能 0 命中——应改用常用英文拼写。
 - `GA`：高度歧义（GABA 等）；`score` 可用，`bm25` 可能因 FTS→LIKE 回退而为 0——改用完整词。
 
-## 输出处理建议
+## 简单查询的输出处理建议
 
 - 将检索结果临时保存到 `.tmp/`，避免重复调用 embedding API；
 - 关键文档用 `Read` 分段读摘要/方法/结果/讨论；
 - 多模态命中用 `ReadMediaFile` 核验；引用图时复制到 `report/<YYYYMMDD>/images/`；
-- 结论必须标注 document_id 或原文出处。
+- 结论标注 `document_id` 及所用解析段落、图像或书目字段。
 
 ## 注意事项
 

@@ -210,6 +210,68 @@ class ApiProfileResolutionTests(unittest.TestCase):
                 response = client.post("/ingest/start", json={"execute": False})
             self.assertEqual(400, response.status_code)
 
+    def test_embedding_routes_use_profile_and_project_env(self) -> None:
+        with workspace_tmpdir("api-qwen-") as root:
+            config_dir = root / "config"
+            config_dir.mkdir()
+            config = self._create_config(config_dir)
+            config.write_text(config.read_text(encoding="utf-8").replace('provider = "stub"', 'provider = "dashscope"'),
+                              encoding="utf-8")
+            env_path = root / ".env"
+            env_path.touch()
+            client = self._client(create_app(config))
+            with (patch("zoterorag.api.app.build_qwen_embedding_provider") as build,
+                  patch("zoterorag.api.app.search_vector_index", return_value=[]) as search,
+                  patch("zoterorag.api.app.index_normalized_document") as index):
+                index.return_value.to_dict.return_value = {}
+                for path, payload, expected, call in (
+                    ("/search/text", {"query": "text"}, "test_text", search),
+                    ("/search/multimodal", {"query": "figure"}, "test_mm", search),
+                    ("/embed/index-normalized", {"profile_name": "test_text", "document_id": "DOC"}, "test_text", index),
+                ):
+                    with self.subTest(path=path):
+                        self.assertEqual(200, client.post(path, json=payload).status_code)
+                        self.assertEqual(expected, build.call_args.args[0]["name"])
+                        self.assertEqual(env_path, build.call_args.args[1])
+                        self.assertIs(build.return_value, call.call_args.kwargs["provider"])
+                        explicit = client.post(path, json={**payload, "embedding_provider": "stub"})
+                        self.assertEqual(200, explicit.status_code)
+                        self.assertEqual("stub", call.call_args.kwargs["provider"].name)
+                env_path.unlink()
+                self.assertEqual(400, client.post("/search/text", json={"query": "text"}).status_code)
+
+    def test_search_uses_activated_stub_profile_without_credentials(self) -> None:
+        with workspace_tmpdir("api-active-profile-") as root:
+            config = self._create_config(root)
+            with config.open("a", encoding="utf-8") as file:
+                file.write('\n[[embedding_profiles]]\nname="alternate"\nprovider="stub"\nmodel="stub"\n'
+                           'dimension=16\nmodality="text"\nbackend="sqlite-local"\n')
+            client = self._client(create_app(config))
+            activation = client.post("/models/embedding/activate", json={"mode": "text", "profile_name": "alternate"})
+            self.assertEqual(200, activation.status_code)
+            with patch("zoterorag.api.app.search_vector_index", return_value=[]) as search:
+                for payload in ({"query": "test"}, {"query": "test", "profile_name": "alternate"}):
+                    self.assertEqual(200, client.post("/search/text", json=payload).status_code)
+                    self.assertEqual("alternate", search.call_args.kwargs["profile_name"])
+                    self.assertEqual(16, search.call_args.kwargs["provider"].dimension)
+                    self.assertEqual("stub", search.call_args.kwargs["provider"].name)
+
+    def test_embedding_job_execution_uses_validated_env(self) -> None:
+        with workspace_tmpdir("api-qwen-jobs-") as root:
+            config = self._create_config(root)
+            config.write_text(config.read_text(encoding="utf-8").replace('provider = "stub"', 'provider = "dashscope"'),
+                              encoding="utf-8")
+            client = self._client(create_app(config))
+            env_path = root / ".env.jobs"
+            env_path.touch()
+            with (patch("zoterorag.api.app.start_ingest_job", return_value={}) as ingest,
+                  patch("zoterorag.api.app.start_reembed_job", return_value={}) as reembed,
+                  patch("zoterorag.api.app._build_extract_manager")):
+                for path, call in (("/ingest/start", ingest), ("/reembed/from-normalized", reembed)):
+                    payload = {"profile_name": "test_text", "execute": True, "env": env_path.name}
+                    self.assertEqual(200, client.post(path, json=payload).status_code)
+                    self.assertEqual(env_path, call.call_args.kwargs["embedding_env_path"])
+
     def test_search_text_default_profile_resolves(self) -> None:
         with workspace_tmpdir("api-profile-") as tmpdir:
             app = create_app(self._create_config(tmpdir))

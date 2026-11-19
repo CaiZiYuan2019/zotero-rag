@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import os
+from pathlib import Path
 from typing import Any, Literal
 
 from ..config import AppConfig
 from ..db import StateLedger
 from ..documents import get_document
 from ..embeddings import search_vector_index
+from ..embeddings.indexer import SearchMode
 from ..models import list_embedding_model_catalog
 from ..search import (
     fulltext_search,
@@ -23,10 +26,32 @@ McpConsumer = Literal["llm_text", "llm_multimodal"]
 ImageReturn = Literal["file_ref", "base64", "none"]
 
 
+def default_config_path() -> Path:
+    return Path(os.environ.get("ZOTERORAG_CONFIG", "config/config.toml"))
+
+
 @dataclass(frozen=True)
 class McpToolContext:
     config: AppConfig
     ledger: StateLedger
+    config_path: Path = field(default_factory=default_config_path)
+
+
+def _search_vector(
+    context: McpToolContext, *, profile_name: str | None, mode: SearchMode, **kwargs: Any
+) -> list[dict[str, Any]]:
+    # Reuse the query CLI's env-file rules only when a vector search is requested.
+    from ..cli import _find_project_root_for_env, _resolve_env_path
+
+    root = _find_project_root_for_env(context.config_path)
+    return search_vector_index(
+        ledger=context.ledger,
+        vector_store_dir=context.config.paths.vector_store_dir,
+        profile_name=profile_name,
+        mode=mode,
+        embedding_env_path=_resolve_env_path(".env", root),
+        **kwargs,
+    )
 
 
 def zotero_rag_status(context: McpToolContext) -> dict[str, Any]:
@@ -213,9 +238,8 @@ def zotero_rag_search_text(
         try:
             results.extend(
                 label_results(
-                    search_vector_index(
-                        ledger=context.ledger,
-                        vector_store_dir=context.config.paths.vector_store_dir,
+                    _search_vector(
+                        context,
                         profile_name=profile_name,
                         query=query,
                         mode="text",
@@ -227,7 +251,7 @@ def zotero_rag_search_text(
                     source="text_vector",
                 )
             )
-        except (FileNotFoundError, KeyError, ValueError) as exc:
+        except (OSError, KeyError, ValueError, RuntimeError) as exc:
             warnings.append(f"text_vector_unavailable:{exc}")
     return {
         "results": results[:top_k],
@@ -267,9 +291,8 @@ def zotero_rag_search_multimodal(
             query_image,
             allowed_roots=[context.config.paths.data_dir],
         )
-        results = search_vector_index(
-            ledger=context.ledger,
-            vector_store_dir=context.config.paths.vector_store_dir,
+        results = _search_vector(
+            context,
             profile_name=profile_name,
             query=query_text,
             mode="multimodal",
@@ -284,7 +307,7 @@ def zotero_rag_search_multimodal(
             query_image_mime_type=normalized_image.mime_type if normalized_image else None,
         )
         warnings: list[str] = []
-    except (FileNotFoundError, KeyError, ValueError) as exc:
+    except (OSError, KeyError, ValueError, RuntimeError) as exc:
         results = []
         warnings = [f"multimodal_vector_unavailable:{exc}"]
     return {

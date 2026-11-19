@@ -54,7 +54,7 @@ zoterorag init-state
 data/
   state/state.sqlite          # 唯一任务账本
   shadow/zotero.sqlite        # Zotero 影子副本
-  extract_cache/              # MinerU 下载缓存
+  extract_cache/              # OCR 解析缓存
   normalized/                 # 标准化 Markdown / 图片 / chunk
   vector_store/<profile>/     # 向量库（每 profile 一个）
   embedding_cache/<profile>/  # embedding 响应缓存（可选）
@@ -80,6 +80,9 @@ port = 8765                                       # API 端口
 require_api_token = true                          # 是否要求 token 鉴权
 
 [extract]
+provider = "deepseek"                              # 新任务可选 deepseek 或 mineru
+deepseek_concurrency = 15                          # 同一文档内并发处理的 DeepSeek 分段上限
+deepseek_pages_per_request = 8                     # 开启自动分段时每次 DeepSeek 请求的页数
 split_large_pdfs = true                           # 是否自动拆分超大 PDF
 max_pages_per_extraction = 200                    # 单次 MinerU 转换的最大页数
 job_max_lifetime_seconds = 21600                  # 单个提取任务总寿命上限（秒，自 submitted_at 起算）
@@ -157,7 +160,10 @@ rate_limit = {}
 ### 2.2 API 密钥文件 (`.env`)
 
 ```bash
-# MinerU PDF 提取（支持多 key 轮询）
+# 默认 DeepSeek 富布局 OCR，安装 providers 和 pdf 两组依赖
+DEEPSEEK_KEY=your_deepseek_key
+
+# 选择 MinerU 时的 PDF 提取密钥（支持多 key 轮询）
 # 写法 A：单 key
 MINERU_KEY=your_mineru_api_key
 
@@ -231,11 +237,11 @@ zoterorag --config path/to/config.toml <command>
 | `list-collections` | 列出已同步的 Zotero 集合 | 无 |
 | `search-by-collection` | 在指定集合（文件夹）内检索 | 无 |
 | `resync-metadata` | 增量回填书目元数据/集合/FTS（不重跑 MinerU/嵌入） | 无 |
-| `search-vector` | 向量搜索 | 指定 `qwen3vl` 时 |
+| `search-vector` | 向量搜索 | 默认使用 Qwen3-VL |
 | `backup create/list/verify/restore` | 备份管理 | 无 |
 | `extract dry-run/jobs/recovery-plan` | 提取作业管理 | `dry-run`(真实) |
 | `normalize markdown/list/chunks` | 标准化管理 | 无 |
-| `embed index-normalized/batches` | 嵌入管理 | 指定 `qwen3vl` 时 |
+| `embed index-normalized/batches` | 嵌入管理 | 默认使用 Qwen3-VL |
 | `reembed` | 向量重建 | `--execute` 时 |
 | `inspect-shadow` | 直接查看影子库 | 无 |
 
@@ -356,7 +362,7 @@ zoterorag ingest start --text-only
 #### 步骤 4：执行建库
 
 ```bash
-# 完整流水线：MinerU 提取 → 标准化 → Qwen 向量化
+# 完整流水线：按配置执行 OCR → Markdown/图片标准化 → Qwen 向量化
 zoterorag ingest start --mode incremental --execute
 
 # 只做文本 embedding（不调多模态）
@@ -428,11 +434,11 @@ zoterorag jobs show --job-id <JOB_ID>
 
 **超大 PDF 分片续传：**
 
-超过 `max_pages_per_extraction`（默认 200 页）的 PDF 会被拆分为多个 segment，每个 segment 是一个独立的 `extract_jobs` 记录。中断后重新执行 `ingest start --execute` 或 `ingest resume` 时，系统会检查所有 segment 的状态：已完成的直接复用，未完成的继续 poll/download，全部 segment 就绪后再执行本地合并与标准化。
+开启 `split_large_pdfs` 时，DeepSeek 按 `deepseek_pages_per_request`（默认 8 页）分片，MinerU 按 `max_pages_per_extraction`（默认 200 页）分片。每个分片对应一条独立的 `extract_jobs` 记录。中断后重新执行 `ingest start --execute` 或 `ingest resume --execute` 时，系统会检查所有 segment 的状态：已完成的直接复用，未完成的继续 poll/download，全部 segment 就绪后再执行本地合并与标准化。
 
 **Embedding 去重：** 通过 batch hash（profile hash + document ID + chunk hashes）检测已完成的 embedding batch，命中时返回 `reused_existing=true`，完全不调用 API。
 
-### 4.5 仅重建向量库（不调 MinerU）
+### 4.5 从已有解析结果重建向量库
 
 切换 embedding 模型或向量维度时，只需重建向量：
 
@@ -458,24 +464,18 @@ zoterorag reembed --from-normalized --profile new_model --execute --allow-stub-p
 ### 4.6 手动分步执行
 
 ```bash
-# 1. 提取单篇 PDF（调用真实 MinerU API）
+# 1. 演练单篇提取（本地 stub）；真实提取使用 ingest start --execute
 zoterorag extract dry-run --pdf /path/to/paper.pdf
 
-# 2. 标准化 MinerU 输出（纯本地，无网络）
+# 2. 标准化 OCR 输出（传入 extract 目录内的 full.md）
 zoterorag normalize markdown \
   --markdown mineru_output/full.md \
   --document-id DOC001
 
-# 3. 嵌入单篇（测试用存根）
+# 3. 嵌入单篇（默认 Qwen3-VL）
 zoterorag embed index-normalized \
   --profile qwen3vl_cloud_2560_text \
   --document-id DOC001
-
-# 3. 嵌入单篇（真实 Qwen API）
-zoterorag embed index-normalized \
-  --profile qwen3vl_cloud_2560_text \
-  --document-id DOC001 \
-  --embedding-provider qwen3vl
 
 # 4. 查看嵌入批次
 zoterorag embed batches --profile qwen3vl_cloud_2560_text
@@ -1042,8 +1042,8 @@ zoterorag vectors verify --profile new_model
 ### 10.4 测试与调试
 
 ```bash
-# 使用存根 provider，不调用外部 API
-zoterorag embed index-normalized --profile qwen3vl_cloud_2560_text --document-id DOC001
+# 使用隔离的测试库和存根 provider，不调用外部 API
+zoterorag embed index-normalized --profile qwen3vl_cloud_2560_text --document-id DOC001 --embedding-provider stub
 zoterorag search-vector "test" --mode text --embedding-provider stub
 zoterorag reembed --from-normalized --profile qwen3vl_cloud_2560_text --execute --allow-stub-provider
 
@@ -1091,7 +1091,7 @@ shadow DB ──→ scan/classify ──→ attachments (state DB)
 
 | 层 | 接口 | 实现 |
 |----|------|------|
-| Extractor | `ExtractorProvider` (Protocol) | `MinerUProvider`, `StubExtractorProvider` |
+| Extractor | `ExtractorProvider` (Protocol) | `DeepSeekOCRProvider`, `MinerUProvider`, `StubExtractorProvider` |
 | Embedding | `EmbeddingProvider` (Protocol) | `Qwen3VLEmbeddingProvider`, `StubEmbeddingProvider` |
 | Vector Store | `open_vector_store()` 工厂 | `LocalVectorStore` (SQLite), `LanceDBVectorStore` |
 | Search | `search_vector_index()` | 统一接口，按 profile 路由 |

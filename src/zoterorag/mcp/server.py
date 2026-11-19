@@ -16,7 +16,6 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import io
 import json
-import os
 from pathlib import Path
 import sys
 from typing import Any
@@ -31,6 +30,7 @@ from ..index.lancedb_vector import warmup_lancedb_connection
 from ..runtime import initialize_runtime
 from .tools import (
     McpToolContext,
+    default_config_path,
     zotero_rag_get_document,
     zotero_rag_list_collections,
     zotero_rag_list_models,
@@ -215,17 +215,6 @@ TOOL_FUNCTIONS: dict[str, Any] = {
 }
 
 
-def _load_runtime(config_path: str | None = None) -> tuple[AppConfig, StateLedger]:
-    """Load config, ensure runtime dirs, and open the state ledger."""
-    if config_path is None:
-        config_path = os.environ.get("ZOTERORAG_CONFIG", "config/config.toml")
-    return initialize_runtime(config_path)
-
-
-def _build_mcp_context(config: AppConfig, ledger: StateLedger) -> McpToolContext:
-    return McpToolContext(config=config, ledger=ledger)
-
-
 def _make_tools() -> list[Tool]:
     return [
         Tool(
@@ -237,7 +226,7 @@ def _make_tools() -> list[Tool]:
     ]
 
 
-async def serve(config: AppConfig, ledger: StateLedger) -> None:
+async def serve(config: AppConfig, ledger: StateLedger, *, config_path: Path | None = None) -> None:
     """Run the MCP stdio server.
 
     Tool handlers execute in a thread pool because several tools call
@@ -246,7 +235,7 @@ async def serve(config: AppConfig, ledger: StateLedger) -> None:
     deadlocks with LanceDB's internal background event loop.
     """
     server = Server(SERVER_NAME)
-    context = _build_mcp_context(config, ledger)
+    context = McpToolContext(config, ledger, config_path or default_config_path())
     tools = _make_tools()
 
     # ``config.mcp`` may be absent when the config file does not define an
@@ -346,10 +335,9 @@ def main(config_path: str | None = None) -> None:
     # Re-encode stdout before any operation so MCP JSON lines are always UTF-8.
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
-    if config_path is None:
-        config_path = os.environ.get("ZOTERORAG_CONFIG")
+    path = Path(config_path) if config_path is not None else default_config_path()
     try:
-        config, ledger = _load_runtime(config_path)
+        config, ledger = initialize_runtime(path)
     except Exception as exc:
         print(
             f"[zoterorag_mcp] FATAL: failed to load runtime: {exc}",
@@ -358,7 +346,7 @@ def main(config_path: str | None = None) -> None:
         )
         raise
     try:
-        asyncio.run(serve(config, ledger))
+        asyncio.run(serve(config, ledger, config_path=path))
     except Exception as exc:
         print(
             f"[zoterorag_mcp] FATAL: server crashed: {exc}", file=sys.stderr, flush=True

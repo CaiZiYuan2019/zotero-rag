@@ -3,11 +3,12 @@ from __future__ import annotations
 import base64
 import json
 import unittest
+from unittest.mock import patch
 
 from tests._support import workspace_tmpdir
 from zoterorag.config import AppConfig, EmbeddingProfile, PathsConfig
 from zoterorag.db import StateLedger
-from zoterorag.embeddings import index_normalized_document
+from zoterorag.embeddings import StubEmbeddingProvider, index_normalized_document
 from zoterorag.mcp import (
     McpToolContext,
     zotero_rag_get_document,
@@ -21,6 +22,15 @@ from zoterorag.normalize import normalize_markdown_document
 
 
 class McpToolsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Exercise Qwen request construction while keeping all queries offline.
+        client_patch = patch("zoterorag.embeddings.qwen._load_requests_client")
+        self.http = client_patch.start().return_value
+        self.addCleanup(client_patch.stop)
+        response = self.http.post.return_value
+        response.status_code = 200
+        response.json.return_value = {"output": {"embeddings": [{"embedding": [1.0] * 256}]}}
+
     def test_mcp_text_tools_are_safe_for_plain_text_llms(self) -> None:
         with workspace_tmpdir("mcp-tools-") as tmpdir:
             context = build_context(tmpdir)
@@ -43,6 +53,11 @@ class McpToolsTests(unittest.TestCase):
                 self.assertFalse(rerank_rejected["results"])
                 self.assertIn("rerank is reserved", rerank_rejected["warnings"][0])
                 self.assertTrue(text["results"])
+                self.http.post.assert_called_once()
+                request = self.http.post.call_args.kwargs
+                self.assertEqual("Bearer fixture-key", request["headers"]["Authorization"])
+                self.assertEqual("text query instruction", request["json"]["parameters"]["instruct"])
+                self.assertEqual([{"text": "figure evidence"}], request["json"]["input"]["contents"])
                 self.assertTrue(document["document"]["chunks"])
             finally:
                 context.ledger.close()
@@ -64,10 +79,15 @@ class McpToolsTests(unittest.TestCase):
                     context,
                     query_text="important figure",
                     consumer="llm_multimodal",
+                    profile_name="fixture_mm",
+                    query_image={"type": "base64", "value": "aW1n", "mime_type": "image/png"},
                     image_return="base64",
                     max_image_bytes=1024,
                 )
 
+                payload = self.http.post.call_args.kwargs["json"]
+                self.assertEqual("multimodal query instruction", payload["parameters"]["instruct"])
+                self.assertIn({"image": "data:image/png;base64,aW1n"}, payload["input"]["contents"])
                 self.assertEqual("llm_text", text_default["consumer"])
                 self.assertEqual("none", text_default["image_return"])
                 text_default_json = json.dumps(text_default, ensure_ascii=False)
@@ -79,6 +99,23 @@ class McpToolsTests(unittest.TestCase):
                 self.assertIn("images", multimodal["results"][0])
                 self.assertEqual("images/img001.png", multimodal["results"][0]["images"][0]["file_ref"])
                 self.assertEqual(base64.b64encode(b"fake-image").decode("ascii"), multimodal_base64["results"][0]["images"][0]["base64"])
+            finally:
+                context.ledger.close()
+
+    def test_qwen_failure_preserves_requested_nonvector_results(self) -> None:
+        with workspace_tmpdir("mcp-tools-") as tmpdir:
+            context = build_context(tmpdir)
+            try:
+                seed_library(context)
+                self.http.post.return_value.status_code = 401
+                self.http.post.return_value.json.return_value = {"message": "invalid credential"}
+                result = zotero_rag_search_text(context, query="Figure Paper", include_metadata=True)
+                self.assertEqual(["metadata"], [r["metadata"]["retrieval_source"] for r in result["results"]])
+                self.assertIn("HTTP 401", result["warnings"][0])
+                self.http.post.reset_mock()
+                result = zotero_rag_search_text(context, query="Figure Paper", include_metadata=True, include_vector=False)
+                self.assertEqual([], result["warnings"])
+                self.http.post.assert_not_called()
             finally:
                 context.ledger.close()
 
@@ -109,20 +146,22 @@ def build_context(tmpdir) -> McpToolContext:
         ),
         embedding_profiles=(
             EmbeddingProfile(
-                name="stub_text",
-                provider="stub",
-                model="stub",
-                dimension=8,
+                name="fixture_text",
+                provider="dashscope",
+                model="qwen3-vl-embedding",
+                instruction_template="text query instruction",
+                dimension=256,
                 modality="text",
                 enabled=True,
                 default_for_text=True,
                 backend="sqlite-local",
             ),
             EmbeddingProfile(
-                name="stub_mm",
-                provider="stub",
-                model="stub-mm",
-                dimension=8,
+                name="fixture_mm",
+                provider="dashscope",
+                model="qwen3-vl-embedding",
+                instruction_template="multimodal query instruction",
+                dimension=256,
                 modality="multimodal",
                 enabled=True,
                 default_for_multimodal=True,
@@ -133,7 +172,11 @@ def build_context(tmpdir) -> McpToolContext:
     config.ensure_runtime_dirs()
     ledger = StateLedger(config.paths.state_db)
     ledger.upsert_embedding_profiles(config.embedding_profiles)
-    return McpToolContext(config=config, ledger=ledger)
+    (tmpdir / "pyproject.toml").touch()
+    (tmpdir / ".env").write_text("QWEN_API_KEY=fixture-key\n", encoding="utf-8")
+    config_path = tmpdir / "config.toml"
+    config_path.touch()
+    return McpToolContext(config=config, ledger=ledger, config_path=config_path)
 
 
 def seed_library(context: McpToolContext) -> None:
@@ -182,14 +225,16 @@ def seed_library(context: McpToolContext) -> None:
     index_normalized_document(
         ledger=ledger,
         vector_store_dir=context.config.paths.vector_store_dir,
-        profile_name="stub_text",
+        profile_name="fixture_text",
         document_id="DOC1",
+        provider=StubEmbeddingProvider(dimension=256),
     )
     index_normalized_document(
         ledger=ledger,
         vector_store_dir=context.config.paths.vector_store_dir,
-        profile_name="stub_mm",
+        profile_name="fixture_mm",
         document_id="DOC1",
+        provider=StubEmbeddingProvider(dimension=256),
     )
 
 

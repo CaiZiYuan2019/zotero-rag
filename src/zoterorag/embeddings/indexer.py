@@ -10,6 +10,7 @@ from typing import Any, Literal
 
 from ..db import StateLedger
 from ..index.local_vector import open_vector_store, VectorRecord
+from ..search.identity import document_identities
 from ..search.results import SearchResult, ensure_rerank_disabled, sanitize_results_for_consumer
 from .base import EmbeddingInput, EmbeddingProvider, StubEmbeddingProvider
 from .profile import embedding_profile_hash
@@ -77,6 +78,7 @@ def _resolve_embedding_provider(
     provider: EmbeddingProvider | None,
     profile: dict[str, Any],
     allow_stub_provider: bool,
+    embedding_env_path: str | Path = ".env",
 ) -> EmbeddingProvider:
     """Resolve an embedding provider, building real providers from env when needed.
 
@@ -89,10 +91,12 @@ def _resolve_embedding_provider(
         return provider
     if profile["provider"] == "stub" or allow_stub_provider:
         return StubEmbeddingProvider(dimension=int(profile["dimension"]))
+    if profile["provider"] not in {"dashscope", "qwen3vl"}:
+        raise ValueError(f"unsupported embedding provider: {profile['provider']}")
     # Lazy-import to avoid a circular dependency between embeddings and
     # the top-level providers module (which imports from embeddings).
     from ..providers import build_qwen_embedding_provider
-    return build_qwen_embedding_provider(profile)
+    return build_qwen_embedding_provider(profile, embedding_env_path)
 
 
 def stage_indexed_document(
@@ -103,6 +107,7 @@ def stage_indexed_document(
     document_id: str,
     provider: EmbeddingProvider | None = None,
     allow_stub_provider: bool = False,
+    embedding_env_path: str | Path = ".env",
     vector_backend: str | None = None,
 ) -> IndexResult | StagedDocument:
     """Compute embeddings for one document without publishing them (Phase 3).
@@ -195,6 +200,7 @@ def stage_indexed_document(
         provider=provider,
         profile=profile,
         allow_stub_provider=allow_stub_provider,
+        embedding_env_path=embedding_env_path,
     )
     if embedding_provider.dimension != int(profile["dimension"]):
         raise ValueError(
@@ -403,6 +409,7 @@ def index_normalized_document(
     document_id: str,
     provider: EmbeddingProvider | None = None,
     allow_stub_provider: bool = False,
+    embedding_env_path: str | Path = ".env",
     vector_backend: str | None = None,
 ) -> IndexResult:
     """Index one normalized document into the profile's vector store.
@@ -419,6 +426,7 @@ def index_normalized_document(
         document_id=document_id,
         provider=provider,
         allow_stub_provider=allow_stub_provider,
+        embedding_env_path=embedding_env_path,
         vector_backend=vector_backend,
     )
     if isinstance(staged, IndexResult):
@@ -582,7 +590,8 @@ def search_vector_index(
     query_image_mime_type: str | None = None,
     provider: EmbeddingProvider | None = None,
     vector_backend: str | None = None,
-    allow_stub_provider: bool = True,
+    allow_stub_provider: bool = False,
+    embedding_env_path: str | Path = ".env",
 ) -> list[dict[str, Any]]:
     profile = select_profile(ledger, profile_name=profile_name, mode=mode)
     profile_name = profile["name"]
@@ -590,13 +599,11 @@ def search_vector_index(
     ensure_rerank_disabled(rerank)
     if mode == "text" and (query_image_path or query_image_base64):
         raise ValueError("text search does not accept query images")
-    # Default to stub-safe resolution for search. Callers that want a real
-    # provider must pass it explicitly; this matches the CLI/API default where
-    # embedding_provider="stub" means "do not make unsolicited provider calls".
     embedding_provider = _resolve_embedding_provider(
         provider=provider,
         profile=profile,
         allow_stub_provider=allow_stub_provider,
+        embedding_env_path=embedding_env_path,
     )
     if embedding_provider.dimension != int(profile["dimension"]):
         raise ValueError(
@@ -632,12 +639,19 @@ def search_vector_index(
         raw_results = store.search(query_vector, top_k=top_k, modality=modality)
     finally:
         store.close()
-    artifacts = {
-        row["document_id"]: ledger.get_normalized_artifact(row["document_id"])
-        for row in raw_results
-        if row.get("document_id")
-    }
-    results = [search_result_from_vector_row(row, artifact=artifacts.get(row["document_id"])) for row in raw_results]
+    # A legacy index may store a parent or attachment alias as document_id.
+    # A matching chunk identifies the exact document even among siblings.
+    chunk_documents = ledger.document_ids_for_chunks(row["chunk_id"] for row in raw_results)
+    document_ids = [chunk_documents.get(row["chunk_id"], row["document_id"]) for row in raw_results]
+    identities = document_identities(ledger, document_ids)
+    artifacts = {}
+    results = []
+    for row, key in zip(raw_results, document_ids):
+        identity = identities[key]
+        if row["modality"] == "image" and identity.document_id not in artifacts:
+            artifacts[identity.document_id] = ledger.get_normalized_artifact(identity.document_id)
+        result = search_result_from_vector_row(row, artifact=artifacts.get(identity.document_id))
+        results.append(identity.enrich_result(result.to_dict()))
     return sanitize_results_for_consumer(
         results,
         consumer=consumer,  # type: ignore[arg-type]

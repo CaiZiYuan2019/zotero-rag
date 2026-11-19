@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import shutil
+import sqlite3
 import tempfile
 from typing import Any
 import uuid
@@ -48,6 +49,7 @@ def run_runtime_diagnostics(
         "external_execution": {
             "ok": True,
             "mineru_executed": False,
+            "deepseek_executed": False,
             "embedding_executed": False,
             "note": "diagnostics never call external extraction or embedding providers",
         },
@@ -288,5 +290,5 @@ def check_provider_configuration(env_path: str | Path = ".env") -> dict[str, Any
         "env_path": str(env_path),
         "env_exists": env_path.is_file(),
         **readiness,
-        "note": "provider diagnostics inspect configuration only and never call MinerU or qwen",
+        "note": "provider diagnostics inspect configuration only and never call OCR or embedding providers",
     }

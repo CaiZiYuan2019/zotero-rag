@@ -2234,6 +2234,68 @@ class StateLedger:
             )
         return self.get_normalized_artifact(artifact["document_id"])  # type: ignore[return-value]
 
+    def artifact_identity_rows(
+        self, keys: Iterable[str], *, by_attachment: bool = False
+    ) -> list[dict[str, Any]]:
+        """Read only the links needed for a result batch, including older artifacts."""
+        keys = list(dict.fromkeys(keys))
+        if not keys:
+            return []
+        # Older rows can retain the attachment only in the manifest or extract
+        # job. The ingest default also uses the attachment key as document ID.
+        column = "attachment_key" if by_attachment else "document_id"
+        with self._lock:
+            rows = self.conn.execute(
+                f"""
+                WITH links AS (
+                    SELECT n.document_id, n.updated_at,
+                           COALESCE(NULLIF(n.attachment_key, ''),
+                                    CASE WHEN json_valid(n.payload_json) THEN
+                                        NULLIF(json_extract(n.payload_json, '$.attachment_key'), '') END,
+                                    j.attachment_key, implicit.attachment_key) AS attachment_key
+                    FROM normalized_artifacts n
+                    LEFT JOIN extract_jobs j ON j.job_id = n.extract_job_id
+                    LEFT JOIN attachments implicit ON implicit.attachment_key = n.document_id
+                )
+                SELECT l.document_id, l.attachment_key, a.parent_key
+                FROM links l LEFT JOIN attachments a ON a.attachment_key = l.attachment_key
+                WHERE l.{column} IN (SELECT value FROM json_each(?))
+                ORDER BY (l.document_id = l.attachment_key) DESC, l.updated_at DESC, l.document_id
+                """,
+                (json.dumps(keys),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def attachment_parents(self, keys: Iterable[str]) -> dict[str, str | None]:
+        keys = list(dict.fromkeys(keys))
+        if not keys:
+            return {}
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT attachment_key, parent_key FROM attachments "
+                "WHERE attachment_key IN (SELECT value FROM json_each(?))",
+                (json.dumps(keys),),
+            ).fetchall()
+        return {row["attachment_key"]: row["parent_key"] for row in rows}
+
+    def unique_attachment_for_parent(self, parent_key: str) -> str | None:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT attachment_key FROM attachments WHERE parent_key = ? LIMIT 2", (parent_key,)
+            ).fetchall()
+        return rows[0]["attachment_key"] if len(rows) == 1 else None
+
+    def document_ids_for_chunks(self, chunk_ids: Iterable[str]) -> dict[str, str]:
+        keys = list(dict.fromkeys(chunk_ids))
+        if not keys:
+            return {}
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT chunk_id, document_id FROM chunks WHERE chunk_id IN (SELECT value FROM json_each(?))",
+                (json.dumps(keys),),
+            ).fetchall()
+        return {row["chunk_id"]: row["document_id"] for row in rows}
+
     def get_normalized_artifact(self, document_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(
             """

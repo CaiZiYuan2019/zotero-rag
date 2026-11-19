@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -8,7 +7,8 @@ from ..backup import create_backup, plan_restore_backup, resolve_backup_manifest
 from ..diagnostics import run_runtime_diagnostics
 from ..documents import get_document as get_document_record
 from ..documents import list_documents as list_document_records
-from ..embeddings import index_normalized_document, search_vector_index
+from ..embeddings import StubEmbeddingProvider, index_normalized_document, search_vector_index
+from ..embeddings.indexer import require_embedding_profile, select_profile
 from ..extractors import build_extract_recovery_plan
 from ..index import verify_vector_index
 from ..models import describe_embedding_profile, list_embedding_model_catalog
@@ -75,10 +75,12 @@ def _as_str_list(value: Any) -> list[str] | None:
 
 def _find_project_root(start: Path) -> Path:
     path = start.resolve()
+    if path.is_file():
+        path = path.parent
     for parent in [path, *path.parents]:
         if (parent / "pyproject.toml").is_file() or (parent / ".git").is_dir():
             return parent
-    return path
+    return path.parent if path.name == "config" else path
 
 
 _ENV_BASENAME_ALLOWLIST = frozenset({".env"})
@@ -143,30 +145,14 @@ def create_app(config_path: str | Path = "config/config.toml") -> Any:
     )
 
     def _resolve_profile(profile_name: str | None, mode: str | None = None) -> dict[str, Any]:
-        """Resolve an embedding profile from config, raising on missing input."""
-        if profile_name:
-            for profile in config.embedding_profiles:
-                if profile.name == profile_name:
-                    return asdict(profile)
-            raise HTTPException(
-                status_code=404, detail=f"embedding profile not found: {profile_name}"
-            )
-        if mode is None:
-            raise HTTPException(
-                status_code=400, detail="profile_name is required when no search mode is given"
-            )
-        expected_modality = "text" if mode == "text" else "multimodal"
-        default_flag = "default_for_text" if mode == "text" else "default_for_multimodal"
-        for profile in config.embedding_profiles:
-            if (
-                profile.enabled
-                and profile.modality == expected_modality
-                and getattr(profile, default_flag)
-            ):
-                return asdict(profile)
-        raise HTTPException(
-            status_code=404, detail=f"no default {mode} embedding profile is configured"
-        )
+        try:
+            if mode is not None:
+                return select_profile(ledger, profile_name=profile_name, mode=mode)
+            if profile_name:
+                return require_embedding_profile(ledger, profile_name)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc.args[0])) from exc
+        raise HTTPException(status_code=400, detail="profile_name is required")
 
     def require_access(
         request: Request,
@@ -286,11 +272,12 @@ def create_app(config_path: str | Path = "config/config.toml") -> Any:
                 execute=execute,
             )
             if execute:
+                env_path = _resolve_env_path(str(payload.get("env", ".env")), project_root)
+                kwargs["embedding_env_path"] = env_path
                 kwargs["extract_manager"] = _build_extract_manager(
                     ledger,
                     config.paths.extract_cache_dir,
-                    str(payload.get("env", ".env")),
-                    project_root,
+                    env_path,
                     extract_config=config.extract,
                 )
                 kwargs["extract_cache_dir"] = config.paths.extract_cache_dir
@@ -305,7 +292,7 @@ def create_app(config_path: str | Path = "config/config.toml") -> Any:
             # M10: a busy runner lock / active job is a client-visible
             # conflict, not a server failure.
             raise _client_error(400) from None
-        except ValueError:
+        except (FileNotFoundError, ValueError):
             raise _client_error(400) from None
 
     @app.post("/ingest/pause", dependencies=[Depends(require_access)])
@@ -528,7 +515,7 @@ def create_app(config_path: str | Path = "config/config.toml") -> Any:
             }
         except NotImplementedError as exc:
             raise HTTPException(status_code=501, detail=str(exc)) from exc
-        except (KeyError, RuntimeError, ValueError):
+        except (FileNotFoundError, KeyError, RuntimeError, ValueError):
             raise _client_error(400) from None
 
     @app.post("/search/multimodal", dependencies=[Depends(require_access)])
@@ -565,7 +552,7 @@ def create_app(config_path: str | Path = "config/config.toml") -> Any:
             }
         except NotImplementedError as exc:
             raise HTTPException(status_code=501, detail=str(exc)) from exc
-        except (KeyError, RuntimeError, ValueError):
+        except (FileNotFoundError, KeyError, RuntimeError, ValueError):
             raise _client_error(400) from None
 
     @app.post("/backup/create", dependencies=[Depends(require_access)])
@@ -649,12 +636,12 @@ def create_app(config_path: str | Path = "config/config.toml") -> Any:
                 profile_name=profile["name"],
                 document_id=str(payload["document_id"]),
                 provider=provider,
-                allow_stub_provider=bool(payload.get("allow_stub_provider", False)),
+                allow_stub_provider=payload.get("allow_stub_provider") is True,
                 vector_backend=profile["backend"],
             ).to_dict()
         except NotImplementedError as exc:
             raise HTTPException(status_code=501, detail=str(exc)) from exc
-        except (KeyError, RuntimeError, ValueError):
+        except (FileNotFoundError, KeyError, RuntimeError, ValueError):
             raise _client_error(400) from None
 
     @app.post("/reembed/plan", dependencies=[Depends(require_access)])
@@ -672,25 +659,31 @@ def create_app(config_path: str | Path = "config/config.toml") -> Any:
             )
         except NotImplementedError as exc:
             raise HTTPException(status_code=501, detail=str(exc)) from exc
-        except (KeyError, RuntimeError, ValueError):
+        except (FileNotFoundError, KeyError, RuntimeError, ValueError):
             raise _client_error(400) from None
 
     @app.post("/reembed/from-normalized", dependencies=[Depends(require_access)])
     def reembed_from_normalized(payload: dict[str, Any]) -> dict[str, Any]:
         try:
             profile = _resolve_profile(str(payload["profile_name"]), mode=None)
+            execute = bool(payload.get("execute", False))
+            allow_stub = payload.get("allow_stub_provider") is True
+            execution_options = {}
+            if execute and not allow_stub and profile["provider"] != "stub":
+                execution_options["embedding_env_path"] = _resolve_env_path(str(payload.get("env", ".env")), project_root)
             return start_reembed_job(
                 ledger,
                 vector_store_dir=config.paths.vector_store_dir,
                 profile_name=profile["name"],
                 document_id=payload.get("document_id"),
                 force=bool(payload.get("force", False)),
-                execute=bool(payload.get("execute", False)),
-                allow_stub_provider=bool(payload.get("allow_stub_provider", False)),
+                execute=execute,
+                allow_stub_provider=allow_stub,
+                **execution_options,
             )
         except NotImplementedError as exc:
             raise HTTPException(status_code=501, detail=str(exc)) from exc
-        except (KeyError, RuntimeError, ValueError):
+        except (FileNotFoundError, KeyError, RuntimeError, ValueError):
             raise _client_error(400) from None
 
     return app
@@ -699,43 +692,25 @@ def create_app(config_path: str | Path = "config/config.toml") -> Any:
 def _build_extract_manager(
     ledger: Any,
     extract_cache_dir: Any,
-    env_path: str,
-    project_root: Path,
+    env_path: Path,
     *,
     extract_config: Any = None,
 ) -> Any:
-    """Build an ExtractionManager wired to real MinerU provider and key pool."""
-    from ..providers import build_mineru_provider
     from ..config.settings import ExtractConfig
-    from ..extractors import ExtractorKeyPool, ExtractionManager
+    from ..providers import build_extraction_manager
 
-    # Phase 2: the [extract] config carries pacing/concurrency/resubmit knobs;
-    # default to a fresh ExtractConfig when the caller has no config at hand.
-    extract_config = extract_config or ExtractConfig()
-    resolved_env_path = _resolve_env_path(env_path, project_root)
-    key_pool = ExtractorKeyPool.from_env_file(
-        resolved_env_path,
-        per_key_submit_concurrency=extract_config.per_key_submit_concurrency,
-    )
-    provider = build_mineru_provider(resolved_env_path)
-    return ExtractionManager(
-        ledger=ledger,
-        cache_dir=extract_cache_dir,
-        provider=provider,
-        key_pool=key_pool,
-        job_max_lifetime_seconds=extract_config.job_max_lifetime_seconds,
-        submit_min_interval_seconds=extract_config.submit_min_interval_seconds,
-        poll_max_per_minute=extract_config.poll_max_per_minute,
-        poll_interval_seconds=extract_config.poll_interval_seconds,
-        max_resubmit_attempts=extract_config.max_resubmit_attempts,
+    return build_extraction_manager(
+        ledger, extract_cache_dir, env_path, extract_config or ExtractConfig()
     )
 
 
 def explicit_embedding_provider(payload: dict[str, Any], profile: dict[str, Any], project_root: Path) -> Any:
-    provider_name = str(payload.get("embedding_provider", "stub"))
+    provider_name = payload.get("embedding_provider")
+    if provider_name is None:
+        provider_name = "stub" if payload.get("allow_stub_provider") is True else profile["provider"]
     if provider_name == "stub":
-        return None
-    if provider_name == "qwen3vl":
+        return StubEmbeddingProvider(dimension=int(profile["dimension"]))
+    if provider_name in ("qwen3vl", "dashscope"):
         resolved_env_path = _resolve_env_path(str(payload.get("env", ".env")), project_root)
         return build_qwen_embedding_provider(profile, resolved_env_path)
     raise ValueError(f"unsupported embedding_provider: {provider_name}")

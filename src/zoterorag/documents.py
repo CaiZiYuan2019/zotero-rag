@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from .db import StateLedger
+from .search.identity import SourceIdentity, attachment_identities, document_identities
 from .search.results import strip_image_references_from_text
 
 
@@ -29,17 +30,15 @@ def list_documents(
         for item in ledger.list_attachments(limit=None)
     }
     artifacts = ledger.list_normalized_artifacts(limit=None)
-    documents = [
-        build_normalized_document_summary(artifact, attachments.get(artifact.get("attachment_key") or ""))
-        for artifact in artifacts
-    ]
+    identities = document_identities(ledger, (artifact["document_id"] for artifact in artifacts))
+    documents = []
+    for artifact in artifacts:
+        identity = identities[artifact["document_id"]]
+        attachment = attachments.get(identity.attachment_key)
+        documents.append(build_normalized_document_summary(artifact, attachment, identity))
 
     if include_metadata_only:
-        normalized_keys = {
-            artifact.get("attachment_key")
-            for artifact in artifacts
-            if artifact.get("attachment_key")
-        }
+        normalized_keys = {identity.attachment_key for identity in identities.values()}
         for attachment in attachments.values():
             if attachment["attachment_key"] in normalized_keys:
                 continue
@@ -66,25 +65,30 @@ def get_document(
     """
 
     consumer = normalize_consumer(consumer)
-    artifact = ledger.get_normalized_artifact(document_id)
+    identity = document_identities(ledger, [document_id])[document_id]
+    artifact = ledger.get_normalized_artifact(identity.document_id)
+    if artifact is None and identity.attachment_key is None:
+        key = ledger.unique_attachment_for_parent(document_id)
+        if key is None:
+            return None
+        identity = attachment_identities(ledger, [key])[key]
+        artifact = ledger.get_normalized_artifact(identity.document_id)
+
+    attachment = ledger.get_attachment(identity.attachment_key) if identity.attachment_key else None
     if artifact is not None:
-        attachment = (
-            ledger.get_attachment(artifact["attachment_key"])
-            if artifact.get("attachment_key")
-            else None
-        )
-        document = build_normalized_document_summary(artifact, attachment)
-        document["artifact"] = artifact_for_consumer(artifact, consumer)
+        document = build_normalized_document_summary(artifact, attachment, identity)
+        document["artifact"] = {**artifact_for_consumer(artifact, consumer), **identity.fields()}
+        if consumer == "manual" and attachment is not None:
+            document["attachment"] = attachment
         if include_chunks:
             selected_chunk_type = "text" if consumer == "llm_text" and chunk_type is None else chunk_type
-            chunks = ledger.list_chunks(document_id, chunk_type=selected_chunk_type, limit=limit)
+            chunks = ledger.list_chunks(identity.document_id, chunk_type=selected_chunk_type, limit=limit)
             document["chunks"] = [
-                chunk_for_consumer(chunk, artifact=artifact, consumer=consumer)
+                identity.enrich_result(chunk_for_consumer(chunk, artifact=artifact, consumer=consumer))
                 for chunk in chunks
             ]
         return document
 
-    attachment = ledger.get_attachment(document_id)
     if attachment is not None:
         document = build_metadata_only_document_summary(attachment)
         if consumer == "manual":
@@ -96,13 +100,12 @@ def get_document(
 def build_normalized_document_summary(
     artifact: dict[str, Any],
     attachment: dict[str, Any] | None,
+    identity: SourceIdentity,
 ) -> dict[str, Any]:
     metadata = attachment or {}
     return {
-        "document_id": artifact["document_id"],
+        **identity.fields(),
         "document_kind": "normalized",
-        "attachment_key": artifact.get("attachment_key"),
-        "parent_key": metadata.get("parent_key"),
         "title": metadata.get("title") or artifact["document_id"],
         "date": metadata.get("date_value"),
         "url": metadata.get("url"),
@@ -117,11 +120,10 @@ def build_normalized_document_summary(
 
 
 def build_metadata_only_document_summary(attachment: dict[str, Any]) -> dict[str, Any]:
+    key = attachment["attachment_key"]
     return {
-        "document_id": attachment["attachment_key"],
+        **SourceIdentity(key, key, attachment.get("parent_key")).fields(),
         "document_kind": "metadata_only",
-        "attachment_key": attachment["attachment_key"],
-        "parent_key": attachment.get("parent_key"),
         "title": attachment.get("title") or attachment.get("relative_path") or attachment["attachment_key"],
         "date": attachment.get("date_value"),
         "url": attachment.get("url"),

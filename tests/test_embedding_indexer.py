@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from datetime import datetime, timedelta, timezone
 import hashlib
+import sqlite3
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -90,6 +91,10 @@ class EmbeddingIndexerTests(unittest.TestCase):
                     document_id="DOC1",
                     provider=mm_provider,
                 )
+                # An existing vector index should pick up current Zotero identity on read.
+                ledger.upsert_attachments([
+                    {"attachment_key": "ATT1", "parent_key": "PARENT1", "classification": "included_auto"}
+                ])
                 text_hits = search_vector_index(
                     ledger=ledger,
                     vector_store_dir=tmpdir / "vectors",
@@ -148,6 +153,12 @@ class EmbeddingIndexerTests(unittest.TestCase):
                     query_image_mime_type="image/png",
                 )
 
+                for hit in [text_hits[0], mm_manual_hits[0], mm_text_only_hits[0]]:
+                    self.assertEqual("DOC1", hit["document_id"])
+                    self.assertEqual("ATT1", hit["attachment_key"])
+                    self.assertEqual("PARENT1", hit["parent_item_key"])
+                    self.assertEqual("PARENT1", hit["source_id"])
+                    self.assertEqual("PARENT1", hit["metadata"]["parent_key"])
                 self.assertEqual(1, text_result.indexed_chunks)
                 self.assertEqual(1, mm_result.indexed_chunks)
                 self.assertEqual(1, mm_provider.calls)
@@ -270,15 +281,14 @@ class EmbeddingIndexerTests(unittest.TestCase):
                 batch = ledger.list_embedding_batches(profile_name="qwen_text", document_id="DOC1")[0]
                 self.assertEqual("stub", batch["provider"])
 
-                # Search now defaults to stub-safe resolution (matches API/CLI
-                # default embedding_provider="stub"). Explicitly disable stub to
-                # verify real-provider auto-resolution still fails without keys.
+                # A stub-built fixture needs an explicitly selected stub for queries.
                 hits = search_vector_index(
                     ledger=ledger,
                     vector_store_dir=tmpdir / "vectors",
                     profile_name="qwen_text",
                     query="alpha beta",
                     mode="text",
+                    allow_stub_provider=True,
                 )
                 self.assertTrue(hits)
                 with self.assertRaises((RuntimeError, ValueError)):
@@ -288,7 +298,6 @@ class EmbeddingIndexerTests(unittest.TestCase):
                         profile_name="qwen_text",
                         query="alpha beta",
                         mode="text",
-                        allow_stub_provider=False,
                     )
 
                 # Passing an explicit stub provider works.
@@ -331,7 +340,7 @@ class EmbeddingIndexerTests(unittest.TestCase):
                     profile_name="stub_text",
                     document_id="DOC_ALPHA",
                 )
-                index_normalized_document(
+                indexed_beta = index_normalized_document(
                     ledger=ledger,
                     vector_store_dir=tmpdir / "vectors",
                     profile_name="stub_text",
@@ -350,6 +359,31 @@ class EmbeddingIndexerTests(unittest.TestCase):
 
                 self.assertEqual(2, indexed["document_count"])
                 self.assertEqual({"DOC_ALPHA", "DOC_BETA"}, {hit["document_id"] for hit in alpha_hits})
+
+                ledger.upsert_attachments([
+                    {"attachment_key": "ATT_" + doc, "parent_key": "P", "classification": "included_auto"}
+                    for doc in ("DOC_ALPHA", "DOC_BETA")
+                ])
+                # Reproduce an older index whose siblings share a parent ID on disk.
+                conn = sqlite3.connect(indexed_beta.vector_path)
+                try:
+                    with conn:
+                        conn.execute("UPDATE vectors SET document_id = 'P'")
+                finally:
+                    conn.close()
+
+                legacy_hits = search_vector_index(
+                    ledger=ledger,
+                    vector_store_dir=tmpdir / "vectors",
+                    profile_name="stub_text",
+                    query="alpha unique evidence",
+                    mode="text",
+                )
+                self.assertEqual({"P"}, {hit["source_id"] for hit in legacy_hits})
+                self.assertEqual(
+                    {("DOC_ALPHA", "ATT_DOC_ALPHA"), ("DOC_BETA", "ATT_DOC_BETA")},
+                    {(hit["document_id"], hit["attachment_key"]) for hit in legacy_hits},
+                )
             finally:
                 ledger.close()
 
@@ -521,18 +555,18 @@ class EmbeddingIndexerTests(unittest.TestCase):
                     allow_stub_provider=True,
                 )
 
-                # Default search resolution is stub-safe, matching API behavior
-                # when embedding_provider="stub" is selected.
+                # Explicit offline selection can still query this synthetic index.
                 hits = search_vector_index(
                     ledger=ledger,
                     vector_store_dir=tmpdir / "vectors",
                     profile_name="qwen_text",
                     query="api stub evidence",
                     mode="text",
+                    allow_stub_provider=True,
                 )
                 self.assertTrue(hits)
 
-                # Explicitly disallowing stub forces real-provider resolution.
+                # The default selects the real provider.
                 with self.assertRaises((RuntimeError, ValueError)):
                     search_vector_index(
                         ledger=ledger,
@@ -540,7 +574,6 @@ class EmbeddingIndexerTests(unittest.TestCase):
                         profile_name="qwen_text",
                         query="api stub evidence",
                         mode="text",
-                        allow_stub_provider=False,
                     )
             finally:
                 ledger.close()

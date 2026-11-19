@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..db import StateLedger
+from .identity import attachment_identities
 from .results import ensure_rerank_disabled, sanitize_results_for_consumer
 
 
@@ -54,16 +55,15 @@ def metadata_search(
         sort_order=sort_order,
         match_mode=match_mode,
     )
-    results = [
-        {
-            "document_id": row.get("parent_key") or row["attachment_key"],
+    identities = attachment_identities(ledger, (row["attachment_key"] for row in rows))
+    results = []
+    for row in rows:
+        result = {
             "chunk_id": row["attachment_key"],
             "title": row.get("title") or row.get("relative_path") or row["attachment_key"],
             "text": build_metadata_text(row),
             "score": row["score"],
             "metadata": {
-                "attachment_key": row["attachment_key"],
-                "parent_key": row.get("parent_key"),
                 "content_type": row.get("content_type"),
                 "classification": row.get("classification"),
                 "source_quality": row.get("source_quality"),
@@ -82,8 +82,7 @@ def metadata_search(
             },
             "images": [],
         }
-        for row in rows
-    ]
+        results.append(identities[row["attachment_key"]].enrich_result(result))
     return sanitize_results_for_consumer(results, consumer=consumer, image_return="none")
 
 

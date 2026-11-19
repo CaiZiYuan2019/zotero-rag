@@ -189,13 +189,11 @@ class CliMainTests(unittest.TestCase):
         dependencies through to resume_ingest_job."""
         with workspace_tmpdir("cli-resume-exec-") as tmpdir:
             config_path = write_config(tmpdir)
-            (tmpdir / ".env").write_text("MINERU_API_KEY=dummy\n", encoding="utf-8")
+            (tmpdir / ".env").write_text("DEEPSEEK_KEY=dummy\n", encoding="utf-8")
             with patch(
                 "zoterorag.cli.resume_ingest_job",
                 return_value={"job": {"job_id": "JOB1", "status": "completed"}},
-            ) as mock_resume, patch(
-                "zoterorag.providers.build_mineru_provider", return_value=object()
-            ):
+            ) as mock_resume:
                 rc, _ = run_main(
                     ["--config", str(config_path), "ingest", "resume", "JOB1", "--execute"]
                 )
@@ -203,9 +201,10 @@ class CliMainTests(unittest.TestCase):
             kwargs = mock_resume.call_args.kwargs
             self.assertEqual("JOB1", kwargs["job_id"])
             self.assertTrue(kwargs["execute"])
-            self.assertIn("extract_manager", kwargs)
+            self.assertEqual("deepseek", kwargs["extract_manager"].provider.name)
             self.assertIn("extract_cache_dir", kwargs)
             self.assertIn("vector_store_dir", kwargs)
+            self.assertEqual((tmpdir / ".env").resolve(), kwargs["embedding_env_path"])
 
     def test_ingest_resume_without_execute_stays_plan_only(self) -> None:
         with workspace_tmpdir("cli-resume-plan-") as tmpdir:
@@ -275,6 +274,55 @@ class CliMainTests(unittest.TestCase):
             self.assertEqual(1, rc)
             self.assertFalse(data["ok"])
             self.assertIn("invalid --options-json", data["error"])
+
+    def test_embedding_commands_use_profile_and_project_env(self) -> None:
+        with workspace_tmpdir("cli-qwen-") as root:
+            config_dir = root / "config"
+            config_dir.mkdir()
+            (root / "pyproject.toml").touch()
+            config = write_config(config_dir)
+            config.write_text(config.read_text(encoding="utf-8").replace('provider = "stub"', 'provider = "dashscope"')
+                              .replace('name = "stub_', 'name = "qwen_'), encoding="utf-8")
+            env_path = root / ".env"
+            env_path.touch()
+            args = ["--config", str(config)]
+            with (patch("zoterorag.cli.build_qwen_embedding_provider") as build,
+                  patch("zoterorag.cli.search_vector_index", return_value=[]) as search,
+                  patch("zoterorag.cli.index_normalized_document") as index):
+                index.return_value.to_dict.return_value = {}
+                for command, profile, call in (
+                    (["search-vector", "text"], "qwen_text", search),
+                    (["search-mm", "image"], "qwen_mm", search),
+                    (["embed", "index-normalized", "--profile", "qwen_text", "--document-id", "DOC"], "qwen_text", index),
+                ):
+                    with self.subTest(command=command):
+                        rc, data = run_main(args + command)
+                        self.assertEqual(0, rc, data)
+                        self.assertEqual(profile, build.call_args.args[0]["name"])
+                        self.assertEqual(env_path, build.call_args.args[1])
+                        self.assertIs(build.return_value, call.call_args.kwargs["provider"])
+                env_path.unlink()
+                for command, call in ((["search", "text"], search),
+                                      (["embed", "index-normalized", "--profile", "qwen_text", "--document-id", "DOC"], index)):
+                    rc, data = run_main(args + command + ["--embedding-provider", "stub"])
+                    self.assertEqual(0, rc, data)
+                    self.assertEqual("stub", call.call_args.kwargs["provider"].name)
+                rc, data = run_main(args + ["search", "test"])
+                self.assertEqual(1, rc)
+                self.assertIn("env file not found", data["error"])
+
+    def test_reembed_execution_passes_custom_env(self) -> None:
+        with workspace_tmpdir("cli-qwen-reembed-") as root:
+            config = write_config(root)
+            config.write_text(config.read_text(encoding="utf-8").replace('provider = "stub"', 'provider = "dashscope"'),
+                              encoding="utf-8")
+            env_path = root / ".env.test"
+            env_path.touch()
+            with patch("zoterorag.cli.start_reembed_job", return_value={}) as start:
+                rc, data = run_main(["--config", str(config), "reembed", "--profile", "stub_text", "--from-normalized",
+                                     "--execute", "--env", env_path.name])
+                self.assertEqual(0, rc, data)
+                self.assertEqual(env_path, start.call_args.kwargs["embedding_env_path"])
 
     def test_search_alias_recognized_and_defaults_to_text(self) -> None:
         with workspace_tmpdir("cli-search-") as tmpdir:

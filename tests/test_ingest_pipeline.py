@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 import json
 from pathlib import Path
 import unittest
@@ -9,11 +10,11 @@ from tests._support import workspace_tmpdir
 from zoterorag.config import EmbeddingProfile
 from zoterorag.db import StateLedger
 from zoterorag.embeddings.profile import embedding_profile_hash
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from zoterorag.config import ExtractConfig
 from zoterorag.extractors.base import ExtractArtifact, ExtractJobState, StubExtractorProvider
-from zoterorag.extractors.manager import ExtractionManager, ExtractionRequest, extraction_cache_context
+from zoterorag.extractors.manager import ExtractionManager, ExtractionRequest, ExtractionResult, extraction_cache_context
 from zoterorag.normalize import normalize_markdown_document
 from zoterorag.pipeline import (
     cancel_ingest_job,
@@ -25,6 +26,7 @@ from zoterorag.pipeline import (
 from zoterorag.pipeline.ingest import (
     CIRCUIT_BREAKER_CONSECUTIVE_FAILURES,
     _execute_normalize_stage,
+    _harvest_one,
     _merge_and_checkpoint_segments,
     _segment_page_start,
     _track_circuit_breaker,
@@ -1705,6 +1707,78 @@ class OrderingRecordingProvider(MarkdownStubExtractorProvider):
 
 
 class ConcurrentHarvestTests(unittest.TestCase):
+    def test_resume_partial_download_keeps_saved_two_page_segments(self) -> None:
+        class SegmentProvider(OrderingRecordingProvider):
+            name = "deepseek"
+
+            def download(self, external_job_id, output_dir, **kwargs):
+                artifact = super().download(external_job_id, output_dir, **kwargs)
+                (artifact.artifact_dir / "full.md").write_text(external_job_id + "\n", encoding="utf-8")
+                self.events.append(("download", external_job_id))
+                return artifact
+
+        with workspace_tmpdir("ingest-saved-split-") as root, patch(
+            "zoterorag.pipeline.ingest.get_pdf_page_count", return_value=5
+        ):
+            cache = root / "extract_cache"
+            db = root / "state.sqlite"
+            key = "ATT_FIVE_PAGES"
+            paths = dict(extract_cache_dir=cache, normalized_dir=root / "normalized", vector_store_dir=root / "vectors")
+            with closing(StateLedger(db)) as ledger:
+                seed_profiles(ledger)
+                ledger.upsert_attachments([build_attachment_with_file(root, key, title="Five pages")])
+                manager = ExtractionManager(ledger=ledger, cache_dir=cache, provider=SegmentProvider())
+                submit = manager.submit_only
+
+                def interrupt_after_download(request):
+                    submitted = submit(request)
+                    manager.harvest(submitted.job["job_id"])
+                    raise KeyboardInterrupt
+
+                with patch.object(manager, "submit_only", side_effect=interrupt_after_download), self.assertRaises(KeyboardInterrupt):
+                    start_ingest_job(
+                        ledger, zotero_key=key, include_multimodal=False, execute=True, extract_manager=manager,
+                        extract_config=ExtractConfig(deepseek_pages_per_request=2), **paths,
+                    )
+                checkpoint = ledger.get_checkpoint(key, "extract")
+                self.assertEqual("running", checkpoint["status"])
+                self.assertEqual(2, checkpoint["payload"]["segment_size"])
+                self.assertNotIn("segment_job_ids", checkpoint["payload"])
+                (first,) = ledger.list_extract_jobs()
+                self.assertEqual(("1-2", "downloaded"), (first["selected_pages"], first["state"]))
+                (ingest_job,) = ledger.list_jobs(kind="ingest")
+                self.assertEqual("interrupted", ingest_job["status"])
+
+            with closing(StateLedger(db)) as ledger:
+                provider = SegmentProvider()
+                manager = ExtractionManager(ledger=ledger, cache_dir=cache, provider=provider)
+                result = resume_ingest_job(
+                    ledger, ingest_job["job_id"], execute=True, extract_manager=manager,
+                    extract_config=ExtractConfig(deepseek_pages_per_request=7), **paths,
+                )
+                self.assertEqual("completed", result["job"]["status"])
+                self.assertCountEqual(provider.events, [
+                    ("submit", "3-4"), ("poll", "batch-3-4"), ("download", "batch-3-4"),
+                    ("submit", "5-5"), ("poll", "batch-5-5"), ("download", "batch-5-5"),
+                ])
+                done = ledger.get_checkpoint(key, "extract")
+                self.assertEqual("done", done["status"])
+                ids = done["payload"]["segment_job_ids"]
+                self.assertEqual(first["job_id"], ids[0])
+                pages = [ledger.get_extract_job(job_id=job_id)["selected_pages"] for job_id in ids]
+                self.assertEqual(["1-2", "3-4", "5-5"], pages)
+                merged = Path(done["payload"]["merged_markdown"]).read_text(encoding="utf-8")
+                self.assertEqual(["batch-1-2", "batch-3-4", "batch-5-5"],
+                                 [line for line in merged.splitlines() if line.startswith("batch-")])
+
+    def test_harvest_manual_review_with_stale_poll_stage(self) -> None:
+        result = ExtractionResult(job={"state": "failed_manual_review", "local_stage": "poll",
+                                       "external_job_id": "batch", "job_id": "segment"}, cache_hit=True)
+        manager = Mock(spec=ExtractionManager)
+        self.assertIs(result, _harvest_one(result, manager))
+        manager.harvest.assert_not_called()
+        manager.resume_extraction.assert_not_called()
+
     def test_all_segments_submitted_before_any_poll_and_keys_released(self) -> None:
         with workspace_tmpdir("ingest-phase2-") as tmpdir:
             ledger = StateLedger(tmpdir / "state.sqlite")

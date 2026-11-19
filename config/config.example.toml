@@ -15,6 +15,11 @@ require_api_token = true
 tool_timeout = 30.0
 
 [extract]
+# Default for new OCR jobs. Existing jobs resume with their recorded provider.
+provider = "deepseek"
+# Maximum parallel DeepSeek OCR requests and pages sent per segment.
+deepseek_concurrency = 15
+deepseek_pages_per_request = 8
 # Split PDFs larger than max_pages_per_extraction into multiple MinerU jobs.
 # Requires PyMuPDF (fitz) to detect page counts automatically.
 split_large_pdfs = true

@@ -136,8 +136,17 @@ class ExtractConfig:
     # rounds in payload["resubmit_attempts"]); beyond it the job is flipped
     # to failed_manual_review.
     max_resubmit_attempts: int = 3
+    provider: str = "deepseek"
+    deepseek_concurrency: int = 15
+    deepseek_pages_per_request: int = 8
 
     def __post_init__(self) -> None:
+        if self.provider not in {"deepseek", "mineru"}:
+            raise ValueError("extract.provider must be deepseek or mineru")
+        for name in ("deepseek_concurrency", "deepseek_pages_per_request"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"extract.{name} must be a positive integer")
         if not isinstance(self.max_pages_per_extraction, int) or self.max_pages_per_extraction < 1:
             raise ValueError(
                 f"extract.max_pages_per_extraction must be a positive integer, "
@@ -411,6 +420,9 @@ def load_config(path: str | Path = "config/config.toml") -> AppConfig:
         tool_timeout=float(mcp_data.get("tool_timeout", 30.0)),
     )
     extract = ExtractConfig(
+        provider=extract_data.get("provider", "deepseek"),
+        deepseek_concurrency=extract_data.get("deepseek_concurrency", 15),
+        deepseek_pages_per_request=extract_data.get("deepseek_pages_per_request", 8),
         split_large_pdfs=_parse_bool(
             extract_data.get("split_large_pdfs", True),
             "extract.split_large_pdfs",

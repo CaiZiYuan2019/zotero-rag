@@ -64,6 +64,7 @@ def start_reembed_job(
     force: bool = False,
     execute: bool = False,
     allow_stub_provider: bool = False,
+    embedding_env_path: str | Path = ".env",
 ) -> dict[str, Any]:
     """Create a vector-only rebuild job and optionally execute indexing.
 
@@ -137,6 +138,7 @@ def start_reembed_job(
                         profile_name=profile_name,
                         document_id=document["document_id"],
                         allow_stub_provider=allow_stub_provider,
+                        embedding_env_path=embedding_env_path,
                     )
                     if isinstance(outcome, IndexResult):
                         # Reuse fast path: already published; count it now.

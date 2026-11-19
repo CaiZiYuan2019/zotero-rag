@@ -5,6 +5,7 @@ import unittest
 
 from tests._support import workspace_tmpdir
 from zoterorag.providers import (
+    build_extraction_manager,
     build_mineru_provider,
     build_qwen_embedding_provider,
     mineru_urls_from_env,
@@ -13,6 +14,27 @@ from zoterorag.providers import (
 
 
 class ProviderRuntimeTests(unittest.TestCase):
+    def test_default_and_recorded_ocr_providers_use_their_own_credentials(self) -> None:
+        from unittest.mock import Mock, patch
+        from zoterorag.config.settings import ExtractConfig
+        from zoterorag.extractors import ExtractionManager
+
+        with workspace_tmpdir("ocr-selection-") as tmpdir:
+            env = tmpdir / ".env"
+            env.write_text("DEEPSEEK_KEY=single-key\nMINERU_KEY=first,second\n", encoding="utf-8")
+            ledger = Mock()
+            manager = build_extraction_manager(ledger, tmpdir, env, ExtractConfig(deepseek_concurrency=12))
+            self.assertEqual("single-key", manager.key_pool.next_key().secret)
+            self.assertEqual(12, manager.key_pool.per_key_submit_concurrency)
+            ledger.get_extract_job.return_value = {"job_id": "old", "state": "completed", "provider": "mineru",
+                                                "external_job_id": "existing-batch", "local_stage": "download"}
+            with patch.object(ExtractionManager, "_download_with_key", autospec=True) as download:
+                manager.resume_extraction("old")
+            old_manager, job = download.call_args.args
+            self.assertEqual("mineru", old_manager.provider.name)
+            self.assertEqual(["first", "second"], [old_manager.key_pool.next_key().secret for _ in range(2)])
+            self.assertEqual("existing-batch", job["external_job_id"])
+
     def test_provider_readiness_reports_configuration_without_secrets(self) -> None:
         with workspace_tmpdir("providers-") as tmpdir:
             env_path = tmpdir / ".env"

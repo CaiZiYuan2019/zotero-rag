@@ -9,6 +9,9 @@ port = 8765
 require_api_token = true
 
 [extract]
+provider = "deepseek"
+deepseek_concurrency = 15
+deepseek_pages_per_request = 8
 split_large_pdfs = true
 max_pages_per_extraction = 200
 job_max_lifetime_seconds = 21600
